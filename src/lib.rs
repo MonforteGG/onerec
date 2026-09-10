@@ -3,6 +3,14 @@ mod ids;
 mod session;
 mod timeline;
 
+pub use capture::{
+    CaptureError, CaptureRead, CaptureSource, InvalidFrames, NoPacketSource, PcmSource,
+    SessionFrame, TimedStereoFrames,
+};
+pub use ids::{DeviceIdError, MicrophoneId, OutputDeviceId};
+pub use session::{FailedSession, PendingRecording, Session};
+pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+
 use std::fmt;
 
 pub fn run() -> Result<(), RunError> {
