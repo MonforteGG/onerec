@@ -230,6 +230,8 @@ fn mix_loop(
     let mut mic_live = true;
     let mut sys_live = true;
     let mut mixed = Vec::new();
+    let origin = Instant::now();
+    let mut quanta = 0u32;
 
     loop {
         match stop_rx.try_recv() {
@@ -245,8 +247,14 @@ fn mix_loop(
         let block = mix(&mic, &sys);
         write_block(&mut file, &block)?;
         mixed.extend_from_slice(&block);
+        quanta = quanta.saturating_add(1);
 
-        match stop_rx.recv_timeout(MIX_TICK) {
+        let due = origin + MIX_TICK * quanta;
+        let wait = due.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            continue;
+        }
+        match stop_rx.recv_timeout(wait) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
