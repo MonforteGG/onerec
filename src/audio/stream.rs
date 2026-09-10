@@ -1,4 +1,3 @@
-// Off Windows nothing but the tests below drives a Tap, and the actor still has to compile.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::VecDeque;
@@ -61,7 +60,7 @@ impl CaptureStream {
 
 impl CaptureSource for CaptureStream {
     fn read(&mut self, max_wait: Duration) -> Result<CaptureRead, CaptureError> {
-        let mut state = lock(&self.tap.state);
+        let mut state = ignore_poison(&self.tap.state);
         if !max_wait.is_zero() && state.samples.is_empty() && state.lost.is_none() {
             state = self
                 .tap
@@ -83,7 +82,7 @@ impl CaptureSource for CaptureStream {
         let first = SessionFrame::from_index(self.next_frame);
         self.next_frame += samples.len() as u64;
         let frames = TimedStereoFrames::try_new(first, samples)
-            .expect("Tap::push sanitized every sample and this drain is not empty");
+            .expect("from_device_sample already clamped every sample and this drain is not empty");
         Ok(CaptureRead::Frames(frames))
     }
 }
@@ -102,11 +101,11 @@ impl Tap {
         if frames.is_empty() {
             return;
         }
-        let mut state = lock(&self.state);
+        let mut state = ignore_poison(&self.state);
         state.samples.extend(
             frames
                 .iter()
-                .map(|[left, right]| [sanitize(*left), sanitize(*right)]),
+                .map(|[left, right]| [from_device_sample(*left), from_device_sample(*right)]),
         );
         drop(state);
         self.ready.notify_one();
@@ -116,7 +115,7 @@ impl Tap {
         if frames == 0 {
             return;
         }
-        let mut state = lock(&self.state);
+        let mut state = ignore_poison(&self.state);
         state
             .samples
             .extend(std::iter::repeat_n([0.0, 0.0], frames));
@@ -125,7 +124,7 @@ impl Tap {
     }
 
     pub(crate) fn wait_for_stop(&self, timeout: Duration) -> bool {
-        let stop = lock(&self.stop);
+        let stop = ignore_poison(&self.stop);
         if *stop || timeout.is_zero() {
             return *stop;
         }
@@ -137,12 +136,12 @@ impl Tap {
     }
 
     fn request_stop(&self) {
-        *lock(&self.stop) = true;
+        *ignore_poison(&self.stop) = true;
         self.stop_changed.notify_all();
     }
 
     fn fail(&self, error: CaptureError) {
-        let mut state = lock(&self.state);
+        let mut state = ignore_poison(&self.state);
         if state.lost.is_none() {
             state.lost = Some(error);
         }
@@ -151,8 +150,7 @@ impl Tap {
     }
 }
 
-/// WASAPI float buffers are not bounded to +/-1.0, and a driver can emit a NaN.
-fn sanitize(sample: f32) -> f32 {
+fn from_device_sample(sample: f32) -> f32 {
     if sample.is_finite() {
         sample.clamp(-1.0, 1.0)
     } else {
@@ -160,8 +158,7 @@ fn sanitize(sample: f32) -> f32 {
     }
 }
 
-/// A panicking producer must not take the mix thread down with it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn ignore_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

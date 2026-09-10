@@ -31,8 +31,6 @@ use crate::ids::{MicrophoneId, OutputDeviceId};
 const SAMPLE_RATE: u32 = 48_000;
 const BUFFER_HNS: i64 = 2_000_000;
 
-/// Loopback capture cannot use `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, so both roles poll on
-/// the same clock instead of one waiting on an event and the other spinning.
 const POLL: Duration = Duration::from_millis(15);
 
 pub(crate) fn query() -> Result<Endpoints, AudioError> {
@@ -41,7 +39,7 @@ pub(crate) fn query() -> Result<Endpoints, AudioError> {
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|error| failure("creating the audio endpoint enumerator", error))?;
 
-    Ok(Endpoints::new(
+    Ok(Endpoints::from_enumerated(
         collect(&enumerator, eCapture, MicrophoneId::parse)?,
         collect(&enumerator, eRender, OutputDeviceId::parse)?,
         default_id(&enumerator, eCapture, MicrophoneId::parse),
@@ -80,8 +78,6 @@ impl Role {
     }
 }
 
-/// Every COM call for this stream happens on its own thread, so the caller learns whether
-/// the device opened through this channel rather than by holding a marshalled pointer.
 fn open(endpoint: String, role: Role) -> Result<CaptureStream, AudioError> {
     let (opened, opened_rx) = mpsc::sync_channel::<Result<(), AudioError>>(1);
     let stream = CaptureStream::spawn(role.thread_name(), move |tap| {
@@ -109,9 +105,7 @@ fn open(endpoint: String, role: Role) -> Result<CaptureStream, AudioError> {
 struct Client {
     audio: IAudioClient,
     capture: IAudioCaptureClient,
-    format: Format,
-    /// Last, because fields drop in declaration order and `CoUninitialize` must not run
-    /// while the interfaces above are still alive.
+    format: StereoDecoder,
     _com: Com,
 }
 
@@ -124,7 +118,7 @@ impl Client {
         let device = unsafe { enumerator.GetDevice(&HSTRING::from(endpoint)) }
             .map_err(|error| failure(&format!("opening endpoint {endpoint}"), error))?;
 
-        let (audio, format) = initialize(&device, role.stream_flags())?;
+        let (audio, format) = activate_shared_or_mix(&device, role.stream_flags())?;
         let capture: IAudioCaptureClient = unsafe { audio.GetService() }
             .map_err(|error| failure("requesting the capture service", error))?;
 
@@ -175,7 +169,7 @@ impl Client {
         } else {
             let bytes =
                 unsafe { slice::from_raw_parts(data, frames as usize * self.format.frame_bytes) };
-            tap.push(&self.format.decode(bytes));
+            tap.push(&self.format.front_pair(bytes));
         }
         unsafe { self.capture.ReleaseBuffer(frames) }
             .map_err(|error| lost("releasing a capture packet", error))?;
@@ -183,9 +177,10 @@ impl Client {
     }
 }
 
-/// A rejected `Initialize` leaves the client unusable, so the fallback activates a fresh
-/// one and converts here instead of asking the audio engine to.
-fn initialize(device: &IMMDevice, flags: u32) -> Result<(IAudioClient, Format), AudioError> {
+fn activate_shared_or_mix(
+    device: &IMMDevice,
+    flags: u32,
+) -> Result<(IAudioClient, StereoDecoder), AudioError> {
     let audio = activate(device)?;
     let desired = stereo_float();
     let attempt = unsafe {
@@ -199,7 +194,7 @@ fn initialize(device: &IMMDevice, flags: u32) -> Result<(IAudioClient, Format), 
         )
     };
     match attempt {
-        Ok(()) => return Ok((audio, Format::STEREO_FLOAT)),
+        Ok(()) => return Ok((audio, StereoDecoder::STEREO_FLOAT)),
         Err(error) if error.code() != AUDCLNT_E_UNSUPPORTED_FORMAT => {
             return Err(failure("initializing the audio client", error))
         }
@@ -208,7 +203,7 @@ fn initialize(device: &IMMDevice, flags: u32) -> Result<(IAudioClient, Format), 
 
     let audio = activate(device)?;
     let mix = MixFormat::of(&audio)?;
-    let format = Format::of(mix.as_ptr())?;
+    let format = StereoDecoder::of(mix.as_ptr())?;
     let flags =
         flags & !(AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY);
     unsafe {
@@ -265,8 +260,7 @@ impl Drop for MixFormat {
     }
 }
 
-/// How to turn one device frame into one stereo `f32` frame.
-struct Format {
+struct StereoDecoder {
     sample: Sample,
     channels: usize,
     frame_bytes: usize,
@@ -280,7 +274,7 @@ enum Sample {
     Int32,
 }
 
-impl Format {
+impl StereoDecoder {
     const STEREO_FLOAT: Self = Self {
         sample: Sample::Float32,
         channels: 2,
@@ -324,8 +318,7 @@ impl Format {
         })
     }
 
-    /// More than two channels keeps the front pair, which is all this build can place.
-    fn decode(&self, bytes: &[u8]) -> Vec<[f32; 2]> {
+    fn front_pair(&self, bytes: &[u8]) -> Vec<[f32; 2]> {
         let stride = self.frame_bytes / self.channels;
         bytes
             .chunks_exact(self.frame_bytes)
@@ -348,7 +341,9 @@ impl Sample {
             Sample::Float32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             Sample::Int16 => i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32_768.0,
             Sample::Int24 => {
-                i32::from_le_bytes([0, bytes[0], bytes[1], bytes[2]]) as f32 / 2_147_483_648.0
+                let sample =
+                    ((bytes[2] as i8 as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[0] as i32);
+                sample as f32 / 8_388_608.0
             }
             Sample::Int32 => {
                 i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
@@ -462,5 +457,16 @@ impl Drop for Com {
         if self.owned {
             unsafe { CoUninitialize() };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int24_reads_little_endian_with_sign() {
+        assert!((Sample::Int24.read(&[0, 0, 0x40]) - 0.5).abs() < 1e-6);
+        assert!((Sample::Int24.read(&[0, 0, 0x80]) + 1.0).abs() < 1e-6);
     }
 }

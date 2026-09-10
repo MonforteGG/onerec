@@ -54,5 +54,12 @@ mod tests {
         {
             assert_eq!(crate::run().unwrap_err().to_string(), "v1 is Windows-only");
         }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                crate::run().unwrap_err().to_string(),
+                "the recorder window is not in this build"
+            );
+        }
     }
 }

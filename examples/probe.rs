@@ -93,8 +93,6 @@ mod probe {
         pub lost: bool,
     }
 
-    /// Counts what each endpoint actually delivered, so a silent mix says which half was
-    /// quiet instead of leaving both suspect.
     pub struct Meter<S> {
         inner: S,
         stats: Arc<Mutex<Stats>>,

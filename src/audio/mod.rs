@@ -88,11 +88,8 @@ impl Endpoints {
         self.default_output.as_ref()
     }
 
-    /// A device can disappear between the enumeration walk and the default lookup, so a
-    /// default that is not in its own list is dropped rather than handed out as a
-    /// selection nothing can render.
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) fn new(
+    pub(crate) fn from_enumerated(
         microphones: Vec<Microphone>,
         outputs: Vec<OutputDevice>,
         default_microphone: Option<MicrophoneId>,
@@ -192,7 +189,7 @@ mod tests {
     fn a_default_missing_from_its_list_is_not_handed_out() {
         let present = MicrophoneId::parse("{0.0.1}.present".into()).unwrap();
         let vanished = MicrophoneId::parse("{0.0.1}.vanished".into()).unwrap();
-        let endpoints = Endpoints::new(
+        let endpoints = Endpoints::from_enumerated(
             vec![microphone("{0.0.1}.present", "Present")],
             Vec::new(),
             Some(vanished),
@@ -200,7 +197,7 @@ mod tests {
         );
         assert_eq!(endpoints.default_microphone(), None);
 
-        let endpoints = Endpoints::new(
+        let endpoints = Endpoints::from_enumerated(
             vec![microphone("{0.0.1}.present", "Present")],
             Vec::new(),
             Some(present.clone()),
