@@ -1,8 +1,13 @@
+mod audio;
 mod capture;
 mod ids;
 mod session;
 mod timeline;
 
+pub use audio::{
+    open_loopback, open_microphone, AudioError, CaptureStream, Endpoint, Endpoints, Microphone,
+    OutputDevice,
+};
 pub use capture::{
     CaptureError, CaptureRead, CaptureSource, InvalidFrames, NoPacketSource, PcmSource,
     SessionFrame, TimedStereoFrames,
@@ -17,7 +22,7 @@ pub fn run() -> Result<(), RunError> {
     #[cfg(windows)]
     {
         Err(RunError {
-            message: "Windows capture is not in this build".into(),
+            message: "the recorder window is not in this build".into(),
         })
     }
     #[cfg(not(windows))]
@@ -48,6 +53,13 @@ mod tests {
         #[cfg(not(windows))]
         {
             assert_eq!(crate::run().unwrap_err().to_string(), "v1 is Windows-only");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                crate::run().unwrap_err().to_string(),
+                "the recorder window is not in this build"
+            );
         }
     }
 }
