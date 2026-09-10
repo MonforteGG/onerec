@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{CaptureRead, CaptureSource};
 use crate::ids::{MicrophoneId, OutputDeviceId};
-use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+use crate::staging::StagingFile;
+use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE, MIX_TICK};
 
 pub enum Session {
     Idle,
@@ -26,11 +28,11 @@ pub struct ActiveRecording {
     stop_tx: Option<Sender<()>>,
     worker: Option<JoinHandle<Result<Vec<[f32; 2]>, FailedSession>>>,
     degraded: Arc<AtomicBool>,
-    staging_file: PathBuf,
+    staging_file: StagingFile,
 }
 
 pub struct PendingRecording {
-    staging_file: PathBuf,
+    staging_file: StagingFile,
     elapsed: Duration,
     mixed: Vec<[f32; 2]>,
     degraded: bool,
@@ -39,6 +41,19 @@ pub struct PendingRecording {
 #[derive(Debug)]
 pub struct FailedSession {
     detail: String,
+    staging: Option<StagingFile>,
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    NoTake,
+    Write(String),
+}
+
+#[derive(Debug)]
+pub struct DiscardError {
+    path: PathBuf,
+    source: io::Error,
 }
 
 impl std::fmt::Debug for Session {
@@ -66,7 +81,7 @@ impl std::fmt::Debug for Session {
 
 impl PendingRecording {
     pub fn staging_file(&self) -> &Path {
-        &self.staging_file
+        self.staging_file.path()
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -82,6 +97,52 @@ impl PendingRecording {
     }
 }
 
+impl FailedSession {
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for FailedSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SaveError::NoTake => f.write_str("nothing to save"),
+            SaveError::Write(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl DiscardError {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Display for DiscardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not delete {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for DiscardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl Session {
     pub fn start(
         &mut self,
@@ -89,7 +150,7 @@ impl Session {
         output: OutputDeviceId,
         microphone_source: impl CaptureSource,
         system: impl CaptureSource,
-        staging_file: PathBuf,
+        staging_file: StagingFile,
     ) {
         if !matches!(self, Session::Idle) {
             return;
@@ -122,6 +183,45 @@ impl Session {
         };
     }
 
+    pub fn save_as(&mut self, destination: &Path) -> Result<(), SaveError> {
+        let Session::AwaitingSave(pending) = self else {
+            return Err(SaveError::NoTake);
+        };
+        crate::wave::write(destination, pending.staging_file.path(), MIX_SAMPLE_RATE)
+            .map_err(|error| SaveError::Write(error.to_string()))?;
+        *self = Session::Idle;
+        Ok(())
+    }
+
+    pub fn discard(&mut self) -> Result<(), DiscardError> {
+        let Session::AwaitingSave(pending) = self else {
+            return Ok(());
+        };
+        pending
+            .staging_file
+            .unlink()
+            .map_err(|source| DiscardError {
+                path: pending.staging_file.path().to_path_buf(),
+                source,
+            })?;
+        *self = Session::Idle;
+        Ok(())
+    }
+
+    pub fn dismiss(&mut self) -> Result<(), DiscardError> {
+        let Session::Failed(failed) = self else {
+            return Ok(());
+        };
+        if let Some(staging) = &mut failed.staging {
+            staging.unlink().map_err(|source| DiscardError {
+                path: staging.path().to_path_buf(),
+                source,
+            })?;
+        }
+        *self = Session::Idle;
+        Ok(())
+    }
+
     pub fn elapsed(&self) -> Option<Duration> {
         match self {
             Session::Recording(active) => Some(active.started_at.elapsed()),
@@ -145,14 +245,22 @@ impl ActiveRecording {
         output: OutputDeviceId,
         microphone_source: impl CaptureSource,
         system: impl CaptureSource,
-        staging_file: PathBuf,
+        staging_file: StagingFile,
     ) -> Result<Self, FailedSession> {
-        let file = File::create(&staging_file).map_err(io_fail)?;
+        let file = match File::create(staging_file.path()) {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(FailedSession {
+                    detail: error.to_string(),
+                    staging: Some(staging_file),
+                });
+            }
+        };
         let (stop_tx, stop_rx) = mpsc::channel();
         let degraded = Arc::new(AtomicBool::new(false));
         let degraded_worker = Arc::clone(&degraded);
         let started_at = Instant::now();
-        let worker = thread::Builder::new()
+        let worker = match thread::Builder::new()
             .name("onerec-mix".into())
             .spawn(move || {
                 mix_loop(
@@ -162,10 +270,15 @@ impl ActiveRecording {
                     stop_rx,
                     degraded_worker,
                 )
-            })
-            .map_err(|error| FailedSession {
-                detail: error.to_string(),
-            })?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(FailedSession {
+                    detail: error.to_string(),
+                    staging: Some(staging_file),
+                });
+            }
+        };
         Ok(Self {
             microphone,
             output,
@@ -181,21 +294,27 @@ impl ActiveRecording {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
+        let staging_file = self.staging_file.take();
         match self.worker.take() {
             Some(worker) => match worker.join() {
                 Ok(Ok(mixed)) => Session::AwaitingSave(PendingRecording {
-                    staging_file: self.staging_file.clone(),
+                    staging_file,
                     elapsed: self.started_at.elapsed(),
                     mixed,
                     degraded: self.degraded.load(Ordering::SeqCst),
                 }),
-                Ok(Err(failed)) => Session::Failed(failed),
+                Ok(Err(mut failed)) => {
+                    failed.staging = Some(staging_file);
+                    Session::Failed(failed)
+                }
                 Err(_) => Session::Failed(FailedSession {
                     detail: "mix thread panicked".into(),
+                    staging: Some(staging_file),
                 }),
             },
             None => Session::Failed(FailedSession {
                 detail: "mix thread missing".into(),
+                staging: Some(staging_file),
             }),
         }
     }
@@ -215,6 +334,7 @@ impl Drop for ActiveRecording {
 fn io_fail(error: io::Error) -> FailedSession {
     FailedSession {
         detail: error.to_string(),
+        staging: None,
     }
 }
 
@@ -320,6 +440,7 @@ fn write_block(file: &mut File, block: &[[f32; 2]]) -> Result<(), FailedSession>
 mod tests {
     use super::*;
     use crate::capture::{NoPacketSource, PcmSource};
+    use crate::staging::StagingArea;
 
     fn mic_id() -> MicrophoneId {
         MicrophoneId::parse("mic".into()).unwrap()
@@ -333,18 +454,47 @@ mod tests {
         session: &mut Session,
         microphone: impl CaptureSource,
         system: impl CaptureSource,
-        path: PathBuf,
+        staging: StagingFile,
     ) {
-        session.start(mic_id(), out_id(), microphone, system, path);
+        session.start(mic_id(), out_id(), microphone, system, staging);
+    }
+
+    fn record_silence() -> (Session, PathBuf) {
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let path = staging.path().to_path_buf();
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, staging);
+        (session, path)
+    }
+
+    fn wav_data_chunk(bytes: &[u8]) -> &[u8] {
+        assert!(bytes.len() >= 12);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let mut offset = 12usize;
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let size =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            offset += 8;
+            assert!(offset + size <= bytes.len());
+            if id == b"data" {
+                return &bytes[offset..offset + size];
+            }
+            offset += size;
+            if size % 2 == 1 {
+                offset += 1;
+            }
+        }
+        panic!("WAV has no data chunk");
     }
 
     #[test]
     fn pending_system_elapsed_follows_wall_clock() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("take.part");
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
         let mut session = Session::Idle;
         let wall_origin = Instant::now();
-        start_with(&mut session, PcmSource::silence(), NoPacketSource, path);
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, staging);
         assert!(matches!(session, Session::Recording(_)));
         thread::sleep(Duration::from_millis(120));
         session.stop();
@@ -365,17 +515,15 @@ mod tests {
 
     #[test]
     fn mixed_pcm_duration_tracks_elapsed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("take.part");
-        let mut session = Session::Idle;
-        start_with(&mut session, PcmSource::silence(), NoPacketSource, path);
+        let (mut session, _path) = record_silence();
         thread::sleep(Duration::from_millis(200));
         session.stop();
         let Session::AwaitingSave(pending) = &session else {
             panic!("expected AwaitingSave, got {session:?}");
         };
-        let sample_rate = MIX_QUANTUM_FRAMES as f64 / MIX_TICK.as_secs_f64();
-        let mixed = Duration::from_secs_f64(pending.mixed_frames().len() as f64 / sample_rate);
+        let mixed = Duration::from_secs_f64(
+            pending.mixed_frames().len() as f64 / f64::from(MIX_SAMPLE_RATE),
+        );
         let elapsed = pending.elapsed();
         assert!(
             mixed + MIX_TICK * 3 >= elapsed,
@@ -389,15 +537,10 @@ mod tests {
 
     #[test]
     fn cancel_save_keeps_awaiting_save_and_staging_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("take.part");
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let path = staging.path().to_path_buf();
         let mut session = Session::Idle;
-        start_with(
-            &mut session,
-            PcmSource::tone(0.25),
-            NoPacketSource,
-            path.clone(),
-        );
+        start_with(&mut session, PcmSource::tone(0.25), NoPacketSource, staging);
         thread::sleep(Duration::from_millis(30));
         session.stop();
         let Session::AwaitingSave(pending) = &session else {
@@ -412,17 +555,17 @@ mod tests {
 
     #[test]
     fn start_while_recording_is_a_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("take.part");
+        let area = StagingArea::open().unwrap();
+        let staging = area.next_take().unwrap();
         let mut session = Session::Idle;
-        start_with(&mut session, PcmSource::tone(0.25), NoPacketSource, path);
+        start_with(&mut session, PcmSource::tone(0.25), NoPacketSource, staging);
         thread::sleep(Duration::from_millis(40));
         let elapsed = session.elapsed().expect("recording elapsed");
         start_with(
             &mut session,
             PcmSource::silence(),
             NoPacketSource,
-            dir.path().join("other.part"),
+            area.next_take().unwrap(),
         );
         assert!(matches!(session, Session::Recording(_)));
         assert!(session.elapsed().unwrap() >= elapsed);
@@ -448,12 +591,11 @@ mod tests {
 
     #[test]
     fn unplug_of_one_source_keeps_the_session_and_other_audio() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("take.part");
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
         let plugged = Arc::new(AtomicBool::new(true));
         let system = PcmSource::with_plug([0.0, 0.0], Arc::clone(&plugged));
         let mut session = Session::Idle;
-        start_with(&mut session, PcmSource::tone(0.5), system, path);
+        start_with(&mut session, PcmSource::tone(0.5), system, staging);
         thread::sleep(Duration::from_millis(40));
         plugged.store(false, Ordering::SeqCst);
         thread::sleep(Duration::from_millis(40));
@@ -471,5 +613,94 @@ mod tests {
                 .any(|frame| (frame[0] - 0.5).abs() < 1e-6 && (frame[1] - 0.5).abs() < 1e-6),
             "microphone frames must remain after the system device is lost"
         );
+    }
+
+    #[test]
+    fn discard_deletes_the_file_and_returns_to_idle() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(30));
+        session.stop();
+        assert!(path.exists());
+        session.discard().unwrap();
+        assert!(matches!(session, Session::Idle));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn discard_failure_keeps_awaiting_save() {
+        let staging = StagingFile::reserved(PathBuf::from("onerec-missing-take.f32"));
+        let mut session = Session::AwaitingSave(PendingRecording {
+            staging_file: staging,
+            elapsed: Duration::ZERO,
+            mixed: Vec::new(),
+            degraded: false,
+        });
+        session.discard().unwrap_err();
+        assert!(matches!(session, Session::AwaitingSave(_)));
+        let Session::AwaitingSave(pending) = &session else {
+            unreachable!();
+        };
+        assert_eq!(pending.staging_file(), Path::new("onerec-missing-take.f32"));
+    }
+
+    #[test]
+    fn save_as_writes_wav_data_chunk_then_goes_idle() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(40));
+        session.stop();
+        let staged_bytes = std::fs::read(&path).unwrap();
+        assert!(!staged_bytes.is_empty());
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("take.wav");
+        session.save_as(&dest).unwrap();
+        assert!(matches!(session, Session::Idle));
+        assert!(!path.exists());
+        let wav = std::fs::read(&dest).unwrap();
+        assert_eq!(&wav[20..22], 3u16.to_le_bytes());
+        assert_eq!(wav_data_chunk(&wav), staged_bytes.as_slice());
+    }
+
+    #[test]
+    fn save_as_write_failure_stays_awaiting_save() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(30));
+        session.stop();
+        let dest = tempfile::tempdir().unwrap();
+        session.save_as(dest.path()).unwrap_err();
+        assert!(matches!(session, Session::AwaitingSave(_)));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn dropping_recording_unlinks_staging() {
+        let (session, path) = record_silence();
+        assert!(matches!(session, Session::Recording(_)));
+        assert!(path.exists());
+        drop(session);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dropping_awaiting_save_unlinks_staging() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(30));
+        session.stop();
+        assert!(matches!(session, Session::AwaitingSave(_)));
+        assert!(path.exists());
+        drop(session);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_session_detail_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingFile::reserved(dir.path().to_path_buf());
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, staging);
+        let Session::Failed(failed) = &session else {
+            panic!("expected Failed, got {session:?}");
+        };
+        assert!(!failed.detail().is_empty());
+        assert_eq!(failed.to_string(), failed.detail());
     }
 }

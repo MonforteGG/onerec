@@ -2,7 +2,9 @@ mod audio;
 mod capture;
 mod ids;
 mod session;
+mod staging;
 mod timeline;
+mod wave;
 
 pub use audio::{
     open_loopback, open_microphone, AudioError, CaptureStream, Endpoint, Endpoints, Microphone,
@@ -13,8 +15,9 @@ pub use capture::{
     SessionFrame, TimedStereoFrames,
 };
 pub use ids::{DeviceIdError, MicrophoneId, OutputDeviceId};
-pub use session::{FailedSession, PendingRecording, Session};
-pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+pub use session::{DiscardError, FailedSession, PendingRecording, SaveError, Session};
+pub use staging::{StagingArea, StagingFile};
+pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE, MIX_TICK};
 
 use std::fmt;
 
