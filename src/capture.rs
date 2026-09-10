@@ -66,6 +66,12 @@ pub trait CaptureSource: Send + 'static {
     fn read(&mut self, max_wait: Duration) -> Result<CaptureRead, CaptureError>;
 }
 
+impl CaptureSource for Box<dyn CaptureSource> {
+    fn read(&mut self, max_wait: Duration) -> Result<CaptureRead, CaptureError> {
+        (**self).read(max_wait)
+    }
+}
+
 #[derive(Debug)]
 pub struct CaptureError {
     detail: Arc<str>,

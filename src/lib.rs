@@ -1,6 +1,7 @@
 mod audio;
 mod capture;
 mod ids;
+mod recorder;
 mod session;
 mod staging;
 mod timeline;
