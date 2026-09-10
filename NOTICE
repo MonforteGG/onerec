@@ -1,0 +1,8 @@
+onerec
+Copyright (c) 2026 Alberto Díaz Muñoz
+
+This application is licensed under the MIT License. See LICENSE.
+
+A later release will statically link LAME to encode MP3.
+LAME is licensed under the GNU Lesser General Public License (LGPL).
+This commit does not include LAME.
