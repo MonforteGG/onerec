@@ -7,6 +7,10 @@ use std::time::Duration;
 pub struct SessionFrame(u64);
 
 impl SessionFrame {
+    pub(crate) fn from_index(index: u64) -> Self {
+        Self(index)
+    }
+
     pub fn index(self) -> u64 {
         self.0
     }
