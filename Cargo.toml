@@ -1,0 +1,10 @@
+[package]
+name = "onerec"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Alberto Díaz Muñoz"]
+
+[dev-dependencies]
+# 3.27 pulls getrandom 0.4, which needs edition 2024.
+tempfile = "=3.13.0"
