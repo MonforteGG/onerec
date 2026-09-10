@@ -55,7 +55,6 @@ impl TimedStereoFrames {
 #[derive(Debug)]
 pub enum CaptureRead {
     Frames(TimedStereoFrames),
-    /// No packet before the deadline. Not silence. Not end of stream.
     Pending,
 }
 
