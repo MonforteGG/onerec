@@ -230,6 +230,8 @@ fn mix_loop(
     let mut mic_live = true;
     let mut sys_live = true;
     let mut mixed = Vec::new();
+    let origin = Instant::now();
+    let mut quanta = 0u32;
 
     loop {
         match stop_rx.try_recv() {
@@ -245,8 +247,14 @@ fn mix_loop(
         let block = mix(&mic, &sys);
         write_block(&mut file, &block)?;
         mixed.extend_from_slice(&block);
+        quanta = quanta.saturating_add(1);
 
-        match stop_rx.recv_timeout(MIX_TICK) {
+        let due = origin + MIX_TICK * quanta;
+        let wait = due.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            continue;
+        }
+        match stop_rx.recv_timeout(wait) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -352,6 +360,30 @@ mod tests {
         assert!(
             elapsed <= wall + MIX_TICK,
             "elapsed {elapsed:?} drifted from wall {wall:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_pcm_duration_tracks_elapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.part");
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, path);
+        thread::sleep(Duration::from_millis(200));
+        session.stop();
+        let Session::AwaitingSave(pending) = &session else {
+            panic!("expected AwaitingSave, got {session:?}");
+        };
+        let sample_rate = MIX_QUANTUM_FRAMES as f64 / MIX_TICK.as_secs_f64();
+        let mixed = Duration::from_secs_f64(pending.mixed_frames().len() as f64 / sample_rate);
+        let elapsed = pending.elapsed();
+        assert!(
+            mixed + MIX_TICK * 3 >= elapsed,
+            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
+        );
+        assert!(
+            mixed <= elapsed + MIX_TICK,
+            "mixed {mixed:?} ran past elapsed {elapsed:?}"
         );
     }
 
