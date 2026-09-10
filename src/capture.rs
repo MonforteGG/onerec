@@ -55,7 +55,7 @@ impl TimedStereoFrames {
 #[derive(Debug)]
 pub enum CaptureRead {
     Frames(TimedStereoFrames),
-    Pending,
+    NoPacket,
 }
 
 pub trait CaptureSource: Send + 'static {
@@ -83,11 +83,11 @@ impl fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
-pub struct PendingSource;
+pub struct NoPacketSource;
 
-impl CaptureSource for PendingSource {
+impl CaptureSource for NoPacketSource {
     fn read(&mut self, _max_wait: Duration) -> Result<CaptureRead, CaptureError> {
-        Ok(CaptureRead::Pending)
+        Ok(CaptureRead::NoPacket)
     }
 }
 
@@ -137,11 +137,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_is_not_frames() {
-        let mut source = PendingSource;
+    fn no_packet_is_not_frames() {
+        let mut source = NoPacketSource;
         assert!(matches!(
             source.read(Duration::ZERO).unwrap(),
-            CaptureRead::Pending
+            CaptureRead::NoPacket
         ));
     }
 

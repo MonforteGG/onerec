@@ -269,7 +269,7 @@ fn pull(
         Ok(CaptureRead::Frames(frames)) => {
             buf.extend(frames.frames().iter().copied());
         }
-        Ok(CaptureRead::Pending) => {}
+        Ok(CaptureRead::NoPacket) => {}
         Err(_) => {
             *live = false;
             degraded.store(true, Ordering::SeqCst);
@@ -311,7 +311,7 @@ fn write_block(file: &mut File, block: &[[f32; 2]]) -> Result<(), FailedSession>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{PcmSource, PendingSource};
+    use crate::capture::{NoPacketSource, PcmSource};
 
     fn mic_id() -> MicrophoneId {
         MicrophoneId::parse("mic".into()).unwrap()
@@ -336,7 +336,7 @@ mod tests {
         let path = dir.path().join("take.part");
         let mut session = Session::Idle;
         let wall_origin = Instant::now();
-        start_with(&mut session, PcmSource::silence(), PendingSource, path);
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, path);
         assert!(matches!(session, Session::Recording(_)));
         thread::sleep(Duration::from_millis(120));
         session.stop();
@@ -363,7 +363,7 @@ mod tests {
         start_with(
             &mut session,
             PcmSource::tone(0.25),
-            PendingSource,
+            NoPacketSource,
             path.clone(),
         );
         thread::sleep(Duration::from_millis(30));
@@ -383,13 +383,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("take.part");
         let mut session = Session::Idle;
-        start_with(&mut session, PcmSource::tone(0.25), PendingSource, path);
+        start_with(&mut session, PcmSource::tone(0.25), NoPacketSource, path);
         thread::sleep(Duration::from_millis(40));
         let elapsed = session.elapsed().expect("recording elapsed");
         start_with(
             &mut session,
             PcmSource::silence(),
-            PendingSource,
+            NoPacketSource,
             dir.path().join("other.part"),
         );
         assert!(matches!(session, Session::Recording(_)));
