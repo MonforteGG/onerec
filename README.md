@@ -14,5 +14,6 @@ onerec records a Windows meeting into one mixed stereo MP3.
 If you cancel the save dialog, onerec keeps the recording and stays in Awaiting save.
 Choose **Save...** or **Discard**. You cannot start another recording until you do.
 
-v1 is a portable Windows 10 executable. This commit is the Linux-testable core.
-It has no WASAPI capture, no window, and no MP3 encoder. Run `cargo test` on Linux.
+v1 is a portable Windows 10 executable. This commit has WASAPI capture. It has no window and no MP3 encoder.
+
+Run `cargo test`. On Windows, `cargo run --example probe` lists devices and records two seconds of mixed PCM.
