@@ -356,6 +356,30 @@ mod tests {
     }
 
     #[test]
+    fn mixed_pcm_duration_tracks_elapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.part");
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, path);
+        thread::sleep(Duration::from_millis(200));
+        session.stop();
+        let Session::AwaitingSave(pending) = &session else {
+            panic!("expected AwaitingSave, got {session:?}");
+        };
+        let sample_rate = MIX_QUANTUM_FRAMES as f64 / MIX_TICK.as_secs_f64();
+        let mixed = Duration::from_secs_f64(pending.mixed_frames().len() as f64 / sample_rate);
+        let elapsed = pending.elapsed();
+        assert!(
+            mixed + MIX_TICK * 3 >= elapsed,
+            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
+        );
+        assert!(
+            mixed <= elapsed + MIX_TICK,
+            "mixed {mixed:?} ran past elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn cancel_save_keeps_awaiting_save_and_staging_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("take.part");
