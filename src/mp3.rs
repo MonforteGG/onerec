@@ -11,27 +11,43 @@ use crate::timeline::MIX_SAMPLE_RATE;
 
 const CHANNELS: u8 = 2;
 const STEREO_FRAME_BYTES: u64 = 8;
-const CHUNK_FRAMES: usize = MIX_SAMPLE_RATE as usize;
+const CHUNK_FRAMES: usize = MIX_SAMPLE_RATE as usize / 10;
 const FLUSH_CAPACITY: usize = 7200;
 
 static NEXT_PART: AtomicU64 = AtomicU64::new(0);
 
+struct Profile {
+    bitrate: Bitrate,
+    output_hz: u32,
+    mode: Mode,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExportQuality {
-    Compact,
     #[default]
+    Meeting,
+    Voice,
+    Compact,
     Standard,
     High,
 }
 
 impl ExportQuality {
-    pub const ALL: [Self; 3] = [Self::Compact, Self::Standard, Self::High];
+    pub const ALL: [Self; 5] = [
+        Self::Meeting,
+        Self::Voice,
+        Self::Compact,
+        Self::Standard,
+        Self::High,
+    ];
 
     pub const fn index(self) -> usize {
         match self {
-            Self::Compact => 0,
-            Self::Standard => 1,
-            Self::High => 2,
+            Self::Meeting => 0,
+            Self::Voice => 1,
+            Self::Compact => 2,
+            Self::Standard => 3,
+            Self::High => 4,
         }
     }
 
@@ -39,19 +55,53 @@ impl ExportQuality {
         Self::ALL.get(index).copied()
     }
 
-    pub const fn label(self) -> &'static str {
+    pub const fn short_name(self) -> &'static str {
         match self {
-            Self::Compact => "Compact (128 kbps)",
-            Self::Standard => "Standard (192 kbps)",
-            Self::High => "High (320 kbps)",
+            Self::Meeting => "Meeting",
+            Self::Voice => "Voice",
+            Self::Compact => "Compact",
+            Self::Standard => "Standard",
+            Self::High => "High",
         }
     }
 
-    fn bitrate(self) -> Bitrate {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Compact => Bitrate::Kbps128,
-            Self::Standard => Bitrate::Kbps192,
-            Self::High => Bitrate::Kbps320,
+            Self::Meeting => "Meeting (8 kbps, ~4 MB/h)",
+            Self::Voice => "Voice (24 kbps, ~11 MB/h)",
+            Self::Compact => "Compact (128 kbps, ~56 MB/h)",
+            Self::Standard => "Standard (192 kbps, ~84 MB/h)",
+            Self::High => "High (320 kbps, ~141 MB/h)",
+        }
+    }
+
+    fn profile(self) -> Profile {
+        match self {
+            Self::Meeting => Profile {
+                bitrate: Bitrate::Kbps8,
+                output_hz: 8_000,
+                mode: Mode::Mono,
+            },
+            Self::Voice => Profile {
+                bitrate: Bitrate::Kbps24,
+                output_hz: 16_000,
+                mode: Mode::Mono,
+            },
+            Self::Compact => Profile {
+                bitrate: Bitrate::Kbps128,
+                output_hz: 48_000,
+                mode: Mode::JointStereo,
+            },
+            Self::Standard => Profile {
+                bitrate: Bitrate::Kbps192,
+                output_hz: 48_000,
+                mode: Mode::JointStereo,
+            },
+            Self::High => Profile {
+                bitrate: Bitrate::Kbps320,
+                output_hz: 48_000,
+                mode: Mode::JointStereo,
+            },
         }
     }
 }
@@ -60,6 +110,19 @@ impl ExportQuality {
 pub struct SaveProgress {
     pub done: u64,
     pub total: u64,
+}
+
+impl SaveProgress {
+    pub fn fraction(self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+    }
+
+    pub fn percent(self) -> u8 {
+        (self.fraction() * 100.0).round().clamp(0.0, 100.0) as u8
+    }
 }
 
 pub(crate) struct Encode {
@@ -72,6 +135,7 @@ pub(crate) struct Encode {
     raw: Vec<u8>,
     pcm: Vec<f32>,
     encoded: Vec<u8>,
+    armed_flush: bool,
 }
 
 impl Encode {
@@ -100,6 +164,7 @@ impl Encode {
             raw: vec![0u8; CHUNK_FRAMES * STEREO_FRAME_BYTES as usize],
             pcm: Vec::with_capacity(CHUNK_FRAMES * usize::from(CHANNELS)),
             encoded: Vec::new(),
+            armed_flush: false,
         })
     }
 
@@ -126,9 +191,14 @@ impl Encode {
     }
 
     fn advance(&mut self) -> io::Result<bool> {
+        if self.armed_flush {
+            return self.flush_and_commit();
+        }
         let n = fill(&mut self.src, &mut self.raw)?;
         if n == 0 {
-            return self.flush_and_commit();
+            self.done = self.total;
+            self.armed_flush = true;
+            return Ok(false);
         }
         if n as u64 % STEREO_FRAME_BYTES != 0 {
             return Err(io::Error::new(
@@ -194,6 +264,7 @@ fn fill(src: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn lame(quality: ExportQuality) -> io::Result<Encoder> {
+    let profile = quality.profile();
     let mut builder = Builder::new().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "could not allocate the MP3 encoder")
     })?;
@@ -202,11 +273,11 @@ fn lame(quality: ExportQuality) -> io::Result<Encoder> {
         .set_sample_rate(MIX_SAMPLE_RATE)
         .map_err(encode_fail)?;
     builder
-        .set_output_sample_rate(NonZeroU32::new(MIX_SAMPLE_RATE))
+        .set_output_sample_rate(NonZeroU32::new(profile.output_hz))
         .map_err(encode_fail)?;
-    builder.set_brate(quality.bitrate()).map_err(encode_fail)?;
+    builder.set_brate(profile.bitrate).map_err(encode_fail)?;
     builder.set_quality(Quality::Best).map_err(encode_fail)?;
-    builder.set_mode(Mode::JointStereo).map_err(encode_fail)?;
+    builder.set_mode(profile.mode).map_err(encode_fail)?;
     builder.set_to_write_vbr_tag(true).map_err(encode_fail)?;
     builder.build().map_err(encode_fail)
 }
@@ -290,10 +361,29 @@ pub(crate) struct MpegLayer3Frame {
 
 #[cfg(test)]
 pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame>, String> {
-    const BITRATE_KBPS: [u16; 16] = [
+    let frames = parse_layer3_cbr(bytes)?;
+    for frame in &frames {
+        if frame.sample_rate != 48_000 || frame.channels != 2 {
+            return Err(format!(
+                "expected MPEG-1 48 kHz stereo, got {} Hz {} ch",
+                frame.sample_rate, frame.channels
+            ));
+        }
+    }
+    Ok(frames)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame>, String> {
+    const MPEG1_BR: [u16; 16] = [
         0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
     ];
-    const SAMPLE_RATE: [u32; 4] = [44_100, 48_000, 32_000, 0];
+    const MPEG2_BR: [u16; 16] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ];
+    const MPEG1_SR: [u32; 4] = [44_100, 48_000, 32_000, 0];
+    const MPEG2_SR: [u32; 4] = [22_050, 24_000, 16_000, 0];
+    const MPEG25_SR: [u32; 4] = [11_025, 12_000, 8_000, 0];
     if bytes.is_empty() {
         return Err("MP3 is empty".into());
     }
@@ -310,18 +400,20 @@ pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame
         if h0 != 0xFF || h1 & 0xE0 != 0xE0 {
             return Err(format!("missing MPEG sync at byte {offset}"));
         }
-        if h1 & 0x18 != 0x18 {
-            return Err(format!("not MPEG-1 at byte {offset}"));
-        }
         if h1 & 0x06 != 0x02 {
             return Err(format!("not Layer III at byte {offset}"));
         }
+        let version = (h1 >> 3) & 0b11;
         let bitrate_index = (h2 >> 4) as usize;
         let sample_rate_index = ((h2 >> 2) & 0b11) as usize;
         let padding = (h2 >> 1) & 1;
         let channel_mode = h3 >> 6;
-        let bitrate_kbps = BITRATE_KBPS[bitrate_index];
-        let sample_rate = SAMPLE_RATE[sample_rate_index];
+        let (bitrate_kbps, sample_rate, slot) = match version {
+            0b11 => (MPEG1_BR[bitrate_index], MPEG1_SR[sample_rate_index], 144u32),
+            0b10 => (MPEG2_BR[bitrate_index], MPEG2_SR[sample_rate_index], 72),
+            0b00 => (MPEG2_BR[bitrate_index], MPEG25_SR[sample_rate_index], 72),
+            _ => return Err(format!("reserved MPEG version at byte {offset}")),
+        };
         if bitrate_kbps == 0 {
             return Err(format!("bitrate index {bitrate_index} at byte {offset}"));
         }
@@ -330,14 +422,13 @@ pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame
                 "sample rate index {sample_rate_index} at byte {offset}"
             ));
         }
+        if channel_mode == 2 {
+            return Err(format!("dual-channel mode at byte {offset}"));
+        }
+        let mut byte_len = (slot * u32::from(bitrate_kbps) * 1000 / sample_rate) as usize;
         if padding != 0 {
-            return Err(format!("padded CBR frame at byte {offset}"));
+            byte_len += 1;
         }
-        if channel_mode > 1 {
-            return Err(format!("channel mode {channel_mode} at byte {offset}"));
-        }
-        // MPEG-1 Layer III CBR length is 144 * bitrate / sample_rate.
-        let byte_len = (144 * u32::from(bitrate_kbps) * 1000 / sample_rate) as usize;
         if offset + byte_len > bytes.len() {
             return Err(format!("truncated MPEG frame at byte {offset}"));
         }
@@ -345,7 +436,7 @@ pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame
             byte_len,
             sample_rate,
             bitrate_kbps,
-            channels: 2,
+            channels: if channel_mode == 3 { 1 } else { 2 },
         });
         offset += byte_len;
     }
@@ -356,6 +447,8 @@ pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame
 mod tests {
     use super::*;
     use std::f32::consts::PI;
+
+    const SECOND_FRAMES: usize = MIX_SAMPLE_RATE as usize;
 
     fn stage_frames(path: &Path, frames: usize, sample: impl Fn(usize) -> [f32; 2]) {
         let mut bytes = Vec::with_capacity(frames * STEREO_FRAME_BYTES as usize);
@@ -383,11 +476,15 @@ mod tests {
         fs::read(&dest).unwrap()
     }
 
-    fn assert_cbr_header(frame: &MpegLayer3Frame, bitrate_kbps: u16, byte_len: usize) {
-        assert_eq!(frame.byte_len, byte_len);
-        assert_eq!(frame.sample_rate, 48_000);
+    fn assert_cbr_header(
+        frame: &MpegLayer3Frame,
+        bitrate_kbps: u16,
+        sample_rate: u32,
+        channels: u8,
+    ) {
+        assert_eq!(frame.sample_rate, sample_rate);
         assert_eq!(frame.bitrate_kbps, bitrate_kbps);
-        assert_eq!(frame.channels, 2);
+        assert_eq!(frame.channels, channels);
     }
 
     fn leftovers(dir: &Path) -> usize {
@@ -399,41 +496,109 @@ mod tests {
     }
 
     #[test]
+    fn default_quality_is_meeting() {
+        assert_eq!(ExportQuality::default(), ExportQuality::Meeting);
+        assert_eq!(ExportQuality::Meeting.index(), 0);
+        assert_eq!(ExportQuality::from_index(0), Some(ExportQuality::Meeting));
+        assert_eq!(ExportQuality::from_index(5), None);
+    }
+
+    #[test]
+    fn combo_labels_name_size() {
+        for quality in ExportQuality::ALL {
+            let label = quality.label();
+            assert!(
+                label.starts_with(quality.short_name()),
+                "{label} does not start with {}",
+                quality.short_name()
+            );
+            assert!(label.contains("kbps"), "{label}");
+            assert!(label.contains("MB/h"), "{label}");
+        }
+    }
+
+    #[test]
+    fn percent_rounds_frame_counts() {
+        assert_eq!(SaveProgress { done: 0, total: 0 }.percent(), 0);
+        assert_eq!(SaveProgress { done: 1, total: 3 }.percent(), 33);
+        assert_eq!(
+            SaveProgress {
+                done: 10,
+                total: 10
+            }
+            .percent(),
+            100
+        );
+    }
+
+    #[test]
     fn writes_one_second_of_mpeg_layer_iii() {
         let dir = tempfile::tempdir().unwrap();
         let mp3 = encode_frames(
             dir.path(),
             "one-second",
-            CHUNK_FRAMES,
+            SECOND_FRAMES,
             ExportQuality::Standard,
         );
         assert_eq!(mp3.len(), 24_192);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert_eq!(frames.len(), 42);
         for frame in &frames {
-            assert_cbr_header(frame, 192, 576);
+            assert_cbr_header(frame, 192, 48_000, 2);
+            assert_eq!(frame.byte_len, 576);
         }
     }
 
     #[test]
     fn compact_headers_are_128_kbps() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(dir.path(), "compact", CHUNK_FRAMES, ExportQuality::Compact);
+        let mp3 = encode_frames(dir.path(), "compact", SECOND_FRAMES, ExportQuality::Compact);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
-            assert_cbr_header(frame, 128, 384);
+            assert_cbr_header(frame, 128, 48_000, 2);
+            assert_eq!(frame.byte_len, 384);
         }
     }
 
     #[test]
     fn high_headers_are_320_kbps() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(dir.path(), "high", CHUNK_FRAMES, ExportQuality::High);
+        let mp3 = encode_frames(dir.path(), "high", SECOND_FRAMES, ExportQuality::High);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
-            assert_cbr_header(frame, 320, 960);
+            assert_cbr_header(frame, 320, 48_000, 2);
+            assert_eq!(frame.byte_len, 960);
+        }
+    }
+
+    #[test]
+    fn meeting_headers_are_8_kbps_8_khz_mono() {
+        let dir = tempfile::tempdir().unwrap();
+        let meeting = encode_frames(dir.path(), "meeting", SECOND_FRAMES, ExportQuality::Meeting);
+        let compact = encode_frames(dir.path(), "compact", SECOND_FRAMES, ExportQuality::Compact);
+        let frames = parse_layer3_cbr(&meeting).unwrap();
+        assert!(!frames.is_empty());
+        for frame in &frames {
+            assert_cbr_header(frame, 8, 8_000, 1);
+        }
+        assert!(
+            meeting.len() < compact.len() / 8,
+            "meeting {} B was not far smaller than compact {} B",
+            meeting.len(),
+            compact.len()
+        );
+    }
+
+    #[test]
+    fn voice_headers_are_24_kbps_16_khz_mono() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3 = encode_frames(dir.path(), "voice", SECOND_FRAMES, ExportQuality::Voice);
+        let frames = parse_layer3_cbr(&mp3).unwrap();
+        assert!(!frames.is_empty());
+        for frame in &frames {
+            assert_cbr_header(frame, 24, 16_000, 1);
         }
     }
 
@@ -443,13 +608,13 @@ mod tests {
         let short = encode_frames(
             dir.path(),
             "one-second",
-            CHUNK_FRAMES,
+            SECOND_FRAMES,
             ExportQuality::Standard,
         );
         let long = encode_frames(
             dir.path(),
             "two-seconds",
-            CHUNK_FRAMES * 2,
+            SECOND_FRAMES * 2,
             ExportQuality::Standard,
         );
         let short_frames = parse_mpeg1_layer3_cbr(&short).unwrap();
@@ -461,7 +626,8 @@ mod tests {
             short_frames.len()
         );
         for frame in short_frames.iter().chain(&long_frames) {
-            assert_cbr_header(frame, 192, 576);
+            assert_cbr_header(frame, 192, 48_000, 2);
+            assert_eq!(frame.byte_len, 576);
         }
     }
 
@@ -470,7 +636,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take");
-        stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        stage_frames(&staged, SECOND_FRAMES, sine_frame);
         write(&dest, &staged, ExportQuality::Standard).unwrap();
         let mp3 = fs::read(&dest).unwrap();
         assert_eq!(mp3.len(), 24_192);
@@ -482,7 +648,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take.mp3");
-        stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        stage_frames(&staged, SECOND_FRAMES, sine_frame);
         fs::write(&dest, b"old").unwrap();
         write(&dest, &staged, ExportQuality::Standard).unwrap();
         let mp3 = fs::read(&dest).unwrap();
@@ -506,7 +672,7 @@ mod tests {
     fn unwritable_destination_unlinks_the_part() {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
-        stage_frames(&staged, CHUNK_FRAMES, |_| [0.0, 0.0]);
+        stage_frames(&staged, SECOND_FRAMES, |_| [0.0, 0.0]);
         write(dir.path(), &staged, ExportQuality::Standard).unwrap_err();
         assert_eq!(leftovers(dir.path()), 0);
         assert!(dir.path().is_dir());
@@ -538,5 +704,22 @@ mod tests {
         while !encode.pump(Duration::from_secs(60)).unwrap() {}
         assert!(dest.exists());
         assert_eq!(leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn pump_reports_full_progress_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("one.f32");
+        let dest = dir.path().join("one.mp3");
+        stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        let mut encode = Encode::start(&dest, &staged, ExportQuality::Standard).unwrap();
+        assert!(!encode.pump(Duration::ZERO).unwrap());
+        while encode.progress().done < encode.progress().total {
+            assert!(!encode.pump(Duration::ZERO).unwrap());
+        }
+        assert_eq!(encode.progress().percent(), 100);
+        assert!(!dest.exists());
+        assert!(encode.pump(Duration::from_secs(1)).unwrap());
+        assert!(dest.exists());
     }
 }

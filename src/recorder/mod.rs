@@ -149,7 +149,7 @@ impl Recorder {
             endpoints_dirty: true,
             microphone,
             output,
-            quality: ExportQuality::Standard,
+            quality: ExportQuality::Meeting,
             session: Session::Idle,
             microphone_vu: Vu::new(),
             system_vu: Vu::new(),
@@ -281,7 +281,7 @@ impl Recorder {
 
     fn save_to(&mut self, destination: &std::path::Path) {
         match self.session.save_as(destination, self.quality) {
-            Ok(()) => {}
+            Ok(()) => self.notice = None,
             Err(SaveError::NoTake) => {}
             Err(SaveError::Write(detail)) => self.notice = Some(warn(detail)),
         }
@@ -445,7 +445,11 @@ impl Recorder {
                 }
             },
             progress: self.session.save_progress(),
-            status: self.notice.clone().unwrap_or_else(|| self.derived_status()),
+            status: if matches!(self.session, Session::Saving(_)) {
+                self.derived_status()
+            } else {
+                self.notice.clone().unwrap_or_else(|| self.derived_status())
+            },
             ask: self.pending_ask.take(),
         }
     }
@@ -500,7 +504,17 @@ impl Recorder {
             Session::AwaitingSave(_) => {
                 neutral("Take ready. Save or discard it before the next one.")
             }
-            Session::Saving(_) => neutral("Saving MP3…"),
+            Session::Saving(_) => {
+                let percent = self
+                    .session
+                    .save_progress()
+                    .map(SaveProgress::percent)
+                    .unwrap_or(0);
+                neutral(format!(
+                    "Saving {} MP3, {percent}%",
+                    self.quality.short_name()
+                ))
+            }
             Session::Failed(failed) => Status {
                 text: failed.to_string(),
                 tone: Tone::Failure,
@@ -832,7 +846,7 @@ mod tests {
         assert!(!started.transport.save_enabled);
         assert!(!started.transport.toggle_enabled);
         assert!(!started.quality.enabled);
-        assert_eq!(started.status.text, "Saving MP3…");
+        assert_eq!(started.status.text, "Saving Meeting MP3, 0%");
         let saved = finish_save(&mut recorder);
         assert_eq!(saved.transport.toggle_label, "Start recording");
         assert!(saved.transport.toggle_enabled);
@@ -842,10 +856,36 @@ mod tests {
     }
 
     #[test]
-    fn quality_defaults_to_standard_and_changes_while_idle() {
+    fn save_to_after_cancel_still_shows_saving_status() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        recorder.apply(Intent::CancelSave);
+        let dest = tempfile::tempdir().unwrap();
+        let path = dest.path().join("take.mp3");
+        let started = recorder.apply(Intent::SaveTo(path.clone()));
+        assert!(
+            started.status.text.starts_with("Saving Meeting MP3, "),
+            "{}",
+            started.status.text
+        );
+        assert!(
+            started.status.text.ends_with('%'),
+            "{}",
+            started.status.text
+        );
+        let percent = started.progress.expect("save started").percent();
+        assert_eq!(
+            started.status.text,
+            format!("Saving Meeting MP3, {percent}%")
+        );
+        finish_save(&mut recorder);
+    }
+
+    #[test]
+    fn quality_defaults_to_meeting_and_changes_while_idle() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         let view = recorder.apply(Intent::Tick);
-        assert_eq!(view.quality.selected, Some(ExportQuality::Standard.index()));
+        assert_eq!(view.quality.selected, Some(ExportQuality::Meeting.index()));
         assert!(view.quality.enabled);
         let high = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
         assert_eq!(high.quality.selected, Some(ExportQuality::High.index()));
