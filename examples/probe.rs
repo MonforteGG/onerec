@@ -65,9 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     probe::report("microphone", &microphone_meter);
     probe::report("loopback", &loopback_meter);
+    let mixed_frames = std::fs::metadata(pending.staging_file())?.len() / 8;
     println!(
         "mixed: {} frames over {:?}, degraded {}",
-        pending.mixed_frames().len(),
+        mixed_frames,
         pending.elapsed(),
         pending.is_degraded()
     );

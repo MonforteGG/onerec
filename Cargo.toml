@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 authors = ["Alberto Díaz Muñoz"]
 
+[dependencies]
+mp3lame-encoder = "0.2.5"
+
 [[bin]]
 name = "onerec"
 path = "src/main.rs"
