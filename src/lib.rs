@@ -1,11 +1,11 @@
 mod audio;
 mod capture;
 mod ids;
+mod mp3;
 mod recorder;
 mod session;
 mod staging;
 mod timeline;
-mod wave;
 #[cfg(windows)]
 mod window;
 

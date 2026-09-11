@@ -267,8 +267,8 @@ impl Recorder {
         }
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
             name_stem: "onerec",
-            filter_label: "Waveform audio",
-            extension: "wav",
+            filter_label: "MP3 audio",
+            extension: "mp3",
         }));
     }
 
@@ -760,13 +760,13 @@ mod tests {
             asked.ask,
             Some(Ask::SaveDestination(SavePrompt {
                 name_stem: "onerec",
-                filter_label: "Waveform audio",
-                extension: "wav",
+                filter_label: "MP3 audio",
+                extension: "mp3",
             }))
         );
         assert_eq!(recorder.apply(Intent::Tick).ask, None);
         let dest = tempfile::tempdir().unwrap();
-        let path = dest.path().join("take.wav");
+        let path = dest.path().join("take.mp3");
         let saved = recorder.apply(Intent::SaveTo(path.clone()));
         assert_eq!(saved.transport.toggle_label, "Start recording");
         assert!(saved.transport.toggle_enabled);
