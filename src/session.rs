@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::capture::{CaptureRead, CaptureSource};
 use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::staging::StagingFile;
-use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE, MIX_TICK};
+use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
 
 pub enum Session {
     Idle,
@@ -26,7 +26,7 @@ pub struct ActiveRecording {
     output: OutputDeviceId,
     started_at: Instant,
     stop_tx: Option<Sender<()>>,
-    worker: Option<JoinHandle<Result<Vec<[f32; 2]>, FailedSession>>>,
+    worker: Option<JoinHandle<Result<(), FailedSession>>>,
     degraded: Arc<AtomicBool>,
     staging_file: StagingFile,
 }
@@ -34,7 +34,6 @@ pub struct ActiveRecording {
 pub struct PendingRecording {
     staging_file: StagingFile,
     elapsed: Duration,
-    mixed: Vec<[f32; 2]>,
     degraded: bool,
 }
 
@@ -86,10 +85,6 @@ impl PendingRecording {
 
     pub fn elapsed(&self) -> Duration {
         self.elapsed
-    }
-
-    pub fn mixed_frames(&self) -> &[[f32; 2]] {
-        &self.mixed
     }
 
     pub fn is_degraded(&self) -> bool {
@@ -187,7 +182,7 @@ impl Session {
         let Session::AwaitingSave(pending) = self else {
             return Err(SaveError::NoTake);
         };
-        crate::wave::write(destination, pending.staging_file.path(), MIX_SAMPLE_RATE)
+        crate::mp3::write(destination, pending.staging_file())
             .map_err(|error| SaveError::Write(error.to_string()))?;
         *self = Session::Idle;
         Ok(())
@@ -297,10 +292,9 @@ impl ActiveRecording {
         let staging_file = self.staging_file.take();
         match self.worker.take() {
             Some(worker) => match worker.join() {
-                Ok(Ok(mixed)) => Session::AwaitingSave(PendingRecording {
+                Ok(Ok(())) => Session::AwaitingSave(PendingRecording {
                     staging_file,
                     elapsed: self.started_at.elapsed(),
-                    mixed,
                     degraded: self.degraded.load(Ordering::SeqCst),
                 }),
                 Ok(Err(mut failed)) => {
@@ -344,12 +338,11 @@ fn mix_loop(
     mut file: File,
     stop_rx: Receiver<()>,
     degraded: Arc<AtomicBool>,
-) -> Result<Vec<[f32; 2]>, FailedSession> {
+) -> Result<(), FailedSession> {
     let mut mic_buf = VecDeque::new();
     let mut sys_buf = VecDeque::new();
     let mut mic_live = true;
     let mut sys_live = true;
-    let mut mixed = Vec::new();
     let origin = Instant::now();
     let mut quanta = 0u32;
 
@@ -366,7 +359,6 @@ fn mix_loop(
         let sys = take_quantum(&mut sys_buf);
         let block = mix(&mic, &sys);
         write_block(&mut file, &block)?;
-        mixed.extend_from_slice(&block);
         quanta = quanta.saturating_add(1);
 
         let due = origin + MIX_TICK * quanta;
@@ -381,7 +373,7 @@ fn mix_loop(
     }
 
     file.sync_all().map_err(io_fail)?;
-    Ok(mixed)
+    Ok(())
 }
 
 fn pull(
@@ -441,6 +433,7 @@ mod tests {
     use super::*;
     use crate::capture::{NoPacketSource, PcmSource};
     use crate::staging::StagingArea;
+    use crate::timeline::MIX_SAMPLE_RATE;
 
     fn mic_id() -> MicrophoneId {
         MicrophoneId::parse("mic".into()).unwrap()
@@ -467,26 +460,17 @@ mod tests {
         (session, path)
     }
 
-    fn wav_data_chunk(bytes: &[u8]) -> &[u8] {
-        assert!(bytes.len() >= 12);
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[8..12], b"WAVE");
-        let mut offset = 12usize;
-        while offset + 8 <= bytes.len() {
-            let id = &bytes[offset..offset + 4];
-            let size =
-                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-            offset += 8;
-            assert!(offset + size <= bytes.len());
-            if id == b"data" {
-                return &bytes[offset..offset + size];
-            }
-            offset += size;
-            if size % 2 == 1 {
-                offset += 1;
-            }
-        }
-        panic!("WAV has no data chunk");
+    fn staged_frame_count(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len() / 8
+    }
+
+    fn staged_interleaved_f32(path: &Path) -> Vec<f32> {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len() % 8, 0, "staging length {}", bytes.len());
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
     }
 
     #[test]
@@ -522,7 +506,7 @@ mod tests {
             panic!("expected AwaitingSave, got {session:?}");
         };
         let mixed = Duration::from_secs_f64(
-            pending.mixed_frames().len() as f64 / f64::from(MIX_SAMPLE_RATE),
+            staged_frame_count(pending.staging_file()) as f64 / f64::from(MIX_SAMPLE_RATE),
         );
         let elapsed = pending.elapsed();
         assert!(
@@ -573,10 +557,9 @@ mod tests {
         let Session::AwaitingSave(pending) = &session else {
             panic!("expected AwaitingSave, got {session:?}");
         };
+        let pcm = staged_interleaved_f32(pending.staging_file());
         assert!(
-            pending
-                .mixed_frames()
-                .iter()
+            pcm.chunks_exact(2)
                 .any(|frame| frame[0] != 0.0 || frame[1] != 0.0),
             "second start must not replace the live tone source"
         );
@@ -606,10 +589,9 @@ mod tests {
             panic!("expected AwaitingSave, got {session:?}");
         };
         assert!(pending.is_degraded());
+        let pcm = staged_interleaved_f32(pending.staging_file());
         assert!(
-            pending
-                .mixed_frames()
-                .iter()
+            pcm.chunks_exact(2)
                 .any(|frame| (frame[0] - 0.5).abs() < 1e-6 && (frame[1] - 0.5).abs() < 1e-6),
             "microphone frames must remain after the system device is lost"
         );
@@ -632,7 +614,6 @@ mod tests {
         let mut session = Session::AwaitingSave(PendingRecording {
             staging_file: staging,
             elapsed: Duration::ZERO,
-            mixed: Vec::new(),
             degraded: false,
         });
         session.discard().unwrap_err();
@@ -644,20 +625,36 @@ mod tests {
     }
 
     #[test]
-    fn save_as_writes_wav_data_chunk_then_goes_idle() {
+    fn save_as_writes_mp3_then_goes_idle() {
         let (mut session, path) = record_silence();
         thread::sleep(Duration::from_millis(40));
         session.stop();
-        let staged_bytes = std::fs::read(&path).unwrap();
-        assert!(!staged_bytes.is_empty());
+        assert!(path.exists());
         let dest_dir = tempfile::tempdir().unwrap();
-        let dest = dest_dir.path().join("take.wav");
+        let dest = dest_dir.path().join("take.mp3");
         session.save_as(&dest).unwrap();
         assert!(matches!(session, Session::Idle));
         assert!(!path.exists());
-        let wav = std::fs::read(&dest).unwrap();
-        assert_eq!(&wav[20..22], 3u16.to_le_bytes());
-        assert_eq!(wav_data_chunk(&wav), staged_bytes.as_slice());
+        let mp3 = std::fs::read(&dest).unwrap();
+        assert_eq!(mp3[0], 0xFF);
+        assert_eq!(mp3[1] & 0xE0, 0xE0);
+    }
+
+    #[test]
+    fn save_as_unaligned_staging_stays_awaiting_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("take.f32");
+        std::fs::write(&staged, [0u8; 7]).unwrap();
+        let mut session = Session::AwaitingSave(PendingRecording {
+            staging_file: StagingFile::reserved(staged.clone()),
+            elapsed: Duration::ZERO,
+            degraded: false,
+        });
+        let dest = dir.path().join("take.mp3");
+        session.save_as(&dest).unwrap_err();
+        assert!(matches!(session, Session::AwaitingSave(_)));
+        assert!(staged.exists());
+        assert!(!dest.exists());
     }
 
     #[test]
