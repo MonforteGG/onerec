@@ -1,41 +1,52 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 
-use ::windows::core::{w, PCWSTR};
+use ::windows::core::{w, HSTRING, PCWSTR};
 use ::windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use ::windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetSysColorBrush, UpdateWindow, COLOR_BTNFACE, HDC, PAINTSTRUCT,
+    BeginPaint, EndPaint, FillRect, GetSysColorBrush, UpdateWindow, COLOR_WINDOW, HDC, PAINTSTRUCT,
 };
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use ::windows::Win32::UI::Controls::{NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW};
+use ::windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
+};
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
+use ::windows::Win32::UI::Shell::ShellExecuteW;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, MessageBoxW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, LoadImageW, MessageBoxW,
     PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer, SetWindowLongPtrW,
     ShowWindow, TranslateMessage, BN_CLICKED, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE,
     CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR,
-    IDC_ARROW, IDC_WAIT, IDYES, MB_ICONWARNING, MB_YESNO, MSG, SW_SHOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_HOTKEY,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_ICONWARNING, MB_YESNO, MSG,
+    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_HOTKEY, WM_PAINT,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::paint::{
-    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_MICROPHONE, ID_OUTPUT, ID_QUALITY,
-    ID_SAVE, ID_TOGGLE,
+    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
+    ID_QUALITY, ID_REFRESH, ID_SAVE, ID_TOGGLE,
 };
 use super::save_dialog;
-use crate::recorder::{Ask, Intent, Recorder};
+use crate::recorder::{Ask, Intent, Phase, Recorder};
 use crate::RunError;
+use ::windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_ERASEBKGND, WM_NOTIFY, WM_PRINTCLIENT,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WS_CLIPCHILDREN,
+};
 
 const CLASS_NAME: PCWSTR = w!("onerec.window");
 const TITLE: PCWSTR = w!("onerec");
 const TOGGLE_HOTKEY: i32 = 1;
 const TICK_TIMER: usize = 1;
-const TICK_MS: u32 = 50;
-const STYLE: WINDOW_STYLE =
-    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(
+    WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0,
+);
 
 pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }
@@ -44,13 +55,20 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
     register_class(instance)?;
     let root = create_window(instance)?;
     let controls = Controls::create(root, instance)?;
-    if unsafe { SetTimer(root, TICK_TIMER, TICK_MS, None) } == 0 {
-        return Err(RunError::new("the recorder could not start its clock"));
-    }
+    let icons = Icons::load(root, instance);
 
     // The shell lives on this stack frame until GetMessageW returns WM_QUIT, so the
     // GWLP_USERDATA pointer cannot outlive it.
-    let shell = RefCell::new(Shell { recorder, controls });
+    let shell = RefCell::new(Shell {
+        recorder,
+        controls,
+        icons,
+        timer_ms: None,
+        phase: Phase::Idle,
+        saved_path: None,
+        modal: false,
+        refresh_after_picker: false,
+    });
     unsafe { SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize) };
     let hotkey = unsafe {
         RegisterHotKey(
@@ -60,7 +78,7 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
             b'R' as u32,
         )
     };
-    shell.borrow_mut().dispatch(
+    dispatch(
         root,
         match hotkey {
             Ok(()) => Intent::Tick,
@@ -100,30 +118,107 @@ fn pump(root: HWND) -> Result<(), RunError> {
 struct Shell {
     recorder: Recorder,
     controls: Controls,
+    icons: Icons,
+    timer_ms: Option<u32>,
+    phase: Phase,
+    saved_path: Option<std::path::PathBuf>,
+    modal: bool,
+    refresh_after_picker: bool,
+}
+
+// Release the borrow before opening a native modal dialog: its nested message
+// loop must still be able to paint the window and observe the export worker.
+fn dispatch(root: HWND, intent: Intent) {
+    let Some(Some(view)) = with_shell(root, |shell| {
+        if shell.modal && !matches!(intent, Intent::Tick) {
+            return None;
+        }
+        let blocking = matches!(intent, Intent::Toggle | Intent::DiscardAndClose);
+        let _wait = blocking.then(WaitCursor::show);
+        let view = shell.recorder.apply(intent);
+        shell.phase = view.phase;
+        shell.saved_path.clone_from(&view.saved_path);
+        shell.controls.show(root, &view);
+        shell.sync_timer(root);
+        Some(view)
+    }) else {
+        return;
+    };
+    match view.ask {
+        None => {}
+        Some(Ask::Close) => unsafe {
+            let _ = DestroyWindow(root);
+        },
+        Some(Ask::ConfirmClose) => {
+            if modal(root, || confirmed_close(root)) {
+                dispatch(root, Intent::DiscardAndClose);
+            }
+        }
+        Some(Ask::ConfirmDiscard) => {
+            let question = HSTRING::from(format!(
+                "Discard this {} recording? It has not been saved.",
+                view.elapsed
+            ));
+            if modal(root, || unsafe {
+                MessageBoxW(
+                    root,
+                    &question,
+                    TITLE,
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                )
+            }) == IDYES
+            {
+                dispatch(root, Intent::Discard);
+            }
+        }
+        Some(Ask::SaveDestination(prompt)) => {
+            let next = match modal(root, || save_dialog::ask_destination(root, &prompt)) {
+                Some(path) => Intent::SaveTo(path),
+                None => Intent::CancelSave,
+            };
+            dispatch(root, next);
+        }
+    }
+}
+
+fn modal<T>(root: HWND, dialog: impl FnOnce() -> T) -> T {
+    with_shell(root, |shell| shell.modal = true);
+    let result = dialog();
+    with_shell(root, |shell| shell.modal = false);
+    result
 }
 
 impl Shell {
-    fn dispatch(&mut self, root: HWND, intent: Intent) {
-        let blocking = matches!(intent, Intent::Toggle | Intent::DiscardAndClose);
-        let _wait = blocking.then(WaitCursor::show);
-        let view = self.recorder.apply(intent);
-        self.controls.show(root, &view);
-        match view.ask {
-            None => {}
-            Some(Ask::Close) => unsafe {
-                let _ = DestroyWindow(root);
-            },
-            Some(Ask::ConfirmClose) => {
-                if confirmed_close(root) {
-                    self.dispatch(root, Intent::DiscardAndClose);
+    fn sync_timer(&mut self, root: HWND) {
+        let wanted = self.phase.timer_ms(unsafe { IsIconic(root) }.as_bool());
+        if wanted == self.timer_ms {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(root, TICK_TIMER);
+            if let Some(interval) = wanted {
+                if SetTimer(root, TICK_TIMER, interval, None) == 0 {
+                    // Keep the window usable so the take can still be stopped/saved.
+                    MessageBoxW(root, w!("The display timer could not start. Close other applications and try again."), TITLE, MB_ICONWARNING);
+                    self.timer_ms = None;
+                    return;
                 }
             }
-            Some(Ask::SaveDestination(prompt)) => {
-                let next = match save_dialog::ask_destination(root, &prompt) {
-                    Some(path) => Intent::SaveTo(path),
-                    None => Intent::CancelSave,
-                };
-                self.dispatch(root, next);
+        }
+        self.timer_ms = wanted;
+    }
+
+    fn open_folder(&self, root: HWND) {
+        if let Some(folder) = self.saved_path.as_deref().and_then(std::path::Path::parent) {
+            unsafe {
+                ShellExecuteW(
+                    root,
+                    w!("open"),
+                    &HSTRING::from(folder.as_os_str()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                );
             }
         }
     }
@@ -135,7 +230,7 @@ fn confirmed_close(root: HWND) -> bool {
             root,
             w!("This take has not been saved. Close onerec and discard it?"),
             TITLE,
-            MB_YESNO | MB_ICONWARNING,
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
         )
     };
     answer == IDYES
@@ -148,7 +243,7 @@ fn register_class(instance: HINSTANCE) -> Result<(), RunError> {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-        hbrBackground: unsafe { GetSysColorBrush(COLOR_BTNFACE) },
+        hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
         lpszClassName: CLASS_NAME,
         ..Default::default()
     };
@@ -161,14 +256,65 @@ fn register_class(instance: HINSTANCE) -> Result<(), RunError> {
     Ok(())
 }
 
+// MAKEINTRESOURCEW(1) is an integer resource identifier, never dereferenced.
+#[allow(clippy::manual_dangling_ptr)]
+fn app_icon(instance: HINSTANCE, small: bool, dpi: u32) -> HICON {
+    let (width, height) = if small {
+        (SM_CXSMICON, SM_CYSMICON)
+    } else {
+        (SM_CXICON, SM_CYICON)
+    };
+    // Each DPI-specific handle is owned by Icons; avoid the LR_SHARED size cache.
+    unsafe {
+        LoadImageW(
+            instance,
+            PCWSTR(1usize as *const u16),
+            IMAGE_ICON,
+            GetSystemMetricsForDpi(width, dpi),
+            GetSystemMetricsForDpi(height, dpi),
+            LR_DEFAULTCOLOR,
+        )
+    }
+    .map(|handle| HICON(handle.0))
+    .unwrap_or_default()
+}
+
+struct Icons {
+    large: HICON,
+    small: HICON,
+}
+impl Icons {
+    fn load(root: HWND, instance: HINSTANCE) -> Self {
+        let dpi = unsafe { GetDpiForWindow(root) }.max(96);
+        let icons = Self {
+            large: app_icon(instance, false, dpi),
+            small: app_icon(instance, true, dpi),
+        };
+        unsafe {
+            SendMessageW(root, WM_SETICON, WPARAM(1), LPARAM(icons.large.0 as isize));
+            SendMessageW(root, WM_SETICON, WPARAM(0), LPARAM(icons.small.0 as isize));
+        }
+        icons
+    }
+}
+impl Drop for Icons {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyIcon(self.large);
+            let _ = DestroyIcon(self.small);
+        }
+    }
+}
+
 fn create_window(instance: HINSTANCE) -> Result<HWND, RunError> {
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
     let mut frame = RECT {
         left: 0,
         top: 0,
-        right: CLIENT_WIDTH,
-        bottom: CLIENT_HEIGHT,
+        right: super::paint::scale(CLIENT_WIDTH, dpi),
+        bottom: super::paint::scale(CLIENT_HEIGHT, dpi),
     };
-    unsafe { AdjustWindowRectEx(&mut frame, STYLE, false, WINDOW_EX_STYLE(0)) }
+    unsafe { AdjustWindowRectExForDpi(&mut frame, STYLE, false, WINDOW_EX_STYLE(0), dpi) }
         .map_err(|error| RunError::new(format!("sizing the window failed: {error}")))?;
     unsafe {
         CreateWindowExW(
@@ -205,26 +351,57 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match message {
         WM_COMMAND => {
+            if (wparam.0 & 0xffff) as u16 == ID_FOLDER {
+                with_shell(root, |shell| shell.open_folder(root));
+                return LRESULT(0);
+            }
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
             let list_dropped =
                 with_shell(root, |shell| shell.controls.list_dropped()).unwrap_or(false);
             if let Some(intent) = command(wparam, lparam, list_dropped) {
-                with_shell(root, |shell| shell.dispatch(root, intent));
+                dispatch(root, intent);
             }
             match notification {
                 CBN_DROPDOWN => {
                     with_shell(root, |shell| shell.controls.set_list_dropped(true));
                 }
                 CBN_CLOSEUP => {
-                    with_shell(root, |shell| shell.controls.set_list_dropped(false));
+                    let refresh = with_shell(root, |shell| {
+                        shell.controls.set_list_dropped(false);
+                        std::mem::take(&mut shell.refresh_after_picker)
+                    })
+                    .unwrap_or(false);
+                    dispatch(
+                        root,
+                        if refresh {
+                            Intent::RefreshEndpoints
+                        } else {
+                            Intent::Tick
+                        },
+                    );
                 }
                 _ => {}
             }
             LRESULT(0)
         }
         WM_TIMER | WM_HOTKEY | WM_DEVICECHANGE | WM_CLOSE => {
+            // Keep combo row indices tied to the currently displayed endpoint
+            // list until the user commits or cancels the open picker.
+            if message == WM_DEVICECHANGE
+                && with_shell(root, |shell| {
+                    if shell.controls.list_dropped() {
+                        shell.refresh_after_picker = true;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+            {
+                return LRESULT(0);
+            }
             if let Some(intent) = translate(message, wparam, lparam) {
-                with_shell(root, |shell| shell.dispatch(root, intent));
+                dispatch(root, intent);
             }
             LRESULT(0)
         }
@@ -235,11 +412,71 @@ unsafe extern "system" fn wnd_proc(
             let _ = EndPaint(root, &paint);
             LRESULT(0)
         }
+        WM_PRINTCLIENT => {
+            with_shell(root, |shell| {
+                shell.controls.draw_meters(HDC(wparam.0 as *mut c_void))
+            });
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => {
+            let mut rect = RECT::default();
+            let _ = GetClientRect(root, &mut rect);
+            let brush = with_shell(root, |shell| shell.controls.background())
+                .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW));
+            FillRect(HDC(wparam.0 as *mut c_void), &rect, brush);
+            LRESULT(1)
+        }
+        WM_NOTIFY => {
+            if let Some(header) = (lparam.0 as *const NMHDR).as_ref() {
+                if header.code == NM_CUSTOMDRAW {
+                    let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
+                    if let Some(result) =
+                        with_shell(root, |shell| shell.controls.draw_button(draw)).flatten()
+                    {
+                        return LRESULT(result as isize);
+                    }
+                }
+            }
+            DefWindowProcW(root, message, wparam, lparam)
+        }
+        WM_DPICHANGED => {
+            let suggested = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(
+                root,
+                None,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            with_shell(root, |shell| {
+                shell
+                    .controls
+                    .refresh_theme(root, (wparam.0 & 0xffff) as u32);
+                if let Ok(module) = GetModuleHandleW(None) {
+                    shell.icons = Icons::load(root, module.into());
+                }
+            });
+            dispatch(root, Intent::Tick);
+            LRESULT(0)
+        }
+        WM_THEMECHANGED | WM_SYSCOLORCHANGE | WM_SETTINGCHANGE => {
+            with_shell(root, |shell| {
+                shell.controls.refresh_theme(root, GetDpiForWindow(root));
+            });
+            dispatch(root, Intent::Tick);
+            DefWindowProcW(root, message, wparam, lparam)
+        }
+        WM_SIZE => {
+            with_shell(root, |shell| shell.sync_timer(root));
+            DefWindowProcW(root, message, wparam, lparam)
+        }
         WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut c_void);
             let control = HWND(lparam.0 as *mut c_void);
             let brush = with_shell(root, |shell| shell.controls.color_static(control, hdc))
-                .unwrap_or_else(|| GetSysColorBrush(COLOR_BTNFACE));
+                .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW));
             LRESULT(brush.0 as isize)
         }
         WM_DESTROY => {
@@ -282,7 +519,8 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
-        (BN_CLICKED, ID_DISCARD) => Some(Intent::Discard),
+        (BN_CLICKED, ID_DISCARD) => Some(Intent::RequestDiscard),
+        (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),
         _ => None,
     }
 }
@@ -310,3 +548,7 @@ impl Drop for WaitCursor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "preview_tests.rs"]
+mod preview_tests;

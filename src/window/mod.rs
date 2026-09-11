@@ -1,6 +1,7 @@
 mod paint;
 mod save_dialog;
 mod shell;
+mod theme;
 
 use ::windows::core::{w, HSTRING};
 use ::windows::Win32::Foundation::RPC_E_CHANGED_MODE;

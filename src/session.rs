@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -28,9 +28,74 @@ pub enum Session {
 }
 
 pub struct ActiveSave {
-    encode: Encode,
+    worker: ExportWorker,
     destination: PathBuf,
     pending: PendingRecording,
+}
+
+// Only exists while exporting. The UI observes atomics and never encodes audio.
+struct ExportWorker {
+    thread: Option<JoinHandle<io::Result<()>>>,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicU64>,
+    total: u64,
+}
+
+impl ExportWorker {
+    fn start(mut encode: Encode) -> io::Result<Self> {
+        let total = encode.progress().total;
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let worker_cancel = Arc::clone(&cancel);
+        let thread = thread::Builder::new()
+            .name("onerec-export".into())
+            .spawn(move || {
+                while !worker_cancel.load(Ordering::Relaxed) {
+                    let complete = encode.pump(SAVE_SLICE)?;
+                    worker_done.store(encode.progress().done, Ordering::Relaxed);
+                    if complete {
+                        return Ok(());
+                    }
+                }
+                Ok(()) // Dropping Encode removes any uncommitted output.
+            })?;
+        Ok(Self {
+            thread: Some(thread),
+            cancel,
+            done,
+            total,
+        })
+    }
+
+    fn progress(&self) -> SaveProgress {
+        SaveProgress {
+            done: self.done.load(Ordering::Relaxed),
+            total: self.total,
+        }
+    }
+
+    fn poll(&mut self) -> Option<io::Result<()>> {
+        if !self.thread.as_ref()?.is_finished() {
+            return None;
+        }
+        Some(
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("MP3 export worker panicked"))),
+        )
+    }
+}
+
+impl Drop for ExportWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub struct ActiveRecording {
@@ -91,7 +156,7 @@ impl std::fmt::Debug for Session {
                 .field("degraded", &active.pending.degraded)
                 .field("staging_file", &active.pending.staging_file)
                 .field("destination", &active.destination)
-                .field("progress", &active.encode.progress())
+                .field("progress", &active.worker.progress())
                 .finish(),
             Session::Failed(failed) => f.debug_tuple("Failed").field(&failed.detail).finish(),
         }
@@ -208,11 +273,13 @@ impl Session {
         };
         let encode = Encode::start(destination, &staged, quality)
             .map_err(|error| SaveError::Write(error.to_string()))?;
+        let worker =
+            ExportWorker::start(encode).map_err(|error| SaveError::Write(error.to_string()))?;
         let Session::AwaitingSave(pending) = std::mem::replace(self, Session::Idle) else {
             unreachable!()
         };
         *self = Session::Saving(ActiveSave {
-            encode,
+            worker,
             destination: destination.to_path_buf(),
             pending,
         });
@@ -227,17 +294,17 @@ impl Session {
             let Session::Saving(active) = self else {
                 unreachable!()
             };
-            active.encode.pump(SAVE_SLICE)
+            active.worker.poll()
         };
         match outcome {
-            Ok(false) => None,
-            Ok(true) => {
+            None => None,
+            Some(Ok(())) => {
                 let Session::Saving(active) = std::mem::replace(self, Session::Idle) else {
                     unreachable!()
                 };
                 Some(Ok(active.destination))
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 let Session::Saving(active) = std::mem::replace(self, Session::Idle) else {
                     unreachable!()
                 };
@@ -249,7 +316,7 @@ impl Session {
 
     pub fn save_progress(&self) -> Option<SaveProgress> {
         match self {
-            Session::Saving(active) => Some(active.encode.progress()),
+            Session::Saving(active) => Some(active.worker.progress()),
             _ => None,
         }
     }
@@ -696,13 +763,16 @@ mod tests {
     }
 
     fn poll_until_terminal(session: &mut Session) -> Result<PathBuf, SaveError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            assert!(Instant::now() < deadline, "export timed out");
             match session.poll() {
                 None => {
                     assert!(
                         matches!(session, Session::Saving(_)),
                         "save left Saving without a terminal poll"
                     );
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Some(result) => return result,
             }
@@ -740,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn save_as_then_poll_sees_progress_before_idle() {
+    fn save_as_then_poll_reports_monotonic_progress_until_idle() {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take.mp3");
@@ -754,23 +824,24 @@ mod tests {
         session.save_as(&dest, ExportQuality::Compact).unwrap();
         assert!(matches!(session, Session::Saving(_)));
         let start = session.save_progress().unwrap();
-        assert_eq!(start.done, 0);
+        assert!(start.done <= start.total);
         assert_eq!(start.total, frames as u64);
 
-        let mut saw_partial = false;
+        let mut previous = start.done;
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            assert!(Instant::now() < deadline, "export timed out");
             match session.poll() {
                 None => {
                     let progress = session.save_progress().expect("still saving");
-                    if progress.done > 0 && progress.done < progress.total {
-                        saw_partial = true;
-                    }
+                    assert!(progress.done >= previous && progress.done <= progress.total);
+                    previous = progress.done;
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Some(Ok(_)) => break,
                 Some(Err(error)) => panic!("{error}"),
             }
         }
-        assert!(saw_partial, "done never rose below total before Idle");
         assert!(matches!(session, Session::Idle));
         assert!(!staged.exists());
         assert!(dest.exists());
@@ -778,6 +849,67 @@ mod tests {
         let mpeg = crate::mp3::parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(mpeg.iter().all(|frame| frame.bitrate_kbps == 128));
         assert_eq!(leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn export_finishes_without_ui_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("take.f32");
+        let dest = dir.path().join("take.mp3");
+        stage_silence(&staged, MIX_SAMPLE_RATE as usize * 2);
+        let mut session = Session::AwaitingSave(PendingRecording {
+            staging_file: StagingFile::reserved(staged.clone()),
+            elapsed: Duration::from_secs(2),
+            degraded: false,
+        });
+        session.save_as(&dest, ExportQuality::Standard).unwrap();
+        let Session::Saving(active) = &session else {
+            panic!("expected saving");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !active.worker.thread.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "worker requires UI polling");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            staged.exists(),
+            "staging remains owned until completion is consumed"
+        );
+        assert!(
+            dest.exists(),
+            "worker commits the file independently of the UI"
+        );
+        assert_eq!(session.poll().unwrap().unwrap(), dest);
+        assert!(!staged.exists());
+        assert_eq!(leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn discard_during_export_releases_files_and_removes_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("take.f32");
+        let dest = dir.path().join("take.mp3");
+        File::create(&staged)
+            .unwrap()
+            .set_len(MIX_SAMPLE_RATE as u64 * 60 * 8)
+            .unwrap();
+        let mut session = Session::AwaitingSave(PendingRecording {
+            staging_file: StagingFile::reserved(staged.clone()),
+            elapsed: Duration::from_secs(60),
+            degraded: false,
+        });
+        session.save_as(&dest, ExportQuality::High).unwrap();
+        session.discard().unwrap();
+        assert!(matches!(session, Session::Idle));
+        assert!(!staged.exists());
+        assert_eq!(leftovers(dir.path()), 0);
+        // A worker that won the completion race may have committed a complete
+        // MP3. Cancellation must never leave an incomplete destination.
+        if dest.exists() {
+            let bytes = std::fs::read(&dest).unwrap();
+            let frames = crate::mp3::parse_mpeg1_layer3_cbr(&bytes).unwrap();
+            assert!(frames.len() > 2_000);
+        }
     }
 
     #[test]

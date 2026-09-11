@@ -1,342 +1,764 @@
-use std::ffi::c_void;
-
-use ::windows::core::{w, HSTRING, PCWSTR};
-use ::windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
-use ::windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateSolidBrush, DeleteObject, FillRect, GetStockObject, GetSysColor,
-    GetSysColorBrush, InvalidateRect, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_WINDOWTEXT,
-    DEFAULT_GUI_FONT, HBRUSH, HDC, HFONT, HGDIOBJ, TRANSPARENT,
-};
-use ::windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
-};
-use ::windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use ::windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, SendMessageW, SetWindowTextW, SystemParametersInfoW, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, HMENU, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
-};
-
-use crate::mp3::{ExportQuality, SaveProgress};
-use crate::recorder::{Level, Levels, Selector, Status, Tone, View};
+use super::theme::{rgb, Theme};
+use crate::mp3::ExportQuality;
+use crate::recorder::{Phase, Selector, Status, Tone, View};
 use crate::RunError;
+use std::ffi::c_void;
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub(crate) const CLIENT_WIDTH: i32 = 460;
-pub(crate) const CLIENT_HEIGHT: i32 = 264;
-
+pub(crate) const CLIENT_WIDTH: i32 = 480;
+pub(crate) const CLIENT_HEIGHT: i32 = 348;
 pub(crate) const ID_MICROPHONE: u16 = 101;
 pub(crate) const ID_OUTPUT: u16 = 102;
 pub(crate) const ID_TOGGLE: u16 = 103;
 pub(crate) const ID_SAVE: u16 = 104;
 pub(crate) const ID_DISCARD: u16 = 105;
 pub(crate) const ID_QUALITY: u16 = 106;
-
-const MARGIN: i32 = 16;
-const LABEL_WIDTH: i32 = 92;
-const FIELD_X: i32 = MARGIN + LABEL_WIDTH;
-const FIELD_WIDTH: i32 = CLIENT_WIDTH - FIELD_X - MARGIN;
-const ROW_HEIGHT: i32 = 24;
-const LABEL_HEIGHT: i32 = 18;
-const DROPPED_HEIGHT: i32 = ROW_HEIGHT + 180;
-
-const COMBO_METER_GAP: i32 = 4;
-const GROUP_GAP: i32 = 12;
-const METER_HEIGHT: i32 = 16;
-
-const MICROPHONE_Y: i32 = MARGIN;
-const MICROPHONE_METER_Y: i32 = MICROPHONE_Y + ROW_HEIGHT + COMBO_METER_GAP;
-const OUTPUT_Y: i32 = MICROPHONE_METER_Y + METER_HEIGHT + GROUP_GAP;
-const SYSTEM_METER_Y: i32 = OUTPUT_Y + ROW_HEIGHT + COMBO_METER_GAP;
-const QUALITY_Y: i32 = SYSTEM_METER_Y + METER_HEIGHT + GROUP_GAP;
-const SAVE_BAR_Y: i32 = QUALITY_Y + ROW_HEIGHT + COMBO_METER_GAP;
-const BUTTON_Y: i32 = 176;
-const BUTTON_HEIGHT: i32 = 30;
-const TOGGLE_WIDTH: i32 = 140;
-const SMALL_BUTTON_WIDTH: i32 = 90;
-const SAVE_X: i32 = MARGIN + TOGGLE_WIDTH + 8;
-const DISCARD_X: i32 = SAVE_X + SMALL_BUTTON_WIDTH + 8;
-const ELAPSED_X: i32 = DISCARD_X + SMALL_BUTTON_WIDTH + 8;
-const ELAPSED_WIDTH: i32 = CLIENT_WIDTH - MARGIN - ELAPSED_X;
-const STATUS_Y: i32 = 216;
-const STATUS_HEIGHT: i32 = 32;
-
-// SS_RIGHT lives in Win32::System::SystemServices, a feature nothing else here needs.
-const SS_RIGHT: u32 = 0x0002;
+pub(crate) const ID_FOLDER: u16 = 107;
+pub(crate) const ID_REFRESH: u16 = 108;
+const MICROPHONE_Y: i32 = 130;
 
 pub(crate) struct Controls {
     microphones: HWND,
     outputs: HWND,
     quality: HWND,
+    microphone_label: HWND,
+    output_label: HWND,
+    quality_label: HWND,
+    microphone_level: HWND,
+    output_level: HWND,
     toggle: HWND,
     save: HWND,
     discard: HWND,
+    folder: HWND,
+    refresh: HWND,
     elapsed: HWND,
+    heading: HWND,
+    shortcut: HWND,
     status: HWND,
-    font: HFONT,
-    trough: HBRUSH,
-    signal: HBRUSH,
-    clipping: HBRUSH,
+    progress: HWND,
+    progress_label: HWND,
+    fonts: Fonts,
+    theme: Theme,
+    dpi: u32,
+    units: u32,
     painted: Painted,
     list_dropped: bool,
 }
 
+#[derive(Default)]
 struct Painted {
+    phase: Option<Phase>,
     toggle_label: &'static str,
     elapsed: String,
+    heading: String,
     status: Option<Status>,
-    levels: Option<Levels>,
-    progress: Option<SaveProgress>,
-    saving: bool,
+    meters: [Meter; 2],
+    percent: Option<u32>,
+    saved_file: bool,
+    missing_devices: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Meter {
+    width: i32,
+    clipping: bool,
+    db: Option<i32>,
+}
+struct Fonts {
+    body: HFONT,
+    strong: HFONT,
+    timer: HFONT,
+    units: u32,
 }
 
 impl Controls {
     pub(crate) fn create(root: HWND, instance: HINSTANCE) -> Result<Self, RunError> {
-        let common = INITCOMMONCONTROLSEX {
-            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES,
-        };
         unsafe {
-            let _ = InitCommonControlsEx(&common);
+            let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS,
+            });
         }
-
-        let font = message_font();
-        label(root, instance, font, w!("Microphone"), MICROPHONE_Y + 3)?;
-        label(root, instance, font, w!("System"), OUTPUT_Y + 3)?;
-        label(root, instance, font, w!("MP3 quality"), QUALITY_Y + 3)?;
-
+        let dpi = unsafe { GetDpiForWindow(root) }.max(96);
+        let fonts = Fonts::new(dpi);
+        // Keep each native label immediately before its associated field.
+        let microphone_label = static_text(root, instance, w!("&Microphone"), 0)?;
+        let microphones = combo(root, instance, ID_MICROPHONE, MICROPHONE_Y)?;
+        let output_label = static_text(root, instance, w!("System &audio"), 0)?;
+        let outputs = combo(root, instance, ID_OUTPUT, 202)?;
+        let quality_label = static_text(root, instance, w!("MP3 &quality"), 0)?;
+        let quality = combo(root, instance, ID_QUALITY, 254)?;
+        let toggle = button(root, instance, ID_TOGGLE, w!("Start &recording"))?;
+        let save = button(root, instance, ID_SAVE, w!("&Save recording…"))?;
+        let discard = button(root, instance, ID_DISCARD, w!("&Discard…"))?;
+        let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
+        let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
         let controls = Self {
-            microphones: combo(root, instance, ID_MICROPHONE, MICROPHONE_Y)?,
-            outputs: combo(root, instance, ID_OUTPUT, OUTPUT_Y)?,
-            quality: combo(root, instance, ID_QUALITY, QUALITY_Y)?,
-            toggle: button(root, instance, ID_TOGGLE, MARGIN, TOGGLE_WIDTH)?,
-            save: button(root, instance, ID_SAVE, SAVE_X, SMALL_BUTTON_WIDTH)?,
-            discard: button(root, instance, ID_DISCARD, DISCARD_X, SMALL_BUTTON_WIDTH)?,
-            elapsed: text(
+            microphones,
+            outputs,
+            quality,
+            microphone_label,
+            output_label,
+            quality_label,
+            microphone_level: static_text(root, instance, w!(""), 2)?,
+            output_level: static_text(root, instance, w!(""), 2)?,
+            toggle,
+            save,
+            discard,
+            folder,
+            refresh,
+            elapsed: static_text(root, instance, w!("00:00"), 0)?,
+            heading: static_text(root, instance, w!("Ready"), 0)?,
+            shortcut: static_text(root, instance, w!("Ctrl+Shift+R"), 2)?,
+            status: static_text(
                 root,
                 instance,
-                ELAPSED_X,
-                BUTTON_Y + (BUTTON_HEIGHT - LABEL_HEIGHT) / 2,
-                ELAPSED_WIDTH,
-                LABEL_HEIGHT,
-                WINDOW_STYLE(SS_RIGHT),
+                w!("Levels appear when recording."),
+                0x0080 | 0x4000, // SS_EDITCONTROL | SS_ENDELLIPSIS
             )?,
-            status: text(
+            progress: child(
                 root,
                 instance,
-                MARGIN,
-                STATUS_Y,
-                CLIENT_WIDTH - 2 * MARGIN,
-                STATUS_HEIGHT,
+                PROGRESS_CLASSW,
+                w!("MP3 export progress"),
                 WINDOW_STYLE(0),
+                109,
             )?,
-            font,
-            trough: unsafe { CreateSolidBrush(rgb(0x21, 0x23, 0x26)) },
-            signal: unsafe { CreateSolidBrush(rgb(0x2e, 0xa0, 0x43)) },
-            clipping: unsafe { CreateSolidBrush(rgb(0xd1, 0x3b, 0x3b)) },
-            painted: Painted {
-                toggle_label: "",
-                elapsed: String::new(),
-                status: None,
-                levels: None,
-                progress: None,
-                saving: false,
-            },
+            progress_label: static_text(root, instance, w!(""), 0)?,
+            units: fonts.units,
+            fonts,
+            theme: Theme::new(),
+            dpi,
+            painted: Painted::default(),
             list_dropped: false,
         };
         for control in [
-            controls.microphones,
-            controls.outputs,
-            controls.quality,
-            controls.toggle,
-            controls.save,
-            controls.discard,
-            controls.elapsed,
-            controls.status,
+            save,
+            discard,
+            folder,
+            refresh,
+            controls.progress,
+            controls.progress_label,
         ] {
-            unsafe { SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1)) };
+            visible(control, false);
         }
-        unsafe {
-            let _ = SetWindowTextW(controls.save, w!("Save…"));
-            let _ = SetWindowTextW(controls.discard, w!("Discard"));
-        }
+        controls.apply_fonts();
         refill(
             controls.quality,
-            &ExportQuality::ALL.map(|quality| quality.label().to_string()),
+            &ExportQuality::ALL.map(|q| q.label().to_owned()),
         );
+        controls.layout(root);
         Ok(controls)
+    }
+
+    fn all(&self) -> [HWND; 19] {
+        [
+            self.microphone_label,
+            self.microphones,
+            self.output_label,
+            self.outputs,
+            self.quality_label,
+            self.quality,
+            self.microphone_level,
+            self.output_level,
+            self.toggle,
+            self.save,
+            self.discard,
+            self.folder,
+            self.refresh,
+            self.elapsed,
+            self.heading,
+            self.shortcut,
+            self.status,
+            self.progress,
+            self.progress_label,
+        ]
+    }
+
+    fn apply_fonts(&self) {
+        for control in self.all() {
+            let font = if control == self.elapsed {
+                self.fonts.timer
+            } else if [self.toggle, self.save, self.heading].contains(&control) {
+                self.fonts.strong
+            } else {
+                self.fonts.body
+            };
+            unsafe {
+                SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
+        }
+    }
+
+    pub(crate) fn refresh_theme(&mut self, root: HWND, dpi: u32) {
+        self.dpi = dpi.max(96);
+        let old_fonts = std::mem::replace(&mut self.fonts, Fonts::new(self.dpi));
+        self.units = self.fonts.units;
+        self.theme = Theme::new();
+        self.apply_fonts();
+        drop(old_fonts);
+        self.painted.meters = [Meter::default(); 2];
+        self.layout(root);
+        unsafe {
+            let _ = InvalidateRect(root, None, true);
+        }
+    }
+
+    fn s(&self, value: i32) -> i32 {
+        scale(value, self.units)
+    }
+
+    fn layout(&self, root: HWND) {
+        let place = |control, x, y, width, height| unsafe {
+            let _ = SetWindowPos(
+                control,
+                None,
+                self.s(x),
+                self.s(y),
+                self.s(width),
+                self.s(height),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        };
+        place(self.heading, 20, 16, 440, 20);
+        place(self.elapsed, 20, 36, 220, 44);
+        place(self.toggle, 256, 36, 204, 40);
+        place(self.save, 256, 36, 204, 40);
+        place(self.shortcut, 256, 80, 204, 18);
+        place(self.discard, 356, 80, 104, 24);
+        place(self.microphone_label, 20, 110, 440, 18);
+        place(self.microphones, 20, 130, 440, 220);
+        place(self.microphone_level, 364, 155, 96, 20);
+        place(self.output_label, 20, 182, 440, 18);
+        place(self.outputs, 20, 202, 440, 220);
+        place(self.output_level, 364, 227, 96, 20);
+        place(self.quality_label, 20, 259, 136, 20);
+        place(self.quality, 178, 254, 282, 220);
+        place(self.progress_label, 20, 254, 440, 20);
+        place(self.progress, 20, 278, 440, 10);
+        let text_width = if self.painted.saved_file || self.painted.missing_devices {
+            288
+        } else {
+            440
+        };
+        let height = self.status_height(root, self.s(text_width)).max(self.s(34));
+        unsafe {
+            let _ = SetWindowPos(
+                self.status,
+                None,
+                self.s(20),
+                self.s(298),
+                self.s(text_width),
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        place(self.folder, 320, 298, 140, 30);
+        place(self.refresh, 320, 298, 140, 30);
+        for list in [self.microphones, self.outputs, self.quality] {
+            unsafe {
+                SendMessageW(
+                    list,
+                    CB_SETITEMHEIGHT,
+                    WPARAM(usize::MAX),
+                    LPARAM(self.s(22) as isize),
+                );
+                SendMessageW(
+                    list,
+                    CB_SETITEMHEIGHT,
+                    WPARAM(0),
+                    LPARAM(self.s(24) as isize),
+                );
+            }
+            dropdown_width(list, self.fonts.body, self.s(440), self.s(32));
+        }
+        unsafe {
+            let mut frame = RECT {
+                right: self.s(CLIENT_WIDTH),
+                bottom: self.s(314) + height,
+                ..Default::default()
+            };
+            let style = WINDOW_STYLE(GetWindowLongW(root, GWL_STYLE) as u32);
+            let ex_style = WINDOW_EX_STYLE(GetWindowLongW(root, GWL_EXSTYLE) as u32);
+            let _ = AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, self.dpi);
+            let mut existing = RECT::default();
+            let _ = GetWindowRect(root, &mut existing);
+            let width = frame.right - frame.left;
+            let height = frame.bottom - frame.top;
+            if existing.right - existing.left != width || existing.bottom - existing.top != height {
+                let _ = SetWindowPos(
+                    root,
+                    None,
+                    0,
+                    0,
+                    width,
+                    height,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    fn status_height(&self, root: HWND, width: i32) -> i32 {
+        let text = self.painted.status.as_ref().map_or("", |s| s.text.as_str());
+        if text.is_empty() {
+            return 0;
+        }
+        let mut text: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = RECT {
+            right: width,
+            ..Default::default()
+        };
+        unsafe {
+            let dc = GetDC(root);
+            let old = SelectObject(dc, HGDIOBJ(self.fonts.body.0));
+            DrawTextW(
+                dc,
+                &mut text,
+                &mut rect,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+            );
+            SelectObject(dc, old);
+            ReleaseDC(root, dc);
+        }
+        rect.bottom
     }
 
     pub(crate) fn set_list_dropped(&mut self, dropped: bool) {
         self.list_dropped = dropped;
     }
-
     pub(crate) fn list_dropped(&self) -> bool {
         self.list_dropped
     }
-
     #[cfg(test)]
     fn microphone_combo(&self) -> HWND {
         self.microphones
     }
 
     pub(crate) fn show(&mut self, root: HWND, view: &View) {
-        if self.list_dropped {
+        if self.list_dropped && matches!(view.phase, Phase::Idle | Phase::AwaitingSave) {
             return;
         }
-        if let Some(lists) = &view.endpoints {
-            refill(self.microphones, &lists.microphones);
-            refill(self.outputs, &lists.outputs);
+        // Preserve an open picker's hovered row without freezing status updates.
+        if !self.list_dropped {
+            if let Some(lists) = &view.endpoints {
+                refill(self.microphones, &lists.microphones);
+                refill(self.outputs, &lists.outputs);
+                for list in [self.microphones, self.outputs] {
+                    dropdown_width(list, self.fonts.body, self.s(440), self.s(32));
+                }
+            }
+            choose(self.microphones, view.microphone);
+            choose(self.outputs, view.output);
+            choose(self.quality, view.quality);
         }
-        choose(self.microphones, view.microphone);
-        choose(self.outputs, view.output);
-        choose(self.quality, view.quality);
-
+        let phase_changed = self.painted.phase != Some(view.phase);
+        let pending = view.phase == Phase::AwaitingSave;
+        let saving = view.phase == Phase::Saving;
+        let previous_focus = unsafe { GetFocus() };
+        if phase_changed {
+            if view.phase == Phase::Recording || saving {
+                for list in [self.microphones, self.outputs, self.quality] {
+                    unsafe {
+                        SendMessageW(list, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+                    }
+                }
+                self.list_dropped = false;
+                choose(self.microphones, view.microphone);
+                choose(self.outputs, view.output);
+                choose(self.quality, view.quality);
+            }
+            self.painted.phase = Some(view.phase);
+            visible(self.toggle, !pending && !saving);
+            visible(self.save, pending || saving);
+            visible(self.discard, pending);
+            visible(self.shortcut, !pending && !saving);
+            visible(self.quality, !saving);
+            visible(self.quality_label, !saving);
+            visible(self.progress, saving);
+            visible(self.progress_label, saving);
+            set_text(
+                self.save,
+                if saving {
+                    "Saving MP3…"
+                } else {
+                    "&Save recording…"
+                },
+            );
+        }
         if self.painted.toggle_label != view.transport.toggle_label {
             self.painted.toggle_label = view.transport.toggle_label;
-            let label = HSTRING::from(view.transport.toggle_label);
-            unsafe {
-                let _ = SetWindowTextW(self.toggle, &label);
-            }
+            set_text(
+                self.toggle,
+                if view.phase == Phase::Recording {
+                    "Stop &recording"
+                } else {
+                    "Start &recording"
+                },
+            );
         }
         enable(self.toggle, view.transport.toggle_enabled);
         enable(self.save, view.transport.save_enabled);
         enable(self.discard, view.transport.discard_enabled);
-
+        if phase_changed
+            && !saving
+            && [self.toggle, self.save, self.discard].contains(&previous_focus)
+        {
+            unsafe {
+                let _ = SetFocus(if pending { self.save } else { self.toggle });
+            }
+        }
         if self.painted.elapsed != view.elapsed {
             self.painted.elapsed.clone_from(&view.elapsed);
-            let elapsed = HSTRING::from(&view.elapsed);
-            unsafe {
-                let _ = SetWindowTextW(self.elapsed, &elapsed);
-            }
+            set_text(self.elapsed, &view.elapsed);
         }
-        if self.painted.status.as_ref() != Some(&view.status) {
-            self.painted.status = Some(view.status.clone());
-            let status = HSTRING::from(&view.status.text);
-            unsafe {
-                let _ = SetWindowTextW(self.status, &status);
+        let heading = match view.phase {
+            Phase::Idle if view.status.tone == Tone::Failure => "Needs attention",
+            Phase::Idle if view.microphone.selected.is_none() || view.output.selected.is_none() => {
+                "Check devices"
             }
+            Phase::Idle if view.saved_path.is_some() => "Recording saved",
+            Phase::Idle => "Ready to record",
+            Phase::Recording if view.status.tone == Tone::Warning => "Recording · check audio",
+            Phase::Recording => "Recording",
+            Phase::AwaitingSave => "Recording not saved",
+            Phase::Saving => "Saving MP3",
+            Phase::Failed => "Needs attention",
+        };
+        if self.painted.heading != heading {
+            self.painted.heading = heading.into();
+            set_text(self.heading, heading);
         }
-        let saving = view.progress.is_some();
-        if saving != self.painted.saving {
-            self.painted.saving = saving;
-            unsafe {
-                let _ = InvalidateRect(root, Some(&save_bar()), true);
+        let saved_file = view.phase == Phase::Idle && view.saved_path.is_some();
+        let missing = view.phase == Phase::Idle
+            && (view.microphone.selected.is_none() || view.output.selected.is_none());
+        let mut status = view.status.clone();
+        status.text = match (view.phase, status.text.as_str()) {
+            (Phase::Idle, "Ready. Ctrl+Shift+R starts recording.") => {
+                "Levels appear when recording.".into()
             }
+            (Phase::Recording, "Recording.") => "Recording microphone and system audio.".into(),
+            (Phase::Saving, "Saving MP3…") => {
+                "You can keep working while the MP3 is saved.".into()
+            }
+            _ => status.text,
+        };
+        if self.painted.status.as_ref() != Some(&status)
+            || saved_file != self.painted.saved_file
+            || missing != self.painted.missing_devices
+        {
+            self.painted.saved_file = saved_file;
+            self.painted.missing_devices = missing;
+            visible(self.folder, saved_file);
+            visible(self.refresh, missing && !saved_file);
+            set_text(self.status, &status.text);
+            self.painted.status = Some(status);
+            self.layout(root);
         }
-        if self.painted.levels != Some(view.levels) {
-            self.painted.levels = Some(view.levels);
-            for rect in [meter(MICROPHONE_METER_Y), meter(SYSTEM_METER_Y)] {
+        let percent = view.progress.map(|p| {
+            if p.total == 0 {
+                0
+            } else {
+                ((p.done.min(p.total) as f64 / p.total as f64) * 100.0).floor() as u32
+            }
+        });
+        if percent != self.painted.percent {
+            self.painted.percent = percent;
+            if let Some(percent) = percent {
                 unsafe {
-                    let _ = InvalidateRect(root, Some(&rect), false);
+                    SendMessageW(
+                        self.progress,
+                        PBM_SETPOS,
+                        WPARAM(percent as usize),
+                        LPARAM(0),
+                    );
                 }
+                set_text(self.progress_label, &format!("Exporting MP3 · {percent}%"));
             }
         }
-        if self.painted.progress != view.progress {
-            self.painted.progress = view.progress;
-            if saving {
-                unsafe {
-                    let _ = InvalidateRect(root, Some(&save_bar()), false);
+        for (index, level) in [view.levels.microphone, view.levels.system]
+            .into_iter()
+            .enumerate()
+        {
+            let next = Meter {
+                width: (bar_fraction(level.peak) * self.s(332) as f32).round() as i32,
+                clipping: level.clipping,
+                db: (view.phase == Phase::Recording).then(|| {
+                    if level.peak > 0.001 {
+                        (20.0 * level.peak.log10()).round().min(0.0) as i32
+                    } else {
+                        -60
+                    }
+                }),
+            };
+            if next != self.painted.meters[index] || phase_changed {
+                let old = self.painted.meters[index];
+                self.painted.meters[index] = next;
+                if old.width != next.width || old.clipping != next.clipping || phase_changed {
+                    unsafe {
+                        let _ = InvalidateRect(root, Some(&self.meter_rect(index)), false);
+                    }
+                }
+                if old.clipping != next.clipping || old.db != next.db || phase_changed {
+                    let label = if next.clipping {
+                        "Clipping".into()
+                    } else {
+                        match next.db {
+                            Some(db) if db > -60 => format!("{db} dBFS"),
+                            Some(_) => "Silence".into(),
+                            None => "Inactive".into(),
+                        }
+                    };
+                    set_text(
+                        if index == 0 {
+                            self.microphone_level
+                        } else {
+                            self.output_level
+                        },
+                        &label,
+                    );
                 }
             }
         }
     }
 
-    pub(crate) fn draw_meters(&self, hdc: HDC) {
-        if let Some(progress) = self.painted.progress {
-            self.fill_linear(hdc, save_bar(), progress.fraction());
+    fn meter_rect(&self, index: usize) -> RECT {
+        let y = if index == 0 { 160 } else { 232 };
+        RECT {
+            left: self.s(20),
+            top: self.s(y),
+            right: self.s(352),
+            bottom: self.s(y + 8),
         }
-        let Some(levels) = self.painted.levels else {
-            return;
-        };
-        self.draw_meter(hdc, meter(MICROPHONE_METER_Y), levels.microphone);
-        self.draw_meter(hdc, meter(SYSTEM_METER_Y), levels.system);
+    }
+    pub(crate) fn background(&self) -> HBRUSH {
+        self.theme.background
+    }
+    pub(crate) fn draw_meters(&self, hdc: HDC) {
+        unsafe {
+            FillRect(
+                hdc,
+                &RECT {
+                    left: self.s(20),
+                    top: self.s(104),
+                    right: self.s(460),
+                    bottom: self.s(104) + 1,
+                },
+                self.theme.divider,
+            );
+        }
+        for index in 0..2 {
+            let rect = self.meter_rect(index);
+            let meter = self.painted.meters[index];
+            unsafe {
+                FillRect(hdc, &rect, self.theme.track);
+                if meter.width > 0 {
+                    FillRect(
+                        hdc,
+                        &RECT {
+                            right: rect.left + meter.width,
+                            ..rect
+                        },
+                        if meter.clipping {
+                            self.theme.clipping
+                        } else {
+                            self.theme.signal
+                        },
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn color_static(&self, control: HWND, hdc: HDC) -> HBRUSH {
-        let tone = if control == self.status {
-            self.painted.status.as_ref().map(|status| status.tone)
+        let tone = self.painted.status.as_ref().map(|s| s.tone);
+        let color = if control == self.heading && self.painted.phase == Some(Phase::Recording) {
+            if tone == Some(Tone::Warning) {
+                self.theme.warning
+            } else {
+                self.theme.red
+            }
+        } else if control == self.status {
+            match tone {
+                Some(Tone::Failure) => self.theme.red,
+                Some(Tone::Warning) => self.theme.warning,
+                _ => self.theme.muted,
+            }
+        } else if control == self.microphone_level || control == self.output_level {
+            let index = usize::from(control == self.output_level);
+            if self.painted.meters[index].clipping {
+                self.theme.red
+            } else {
+                self.theme.muted
+            }
+        } else if control == self.shortcut {
+            self.theme.muted
         } else {
-            None
-        };
-        let color = match tone {
-            Some(Tone::Recording) => rgb(0xc0, 0x28, 0x28),
-            Some(Tone::Warning) => rgb(0x8a, 0x5a, 0x00),
-            Some(Tone::Failure) => rgb(0xb0, 0x00, 0x00),
-            Some(Tone::Neutral) | None => COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) }),
+            self.theme.ink
         };
         unsafe {
             SetTextColor(hdc, color);
             SetBkMode(hdc, TRANSPARENT);
-            GetSysColorBrush(COLOR_BTNFACE)
         }
+        self.theme.background
     }
 
-    fn draw_meter(&self, hdc: HDC, rect: RECT, level: Level) {
-        unsafe { FillRect(hdc, &rect, self.trough) };
-        let filled = ((rect.right - rect.left) as f32 * bar_fraction(level.peak)).round() as i32;
-        if filled <= 0 {
-            return;
+    // Native BUTTON keeps keyboard, accessibility and hover/pressed tracking.
+    pub(crate) fn draw_button(&self, draw: &NMCUSTOMDRAW) -> Option<u32> {
+        if ![self.toggle, self.save].contains(&draw.hdr.hwndFrom) || self.theme.high_contrast {
+            return None;
         }
-        let lit = RECT {
-            right: rect.left + filled,
-            ..rect
-        };
-        let brush = if level.clipping {
-            self.clipping
+        if draw.dwDrawStage != CDDS_PREPAINT {
+            return Some(CDRF_DODEFAULT);
+        }
+        let disabled = draw.uItemState.contains(CDIS_DISABLED);
+        let brush = if disabled {
+            self.theme.disabled
+        } else if draw.uItemState.contains(CDIS_SELECTED) {
+            self.theme.pressed
+        } else if draw.uItemState.contains(CDIS_HOT) {
+            self.theme.hover
         } else {
-            self.signal
+            self.theme.primary
         };
-        unsafe { FillRect(hdc, &lit, brush) };
-    }
-
-    fn fill_linear(&self, hdc: HDC, rect: RECT, fraction: f32) {
-        unsafe { FillRect(hdc, &rect, self.trough) };
-        let filled = ((rect.right - rect.left) as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
-        if filled <= 0 {
-            return;
-        }
-        let lit = RECT {
-            right: rect.left + filled,
-            ..rect
+        let caption = if draw.hdr.hwndFrom == self.save {
+            if self.painted.phase == Some(Phase::Saving) {
+                "Saving MP3…"
+            } else {
+                "Save recording…"
+            }
+        } else {
+            self.painted.toggle_label
         };
-        unsafe { FillRect(hdc, &lit, self.signal) };
-    }
-}
-
-impl Drop for Controls {
-    fn drop(&mut self) {
+        let mut text: Vec<u16> = caption.encode_utf16().collect();
+        let rect = draw.rc;
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.font.0));
-            let _ = DeleteObject(HGDIOBJ(self.trough.0));
-            let _ = DeleteObject(HGDIOBJ(self.signal.0));
-            let _ = DeleteObject(HGDIOBJ(self.clipping.0));
+            FillRect(draw.hdc, &rect, self.theme.background);
+            let old_pen = SelectObject(draw.hdc, GetStockObject(NULL_PEN));
+            let old_brush = SelectObject(draw.hdc, HGDIOBJ(brush.0));
+            let _ = RoundRect(
+                draw.hdc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                self.s(10),
+                self.s(10),
+            );
+            let old_font = SelectObject(draw.hdc, HGDIOBJ(self.fonts.strong.0));
+            SetBkMode(draw.hdc, TRANSPARENT);
+            SetTextColor(
+                draw.hdc,
+                if disabled {
+                    self.theme.muted
+                } else {
+                    rgb(255, 255, 255)
+                },
+            );
+            let mut text_rect = rect;
+            DrawTextW(
+                draw.hdc,
+                &mut text,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if draw.uItemState.contains(CDIS_FOCUS) {
+                let _ = DrawFocusRect(
+                    draw.hdc,
+                    &RECT {
+                        left: rect.left + self.s(4),
+                        top: rect.top + self.s(4),
+                        right: rect.right - self.s(4),
+                        bottom: rect.bottom - self.s(4),
+                    },
+                );
+            }
+            SelectObject(draw.hdc, old_font);
+            SelectObject(draw.hdc, old_brush);
+            SelectObject(draw.hdc, old_pen);
         }
+        Some(CDRF_SKIPDEFAULT)
     }
 }
 
-const METER_FLOOR_DB: f32 = 60.0;
-
+impl Fonts {
+    fn new(dpi: u32) -> Self {
+        let mut metrics = NONCLIENTMETRICSW {
+            cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS.0,
+                metrics.cbSize,
+                Some(&mut metrics as *mut _ as *mut c_void),
+                0,
+                dpi,
+            );
+        }
+        let mut base = metrics.lfMessageFont;
+        if base.lfFaceName[0] == 0 {
+            for (to, from) in base.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
+                *to = from;
+            }
+        }
+        base.lfHeight = -base.lfHeight.abs().max(scale(14, dpi));
+        let units = dpi.max((base.lfHeight.unsigned_abs() * 96).div_ceil(14));
+        let body = unsafe { CreateFontIndirectW(&base) };
+        let body_face = base.lfFaceName;
+        base.lfWeight = 600;
+        if String::from_utf16_lossy(&base.lfFaceName).trim_end_matches('\0') == "Segoe UI" {
+            base.lfFaceName.fill(0);
+            for (to, from) in base
+                .lfFaceName
+                .iter_mut()
+                .zip("Segoe UI Semibold".encode_utf16())
+            {
+                *to = from;
+            }
+        }
+        let strong = unsafe { CreateFontIndirectW(&base) };
+        base.lfFaceName = body_face;
+        base.lfWeight = 400;
+        base.lfHeight = -scale(34, units);
+        let timer = unsafe { CreateFontIndirectW(&base) };
+        Self {
+            body,
+            strong,
+            timer,
+            units,
+        }
+    }
+}
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        for font in [self.body, self.strong, self.timer] {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+    }
+}
+pub(super) fn scale(value: i32, dpi: u32) -> i32 {
+    ((value as i64 * dpi as i64 + 48) / 96) as i32
+}
 fn bar_fraction(peak: f32) -> f32 {
     if peak <= 0.0 {
-        return 0.0;
-    }
-    ((20.0 * peak.log10() + METER_FLOOR_DB) / METER_FLOOR_DB).clamp(0.0, 1.0)
-}
-
-fn meter(top: i32) -> RECT {
-    RECT {
-        left: FIELD_X,
-        top,
-        right: FIELD_X + FIELD_WIDTH,
-        bottom: top + METER_HEIGHT,
+        0.0
+    } else {
+        ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
     }
 }
-
-fn save_bar() -> RECT {
-    meter(SAVE_BAR_Y)
-}
-
 fn refill(list: HWND, names: &[String]) {
     unsafe {
         SendMessageW(list, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
@@ -351,336 +773,129 @@ fn refill(list: HWND, names: &[String]) {
         }
     }
 }
-
+fn dropdown_width(list: HWND, font: HFONT, minimum: i32, padding: i32) {
+    unsafe {
+        let dc = GetDC(list);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let count = SendMessageW(list, CB_GETCOUNT, WPARAM(0), LPARAM(0))
+            .0
+            .max(0) as usize;
+        let mut width = minimum;
+        for index in 0..count {
+            let length = SendMessageW(list, CB_GETLBTEXTLEN, WPARAM(index), LPARAM(0)).0;
+            if !(0..=32768).contains(&length) {
+                continue;
+            }
+            let mut text = vec![0u16; length as usize + 1];
+            SendMessageW(
+                list,
+                CB_GETLBTEXT,
+                WPARAM(index),
+                LPARAM(text.as_mut_ptr() as isize),
+            );
+            let mut size = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, &text[..length as usize], &mut size);
+            width = width.max(size.cx + padding);
+        }
+        SelectObject(dc, old);
+        ReleaseDC(list, dc);
+        let monitor = MonitorFromWindow(list, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            width = width.min(info.rcWork.right - info.rcWork.left - padding);
+        }
+        SendMessageW(
+            list,
+            CB_SETDROPPEDWIDTH,
+            WPARAM(width.max(1) as usize),
+            LPARAM(0),
+        );
+    }
+}
 fn choose(list: HWND, selector: Selector) {
     let wanted = selector.selected.map_or(-1, |index| index as isize);
-    let current = unsafe { SendMessageW(list, CB_GETCURSEL, WPARAM(0), LPARAM(0)) };
-    if current.0 != wanted {
-        unsafe { SendMessageW(list, CB_SETCURSEL, WPARAM(wanted as usize), LPARAM(0)) };
+    unsafe {
+        if SendMessageW(list, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 != wanted {
+            SendMessageW(list, CB_SETCURSEL, WPARAM(wanted as usize), LPARAM(0));
+        }
     }
     enable(list, selector.enabled);
 }
-
 fn enable(control: HWND, enabled: bool) {
     unsafe {
-        let _ = EnableWindow(control, enabled);
+        if IsWindowEnabled(control).as_bool() != enabled {
+            let _ = EnableWindow(control, enabled);
+        }
     }
 }
-
-fn combo(root: HWND, instance: HINSTANCE, id: u16, top: i32) -> Result<HWND, RunError> {
+fn visible(control: HWND, show: bool) {
+    unsafe {
+        if (GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0) != show {
+            let _ = ShowWindow(control, if show { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+}
+fn set_text(control: HWND, text: &str) {
+    unsafe {
+        let _ = SetWindowTextW(control, &HSTRING::from(text));
+    }
+}
+fn combo(root: HWND, instance: HINSTANCE, id: u16, _top: i32) -> Result<HWND, RunError> {
     child(
         root,
         instance,
         w!("COMBOBOX"),
+        w!(""),
         WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
-        FIELD_X,
-        top,
-        FIELD_WIDTH,
-        DROPPED_HEIGHT,
         id,
     )
 }
-
-fn button(
+fn button(root: HWND, instance: HINSTANCE, id: u16, caption: PCWSTR) -> Result<HWND, RunError> {
+    child(root, instance, w!("BUTTON"), caption, WS_TABSTOP, id)
+}
+fn static_text(
     root: HWND,
     instance: HINSTANCE,
-    id: u16,
-    left: i32,
-    width: i32,
+    caption: PCWSTR,
+    style: u32,
 ) -> Result<HWND, RunError> {
     child(
         root,
         instance,
-        w!("BUTTON"),
-        WS_TABSTOP,
-        left,
-        BUTTON_Y,
-        width,
-        BUTTON_HEIGHT,
-        id,
+        w!("STATIC"),
+        caption,
+        WINDOW_STYLE(style),
+        0,
     )
 }
-
-fn text(
-    root: HWND,
-    instance: HINSTANCE,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
-    style: WINDOW_STYLE,
-) -> Result<HWND, RunError> {
-    let control = child(
-        root,
-        instance,
-        w!("STATIC"),
-        style,
-        left,
-        top,
-        width,
-        height,
-        0,
-    )?;
-    unsafe {
-        let _ = SetWindowTheme(control, w!(""), w!(""));
-    }
-    Ok(control)
-}
-
-fn label(
-    root: HWND,
-    instance: HINSTANCE,
-    font: HFONT,
-    caption: PCWSTR,
-    top: i32,
-) -> Result<HWND, RunError> {
-    let control = text(
-        root,
-        instance,
-        MARGIN,
-        top,
-        LABEL_WIDTH,
-        LABEL_HEIGHT,
-        WINDOW_STYLE(0),
-    )?;
-    unsafe {
-        let _ = SetWindowTextW(control, caption);
-        SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    }
-    Ok(control)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn child(
     root: HWND,
     instance: HINSTANCE,
     class: PCWSTR,
+    caption: PCWSTR,
     style: WINDOW_STYLE,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
     id: u16,
 ) -> Result<HWND, RunError> {
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            PCWSTR::null(),
+            caption,
             WS_CHILD | WS_VISIBLE | style,
-            left,
-            top,
-            width,
-            height,
+            0,
+            0,
+            100,
+            24,
             root,
             HMENU(id as usize as *mut c_void),
             instance,
             None,
         )
     }
-    .map_err(|error| RunError::new(format!("creating a window control failed: {error}")))
+    .map_err(|e| RunError::new(format!("creating a window control failed: {e}")))
 }
-
-fn message_font() -> HFONT {
-    let mut metrics = NONCLIENTMETRICSW {
-        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
-    let read = unsafe {
-        SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            metrics.cbSize,
-            Some(&mut metrics as *mut _ as *mut c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    match read {
-        Ok(()) => unsafe { CreateFontIndirectW(&metrics.lfMessageFont) },
-        Err(_) => HFONT(unsafe { GetStockObject(DEFAULT_GUI_FONT) }.0),
-    }
-}
-
-const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
-    COLORREF(red as u32 | (green as u32) << 8 | (blue as u32) << 16)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::recorder::{Level, Levels, Status, Tone, Transport, View};
-    use std::sync::Once;
-    use windows::Win32::Foundation::LRESULT;
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, RegisterClassExW, ShowWindow, CB_GETDROPPEDSTATE,
-        CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, LB_GETCURSEL, SW_SHOW, WNDCLASSEXW,
-        WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
-    };
-
-    struct Harness {
-        root: HWND,
-        combo: HWND,
-    }
-
-    impl Drop for Harness {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = DestroyWindow(self.root);
-            }
-        }
-    }
-
-    unsafe extern "system" fn proc(
-        root: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        DefWindowProcW(root, message, wparam, lparam)
-    }
-
-    fn harness() -> Harness {
-        static REGISTER: Once = Once::new();
-        REGISTER.call_once(|| {
-            let class = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(proc),
-                lpszClassName: w!("onerec.combo.test"),
-                ..Default::default()
-            };
-            unsafe { RegisterClassExW(&class) };
-        });
-        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
-        let root = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("onerec.combo.test"),
-                w!("combo-test"),
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CLIENT_WIDTH + 32,
-                CLIENT_HEIGHT + 48,
-                None,
-                None,
-                instance,
-                None,
-            )
-        }
-        .expect("test window");
-        unsafe {
-            let _ = ShowWindow(root, SW_SHOW);
-        }
-        let combo = combo(root, instance, ID_MICROPHONE, MICROPHONE_Y).expect("combo");
-        refill(
-            combo,
-            &[
-                "Mic A".into(),
-                "Mic B".into(),
-                "Mic C".into(),
-                "Mic D".into(),
-            ],
-        );
-        Harness { root, combo }
-    }
-
-    fn current(combo: HWND) -> isize {
-        unsafe { SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0
-    }
-
-    fn list_sel(combo: HWND) -> isize {
-        let mut info = COMBOBOXINFO {
-            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
-            ..Default::default()
-        };
-        unsafe { GetComboBoxInfo(combo, &mut info) }.expect("combo info");
-        unsafe { SendMessageW(info.hwndList, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0
-    }
-
-    fn dropped(combo: HWND) -> bool {
-        unsafe { SendMessageW(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)) }.0 != 0
-    }
-
-    fn idle_view(microphone: Option<usize>) -> View {
-        View {
-            endpoints: None,
-            microphone: Selector {
-                selected: microphone,
-                enabled: true,
-            },
-            output: Selector {
-                selected: Some(0),
-                enabled: true,
-            },
-            quality: Selector {
-                selected: Some(ExportQuality::Meeting.index()),
-                enabled: true,
-            },
-            transport: Transport {
-                toggle_label: "Start recording",
-                toggle_enabled: true,
-                save_enabled: false,
-                discard_enabled: false,
-            },
-            elapsed: "00:00".into(),
-            levels: Levels {
-                microphone: Level::ZERO,
-                system: Level::ZERO,
-            },
-            progress: None,
-            status: Status {
-                text: String::new(),
-                tone: Tone::Neutral,
-            },
-            ask: None,
-        }
-    }
-
-    #[test]
-    fn show_leaves_hover_highlight_while_the_list_is_dropped() {
-        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
-        let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).expect("controls");
-        let combo = controls.microphone_combo();
-        refill(
-            combo,
-            &[
-                "Mic A".into(),
-                "Mic B".into(),
-                "Mic C".into(),
-                "Mic D".into(),
-            ],
-        );
-        unsafe {
-            SendMessageW(combo, CB_SETCURSEL, WPARAM(2), LPARAM(0));
-            SendMessageW(combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
-            SendMessageW(combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
-        }
-        assert_eq!(list_sel(combo), 0);
-
-        controls.set_list_dropped(true);
-        controls.show(ui.root, &idle_view(Some(2)));
-
-        assert_eq!(list_sel(combo), 0);
-    }
-
-    #[test]
-    fn choose_applies_the_committed_row_when_the_list_is_closed() {
-        let ui = harness();
-        unsafe { SendMessageW(ui.combo, CB_SETCURSEL, WPARAM(2), LPARAM(0)) };
-        assert!(!dropped(ui.combo));
-        assert_eq!(current(ui.combo), 2);
-
-        choose(
-            ui.combo,
-            Selector {
-                selected: Some(0),
-                enabled: true,
-            },
-        );
-
-        assert_eq!(current(ui.combo), 0);
-    }
-}
+include!("paint_tests.rs");

@@ -31,6 +31,7 @@ pub(crate) enum Intent {
     Save,
     SaveTo(PathBuf),
     CancelSave,
+    RequestDiscard,
     Discard,
     Closing,
     DiscardAndClose,
@@ -39,6 +40,7 @@ pub(crate) enum Intent {
 
 #[derive(Debug)]
 pub(crate) struct View {
+    pub phase: Phase,
     pub endpoints: Option<EndpointLists>,
     pub microphone: Selector,
     pub output: Selector,
@@ -49,6 +51,26 @@ pub(crate) struct View {
     pub progress: Option<SaveProgress>,
     pub status: Status,
     pub ask: Option<Ask>,
+    pub saved_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Idle,
+    Recording,
+    AwaitingSave,
+    Saving,
+    Failed,
+}
+
+impl Phase {
+    pub(crate) fn timer_ms(self, minimized: bool) -> Option<u32> {
+        match self {
+            Self::Recording => Some(if minimized { 500 } else { 50 }),
+            Self::Saving => Some(50),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -95,6 +117,7 @@ pub(crate) enum Tone {
 pub(crate) enum Ask {
     SaveDestination(SavePrompt),
     ConfirmClose,
+    ConfirmDiscard,
     Close,
 }
 
@@ -119,6 +142,7 @@ pub(crate) struct Recorder {
     notice: Option<Status>,
     last_tick: Instant,
     pending_ask: Option<Ask>,
+    saved_path: Option<PathBuf>,
 }
 
 impl Recorder {
@@ -156,6 +180,7 @@ impl Recorder {
             notice,
             last_tick: Instant::now(),
             pending_ask: None,
+            saved_path: None,
         }
     }
 
@@ -170,6 +195,11 @@ impl Recorder {
             Intent::Save => self.request_destination(),
             Intent::SaveTo(path) => self.save_to(&path),
             Intent::CancelSave => self.cancel_save(),
+            Intent::RequestDiscard => {
+                if matches!(self.session, Session::AwaitingSave(_)) {
+                    self.pending_ask = Some(Ask::ConfirmDiscard);
+                }
+            }
             Intent::Discard => self.discard(),
             Intent::Closing => self.consider_closing(),
             Intent::DiscardAndClose => self.abandon_and_close(),
@@ -239,6 +269,8 @@ impl Recorder {
         self.microphone_vu.reset();
         self.system_vu.reset();
         self.notice = None;
+        self.saved_path = None;
+        self.last_tick = Instant::now();
         self.session.start(
             mic_id,
             out_id,
@@ -281,7 +313,11 @@ impl Recorder {
 
     fn save_to(&mut self, destination: &std::path::Path) {
         match self.session.save_as(destination, self.quality) {
-            Ok(()) => self.notice = None,
+            Ok(()) => {
+                if matches!(self.session, Session::Saving(_)) {
+                    self.notice = None;
+                }
+            }
             Err(SaveError::NoTake) => {}
             Err(SaveError::Write(detail)) => self.notice = Some(warn(detail)),
         }
@@ -307,7 +343,7 @@ impl Recorder {
     }
 
     fn refresh(&mut self) {
-        if matches!(self.session, Session::Recording(_)) {
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
             return;
         }
         match self.devices.survey() {
@@ -332,7 +368,7 @@ impl Recorder {
     }
 
     fn select_microphone(&mut self, index: usize) {
-        if !matches!(self.session, Session::Idle) {
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
             return;
         }
         if index >= self.endpoints.microphones().len() {
@@ -342,7 +378,7 @@ impl Recorder {
     }
 
     fn select_output(&mut self, index: usize) {
-        if !matches!(self.session, Session::Idle) {
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
             return;
         }
         if index >= self.endpoints.outputs().len() {
@@ -365,8 +401,10 @@ impl Recorder {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
-        self.microphone_vu.advance(dt);
-        self.system_vu.advance(dt);
+        if matches!(self.session, Session::Recording(_)) {
+            self.microphone_vu.advance(dt);
+            self.system_vu.advance(dt);
+        }
         self.drive_save();
     }
 
@@ -374,7 +412,12 @@ impl Recorder {
         match self.session.poll() {
             None => {}
             Some(Ok(path)) => {
-                self.notice = Some(neutral(format!("Saved to {}.", path.display())));
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                self.notice = Some(neutral(format!("Saved: {name}")));
+                self.saved_path = Some(path);
                 self.microphone_vu.reset();
                 self.system_vu.reset();
             }
@@ -418,6 +461,13 @@ impl Recorder {
         );
         let recording = matches!(self.session, Session::Recording(_));
         View {
+            phase: match self.session {
+                Session::Idle => Phase::Idle,
+                Session::Recording(_) => Phase::Recording,
+                Session::AwaitingSave(_) => Phase::AwaitingSave,
+                Session::Saving(_) => Phase::Saving,
+                Session::Failed(_) => Phase::Failed,
+            },
             endpoints,
             microphone: Selector {
                 selected: self.microphone,
@@ -445,12 +495,13 @@ impl Recorder {
                 }
             },
             progress: self.session.save_progress(),
-            status: if matches!(self.session, Session::Saving(_)) {
+            status: if matches!(self.session, Session::Recording(_) | Session::Saving(_)) {
                 self.derived_status()
             } else {
                 self.notice.clone().unwrap_or_else(|| self.derived_status())
             },
             ask: self.pending_ask.take(),
+            saved_path: self.saved_path.clone(),
         }
     }
 
@@ -708,6 +759,7 @@ mod tests {
                 return view;
             }
             view = recorder.apply(Intent::Tick);
+            thread::sleep(Duration::from_millis(1));
         }
         panic!("save did not reach Idle")
     }
@@ -841,7 +893,7 @@ mod tests {
         let path = dest.path().join("take.mp3");
         let started = recorder.apply(Intent::SaveTo(path.clone()));
         let progress = started.progress.expect("save started");
-        assert_eq!(progress.done, 0);
+        assert!(progress.done <= progress.total);
         assert!(progress.total > 0);
         assert!(!started.transport.save_enabled);
         assert!(!started.transport.toggle_enabled);
@@ -1015,5 +1067,45 @@ mod tests {
         );
         assert_eq!(view.status.tone, Tone::Warning);
         assert!(view.transport.toggle_enabled);
+    }
+
+    #[test]
+    fn discard_request_keeps_take_until_confirmed() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::RequestDiscard);
+        assert_eq!(asked.ask, Some(Ask::ConfirmDiscard));
+        assert_eq!(asked.phase, Phase::AwaitingSave);
+        let cancelled = recorder.apply(Intent::Tick);
+        assert!(cancelled.ask.is_none());
+        assert!(cancelled.transport.save_enabled);
+        assert_eq!(recorder.apply(Intent::Discard).phase, Phase::Idle);
+    }
+
+    #[test]
+    fn retry_save_replaces_cancel_notice_and_provides_saved_path() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        recorder.apply(Intent::CancelSave);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meeting.mp3");
+        let saving = recorder.apply(Intent::SaveTo(path.clone()));
+        assert_eq!(saving.phase, Phase::Saving);
+        assert!(saving.status.text.starts_with("Saving Meeting MP3, "));
+        let saved = finish_save(&mut recorder);
+        assert_eq!(saved.phase, Phase::Idle);
+        assert_eq!(saved.saved_path, Some(path));
+        assert_eq!(saved.status.text, "Saved: meeting.mp3");
+    }
+
+    #[test]
+    fn timer_sleeps_when_idle_without_stalling_export_when_minimized() {
+        for phase in [Phase::Idle, Phase::AwaitingSave, Phase::Failed] {
+            assert_eq!(phase.timer_ms(false), None);
+            assert_eq!(phase.timer_ms(true), None);
+        }
+        assert_eq!(Phase::Recording.timer_ms(false), Some(50));
+        assert_eq!(Phase::Recording.timer_ms(true), Some(500));
+        assert_eq!(Phase::Saving.timer_ms(true), Some(50));
     }
 }
