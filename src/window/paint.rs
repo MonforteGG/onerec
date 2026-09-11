@@ -8,15 +8,14 @@ use ::windows::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, HBRUSH, HDC, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use ::windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx, SetWindowTheme, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
 };
 use ::windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, SendMessageW, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, HMENU,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, SendMessageW, SetWindowTextW, SystemParametersInfoW, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, HMENU, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::mp3::{ExportQuality, SaveProgress};
@@ -40,14 +39,17 @@ const FIELD_WIDTH: i32 = CLIENT_WIDTH - FIELD_X - MARGIN;
 const ROW_HEIGHT: i32 = 24;
 const LABEL_HEIGHT: i32 = 18;
 const DROPPED_HEIGHT: i32 = ROW_HEIGHT + 180;
-const ROW_PITCH: i32 = 32;
+
+const COMBO_METER_GAP: i32 = 4;
+const GROUP_GAP: i32 = 12;
+const METER_HEIGHT: i32 = 16;
 
 const MICROPHONE_Y: i32 = MARGIN;
-const OUTPUT_Y: i32 = MICROPHONE_Y + ROW_PITCH;
-const QUALITY_Y: i32 = OUTPUT_Y + ROW_PITCH;
-const MICROPHONE_METER_Y: i32 = 120;
-const SYSTEM_METER_Y: i32 = 144;
-const METER_HEIGHT: i32 = 16;
+const MICROPHONE_METER_Y: i32 = MICROPHONE_Y + ROW_HEIGHT + COMBO_METER_GAP;
+const OUTPUT_Y: i32 = MICROPHONE_METER_Y + METER_HEIGHT + GROUP_GAP;
+const SYSTEM_METER_Y: i32 = OUTPUT_Y + ROW_HEIGHT + COMBO_METER_GAP;
+const QUALITY_Y: i32 = SYSTEM_METER_Y + METER_HEIGHT + GROUP_GAP;
+const SAVE_BAR_Y: i32 = QUALITY_Y + ROW_HEIGHT + COMBO_METER_GAP;
 const BUTTON_Y: i32 = 176;
 const BUTTON_HEIGHT: i32 = 30;
 const TOGGLE_WIDTH: i32 = 140;
@@ -71,8 +73,6 @@ pub(crate) struct Controls {
     discard: HWND,
     elapsed: HWND,
     status: HWND,
-    mic_meter_label: HWND,
-    system_meter_label: HWND,
     font: HFONT,
     trough: HBRUSH,
     signal: HBRUSH,
@@ -104,8 +104,6 @@ impl Controls {
         label(root, instance, font, w!("Microphone"), MICROPHONE_Y + 3)?;
         label(root, instance, font, w!("System"), OUTPUT_Y + 3)?;
         label(root, instance, font, w!("MP3 quality"), QUALITY_Y + 3)?;
-        let mic_meter_label = label(root, instance, font, w!("Mic"), MICROPHONE_METER_Y)?;
-        let system_meter_label = label(root, instance, font, w!("System"), SYSTEM_METER_Y)?;
 
         let controls = Self {
             microphones: combo(root, instance, ID_MICROPHONE, MICROPHONE_Y)?,
@@ -132,8 +130,6 @@ impl Controls {
                 STATUS_HEIGHT,
                 WINDOW_STYLE(0),
             )?,
-            mic_meter_label,
-            system_meter_label,
             font,
             trough: unsafe { CreateSolidBrush(rgb(0x21, 0x23, 0x26)) },
             signal: unsafe { CreateSolidBrush(rgb(0x2e, 0xa0, 0x43)) },
@@ -225,29 +221,22 @@ impl Controls {
         if saving != self.painted.saving {
             self.painted.saving = saving;
             unsafe {
-                if saving {
-                    let _ = SetWindowTextW(self.mic_meter_label, w!("Saving"));
-                    let _ = ShowWindow(self.system_meter_label, SW_HIDE);
-                } else {
-                    let _ = SetWindowTextW(self.mic_meter_label, w!("Mic"));
-                    let _ = SetWindowTextW(self.system_meter_label, w!("System"));
-                    let _ = ShowWindow(self.system_meter_label, SW_SHOW);
-                }
                 let _ = InvalidateRect(root, Some(&save_bar()), true);
             }
         }
-        if self.painted.levels != Some(view.levels) || self.painted.progress != view.progress {
+        if self.painted.levels != Some(view.levels) {
             self.painted.levels = Some(view.levels);
+            for rect in [meter(MICROPHONE_METER_Y), meter(SYSTEM_METER_Y)] {
+                unsafe {
+                    let _ = InvalidateRect(root, Some(&rect), false);
+                }
+            }
+        }
+        if self.painted.progress != view.progress {
             self.painted.progress = view.progress;
             if saving {
                 unsafe {
                     let _ = InvalidateRect(root, Some(&save_bar()), false);
-                }
-            } else {
-                for rect in [meter(MICROPHONE_METER_Y), meter(SYSTEM_METER_Y)] {
-                    unsafe {
-                        let _ = InvalidateRect(root, Some(&rect), false);
-                    }
                 }
             }
         }
@@ -256,7 +245,6 @@ impl Controls {
     pub(crate) fn draw_meters(&self, hdc: HDC) {
         if let Some(progress) = self.painted.progress {
             self.fill_linear(hdc, save_bar(), progress.fraction());
-            return;
         }
         let Some(levels) = self.painted.levels else {
             return;
@@ -346,14 +334,7 @@ fn meter(top: i32) -> RECT {
 }
 
 fn save_bar() -> RECT {
-    let top = meter(MICROPHONE_METER_Y);
-    let bottom = meter(SYSTEM_METER_Y);
-    RECT {
-        left: top.left,
-        top: top.top,
-        right: top.right,
-        bottom: bottom.bottom,
-    }
+    meter(SAVE_BAR_Y)
 }
 
 fn refill(list: HWND, names: &[String]) {
@@ -429,7 +410,7 @@ fn text(
     height: i32,
     style: WINDOW_STYLE,
 ) -> Result<HWND, RunError> {
-    child(
+    let control = child(
         root,
         instance,
         w!("STATIC"),
@@ -439,7 +420,11 @@ fn text(
         width,
         height,
         0,
-    )
+    )?;
+    unsafe {
+        let _ = SetWindowTheme(control, w!(""), w!(""));
+    }
+    Ok(control)
 }
 
 fn label(
