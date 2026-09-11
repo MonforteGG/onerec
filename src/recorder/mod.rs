@@ -119,7 +119,6 @@ pub(crate) struct Recorder {
     notice: Option<Status>,
     last_tick: Instant,
     pending_ask: Option<Ask>,
-    saving_to: Option<PathBuf>,
 }
 
 impl Recorder {
@@ -157,7 +156,6 @@ impl Recorder {
             notice,
             last_tick: Instant::now(),
             pending_ask: None,
-            saving_to: None,
         }
     }
 
@@ -283,9 +281,7 @@ impl Recorder {
 
     fn save_to(&mut self, destination: &std::path::Path) {
         match self.session.save_as(destination, self.quality) {
-            Ok(()) => {
-                self.saving_to = Some(destination.to_path_buf());
-            }
+            Ok(()) => {}
             Err(SaveError::NoTake) => {}
             Err(SaveError::Write(detail)) => self.notice = Some(warn(detail)),
         }
@@ -300,7 +296,6 @@ impl Recorder {
     }
 
     fn discard(&mut self) {
-        self.saving_to = None;
         match self.session.discard() {
             Ok(()) => {
                 self.microphone_vu.reset();
@@ -378,16 +373,13 @@ impl Recorder {
     fn drive_save(&mut self) {
         match self.session.poll() {
             None => {}
-            Some(Ok(())) => {
-                if let Some(path) = self.saving_to.take() {
-                    self.notice = Some(neutral(format!("Saved to {}.", path.display())));
-                }
+            Some(Ok(path)) => {
+                self.notice = Some(neutral(format!("Saved to {}.", path.display())));
                 self.microphone_vu.reset();
                 self.system_vu.reset();
             }
             Some(Err(SaveError::NoTake)) => {}
             Some(Err(SaveError::Write(detail))) => {
-                self.saving_to = None;
                 self.notice = Some(warn(detail));
             }
         }
@@ -403,7 +395,6 @@ impl Recorder {
     }
 
     fn abandon_and_close(&mut self) {
-        self.saving_to = None;
         if matches!(self.session, Session::Recording(_)) {
             self.session.stop();
         }

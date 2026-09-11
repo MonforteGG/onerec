@@ -16,7 +16,6 @@ const FLUSH_CAPACITY: usize = 7200;
 
 static NEXT_PART: AtomicU64 = AtomicU64::new(0);
 
-/// Closed CBR presets. LAME `Bitrate` is mapped only inside this module.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExportQuality {
     Compact,
@@ -57,14 +56,12 @@ impl ExportQuality {
     }
 }
 
-/// PCM stereo frames consumed versus `staging_bytes / 8`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaveProgress {
     pub done: u64,
     pub total: u64,
 }
 
-/// Pollable CBR encode. Drop of an uncommitted part unlinks it.
 pub(crate) struct Encode {
     encoder: Encoder,
     src: File,
@@ -106,7 +103,6 @@ impl Encode {
         })
     }
 
-    /// `budget == 0` still encodes one PCM chunk or the final flush.
     pub(crate) fn pump(&mut self, budget: Duration) -> io::Result<bool> {
         if self.part.is_none() {
             return Ok(true);
@@ -340,7 +336,7 @@ pub(crate) fn parse_mpeg1_layer3_cbr(bytes: &[u8]) -> Result<Vec<MpegLayer3Frame
         if channel_mode > 1 {
             return Err(format!("channel mode {channel_mode} at byte {offset}"));
         }
-        // MPEG-1 Layer III CBR length is 144 * bitrate / sample_rate. Compact is 384 B, Standard 576 B, High 960 B.
+        // MPEG-1 Layer III CBR length is 144 * bitrate / sample_rate.
         let byte_len = (144 * u32::from(bitrate_kbps) * 1000 / sample_rate) as usize;
         if offset + byte_len > bytes.len() {
             return Err(format!("truncated MPEG frame at byte {offset}"));

@@ -28,9 +28,9 @@ pub enum Session {
 }
 
 pub struct ActiveSave {
-    pending: PendingRecording,
-    destination: PathBuf,
     encode: Encode,
+    destination: PathBuf,
+    pending: PendingRecording,
 }
 
 pub struct ActiveRecording {
@@ -212,14 +212,14 @@ impl Session {
             unreachable!()
         };
         *self = Session::Saving(ActiveSave {
-            pending,
-            destination: destination.to_path_buf(),
             encode,
+            destination: destination.to_path_buf(),
+            pending,
         });
         Ok(())
     }
 
-    pub fn poll(&mut self) -> Option<Result<(), SaveError>> {
+    pub fn poll(&mut self) -> Option<Result<PathBuf, SaveError>> {
         if !matches!(self, Session::Saving(_)) {
             return None;
         }
@@ -232,8 +232,10 @@ impl Session {
         match outcome {
             Ok(false) => None,
             Ok(true) => {
-                *self = Session::Idle;
-                Some(Ok(()))
+                let Session::Saving(active) = std::mem::replace(self, Session::Idle) else {
+                    unreachable!()
+                };
+                Some(Ok(active.destination))
             }
             Err(error) => {
                 let Session::Saving(active) = std::mem::replace(self, Session::Idle) else {
@@ -693,13 +695,14 @@ mod tests {
         assert_eq!(pending.staging_file(), Path::new("onerec-missing-take.f32"));
     }
 
-    fn poll_until_terminal(session: &mut Session) -> Result<(), SaveError> {
+    fn poll_until_terminal(session: &mut Session) -> Result<PathBuf, SaveError> {
         loop {
             match session.poll() {
                 None => {
-                    if !matches!(session, Session::Saving(_)) {
-                        return Ok(());
-                    }
+                    assert!(
+                        matches!(session, Session::Saving(_)),
+                        "save left Saving without a terminal poll"
+                    );
                 }
                 Some(result) => return result,
             }
@@ -728,7 +731,7 @@ mod tests {
         let dest = dest_dir.path().join("take.mp3");
         session.save_as(&dest, ExportQuality::Standard).unwrap();
         assert!(matches!(session, Session::Saving(_)));
-        poll_until_terminal(&mut session).unwrap();
+        assert_eq!(poll_until_terminal(&mut session).unwrap(), dest);
         assert!(matches!(session, Session::Idle));
         assert!(!path.exists());
         let mp3 = std::fs::read(&dest).unwrap();
@@ -763,7 +766,7 @@ mod tests {
                         saw_partial = true;
                     }
                 }
-                Some(Ok(())) => break,
+                Some(Ok(_)) => break,
                 Some(Err(error)) => panic!("{error}"),
             }
         }
