@@ -1,1 +1,42 @@
-/target
+# Rust build output
+/target/
+
+# Local binaries and build products
+*.exe
+*.pdb
+*.dll
+*.msi
+*.zip
+*.log
+*.tmp
+*.bak
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+
+# Internal review notes and generated local documentation.
+# Keep only the public project README at the repository root.
+*.md
+!/README.md
+/docs/
+
+# Private prompts and large source renders used to regenerate production icons.
+/assets/icon-prompt.txt
+/assets/onerec-master.png
+/scripts/
+
+# Native UI preview output
+*.bmp
+/target/ui-preview/
