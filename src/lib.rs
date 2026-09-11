@@ -56,7 +56,6 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-// On Windows `run()` pumps a message loop, so it has no unit test.
 #[cfg(all(test, not(windows)))]
 mod tests {
     #[test]

@@ -31,7 +31,6 @@ fn open() -> Result<(), RunError> {
     shell::run(Recorder::new(staging))
 }
 
-/// The only way to tell the user about a failure that happens before the window exists.
 fn report(error: &RunError) {
     unsafe {
         MessageBoxW(
@@ -43,8 +42,7 @@ fn report(error: &RunError) {
     };
 }
 
-/// The UI thread runs in an STA because `IFileSaveDialog` wants one. The capture threads
-/// ask for an MTA of their own and already tolerate the `RPC_E_CHANGED_MODE` that follows.
+/// The UI thread runs in an STA because `IFileSaveDialog` wants one.
 struct Apartment {
     owned: bool,
 }

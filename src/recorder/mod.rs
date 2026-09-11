@@ -367,11 +367,7 @@ impl Recorder {
         if matches!(self.session, Session::Recording(_)) {
             self.session.stop();
         }
-        // A take that will not delete is not a reason to keep the user in the window. The
-        // staging handle retries the unlink when the recorder drops.
-        if let Err(error) = self.session.discard() {
-            self.notice = Some(warn(error.to_string()));
-        }
+        let _ = self.session.discard();
         self.microphone_vu.reset();
         self.system_vu.reset();
         self.pending_ask = Some(Ask::Close);

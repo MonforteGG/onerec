@@ -12,8 +12,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// A windows-subsystem binary has no console, so the Windows build shows the failure in a
-/// message box before `run()` returns it.
 #[cfg(windows)]
 fn report(_: &onerec::RunError) {}
 

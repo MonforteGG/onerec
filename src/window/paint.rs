@@ -203,7 +203,6 @@ impl Controls {
         self.draw_meter(hdc, meter(SYSTEM_METER_Y), levels.system);
     }
 
-    /// The status line is the only control whose colour carries meaning.
     pub(crate) fn color_static(&self, control: HWND, hdc: HDC) -> HBRUSH {
         let tone = if control == self.status {
             self.painted.status.as_ref().map(|status| status.tone)
@@ -253,13 +252,13 @@ impl Drop for Controls {
     }
 }
 
-/// Speech peaks around -20 dBFS, which is a tenth of a linear bar and reads as silence.
-/// The bar is a 60 dB window instead.
+const METER_FLOOR_DB: f32 = 60.0;
+
 fn bar_fraction(peak: f32) -> f32 {
     if peak <= 0.0 {
         return 0.0;
     }
-    ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    ((20.0 * peak.log10() + METER_FLOOR_DB) / METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
 fn meter(top: i32) -> RECT {

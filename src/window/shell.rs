@@ -47,8 +47,8 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
         return Err(RunError::new("the recorder could not start its clock"));
     }
 
-    // The shell outlives the window: the loop only ends after WM_DESTROY posts the quit
-    // message, so dropping it here cannot dangle a pointer the window procedure still reads.
+    // The shell lives on this stack frame until GetMessageW returns WM_QUIT, so the
+    // GWLP_USERDATA pointer cannot outlive it.
     let shell = RefCell::new(Shell { recorder, controls });
     unsafe { SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize) };
     let hotkey = unsafe {
@@ -102,9 +102,7 @@ struct Shell {
 }
 
 impl Shell {
-    /// The single funnel. Every message that means something becomes one intent here.
     fn dispatch(&mut self, root: HWND, intent: Intent) {
-        // Stopping a take joins the capture threads and saving streams the whole staging file.
         let blocking = matches!(
             intent,
             Intent::Toggle | Intent::SaveTo(_) | Intent::DiscardAndClose
@@ -193,8 +191,7 @@ fn create_window(instance: HINSTANCE) -> Result<HWND, RunError> {
     .map_err(|error| RunError::new(format!("opening the recorder window failed: {error}")))
 }
 
-/// Win32 re-enters the window procedure from a modal dialog's own message pump. A failed
-/// borrow is exactly that re-entry, and the message is dropped rather than reordered.
+/// Win32 re-enters the window procedure from a modal dialog's own message pump.
 fn with_shell<T>(root: HWND, body: impl FnOnce(&mut Shell) -> T) -> Option<T> {
     let pointer = unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *const RefCell<Shell>;
     let cell = unsafe { pointer.as_ref() }?;
@@ -218,8 +215,6 @@ unsafe extern "system" fn wnd_proc(
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc = BeginPaint(root, &mut paint);
-            // A repaint during a modal dialog cannot borrow the shell, and the meters read
-            // zero for as long as one is up, so nothing visible is lost.
             with_shell(root, |shell| shell.controls.draw_meters(hdc));
             let _ = EndPaint(root, &paint);
             LRESULT(0)
@@ -259,7 +254,6 @@ fn command(wparam: WPARAM, lparam: LPARAM) -> Option<Intent> {
     match (notification, id) {
         (CBN_SELCHANGE, ID_MICROPHONE) => Some(Intent::ChooseMicrophone(selection(control)?)),
         (CBN_SELCHANGE, ID_OUTPUT) => Some(Intent::ChooseOutput(selection(control)?)),
-        // The list is worth refreshing exactly when the user is about to look at it.
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
