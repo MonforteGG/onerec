@@ -1,8 +1,13 @@
 mod audio;
 mod capture;
 mod ids;
+mod recorder;
 mod session;
+mod staging;
 mod timeline;
+mod wave;
+#[cfg(windows)]
+mod window;
 
 pub use audio::{
     open_loopback, open_microphone, AudioError, CaptureStream, Endpoint, Endpoints, Microphone,
@@ -13,29 +18,34 @@ pub use capture::{
     SessionFrame, TimedStereoFrames,
 };
 pub use ids::{DeviceIdError, MicrophoneId, OutputDeviceId};
-pub use session::{FailedSession, PendingRecording, Session};
-pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+pub use session::{DiscardError, FailedSession, PendingRecording, SaveError, Session};
+pub use staging::{StagingArea, StagingFile};
+pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE, MIX_TICK};
 
 use std::fmt;
 
 pub fn run() -> Result<(), RunError> {
     #[cfg(windows)]
     {
-        Err(RunError {
-            message: "the recorder window is not in this build".into(),
-        })
+        window::run()
     }
     #[cfg(not(windows))]
     {
-        Err(RunError {
-            message: "v1 is Windows-only".into(),
-        })
+        Err(RunError::new("v1 is Windows-only"))
     }
 }
 
 #[derive(Debug)]
 pub struct RunError {
     message: String,
+}
+
+impl RunError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for RunError {
@@ -46,20 +56,10 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     #[test]
     fn run_reports_windows_only_off_windows() {
-        #[cfg(not(windows))]
-        {
-            assert_eq!(crate::run().unwrap_err().to_string(), "v1 is Windows-only");
-        }
-        #[cfg(windows)]
-        {
-            assert_eq!(
-                crate::run().unwrap_err().to_string(),
-                "the recorder window is not in this build"
-            );
-        }
+        assert_eq!(crate::run().unwrap_err().to_string(), "v1 is Windows-only");
     }
 }

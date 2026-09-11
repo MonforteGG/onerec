@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::thread;
     use std::time::Duration;
 
-    use onerec::{open_loopback, open_microphone, Endpoints, Session};
+    use onerec::{open_loopback, open_microphone, Endpoints, Session, StagingArea};
 
     use probe::Meter;
 
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let microphone_meter = Arc::new(Mutex::new(probe::Stats::default()));
     let loopback_meter = Arc::new(Mutex::new(probe::Stats::default()));
-    let staging = std::env::temp_dir().join("onerec-probe.f32");
+    let staging = StagingArea::open()?.next_take()?;
 
     let mut session = Session::Idle;
     session.start(
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_id,
         Meter::new(microphone, Arc::clone(&microphone_meter)),
         Meter::new(loopback, Arc::clone(&loopback_meter)),
-        staging.clone(),
+        staging,
     );
     thread::sleep(Duration::from_secs(2));
     session.stop();
@@ -73,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "staging file: {} ({} bytes)",
-        staging.display(),
-        std::fs::metadata(&staging)?.len()
+        pending.staging_file().display(),
+        std::fs::metadata(pending.staging_file())?.len()
     );
     Ok(())
 }
