@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{AudioError, Endpoint, Endpoints};
 use crate::capture::CaptureSource;
 use crate::ids::{MicrophoneId, OutputDeviceId};
+use crate::mp3::{ExportQuality, SaveProgress};
 use crate::session::{SaveError, Session};
 use crate::staging::StagingArea;
 
@@ -25,6 +26,7 @@ pub(crate) enum Intent {
     RefreshEndpoints,
     ChooseMicrophone(usize),
     ChooseOutput(usize),
+    ChooseQuality(usize),
     Toggle,
     Save,
     SaveTo(PathBuf),
@@ -40,9 +42,11 @@ pub(crate) struct View {
     pub endpoints: Option<EndpointLists>,
     pub microphone: Selector,
     pub output: Selector,
+    pub quality: Selector,
     pub transport: Transport,
     pub elapsed: String,
     pub levels: Levels,
+    pub progress: Option<SaveProgress>,
     pub status: Status,
     pub ask: Option<Ask>,
 }
@@ -108,12 +112,14 @@ pub(crate) struct Recorder {
     endpoints_dirty: bool,
     microphone: Option<usize>,
     output: Option<usize>,
+    quality: ExportQuality,
     session: Session,
     microphone_vu: Vu,
     system_vu: Vu,
     notice: Option<Status>,
     last_tick: Instant,
     pending_ask: Option<Ask>,
+    saving_to: Option<PathBuf>,
 }
 
 impl Recorder {
@@ -144,12 +150,14 @@ impl Recorder {
             endpoints_dirty: true,
             microphone,
             output,
+            quality: ExportQuality::Standard,
             session: Session::Idle,
             microphone_vu: Vu::new(),
             system_vu: Vu::new(),
             notice,
             last_tick: Instant::now(),
             pending_ask: None,
+            saving_to: None,
         }
     }
 
@@ -159,6 +167,7 @@ impl Recorder {
             Intent::RefreshEndpoints => self.refresh(),
             Intent::ChooseMicrophone(index) => self.select_microphone(index),
             Intent::ChooseOutput(index) => self.select_output(index),
+            Intent::ChooseQuality(index) => self.select_quality(index),
             Intent::Toggle => self.toggle(),
             Intent::Save => self.request_destination(),
             Intent::SaveTo(path) => self.save_to(&path),
@@ -273,11 +282,9 @@ impl Recorder {
     }
 
     fn save_to(&mut self, destination: &std::path::Path) {
-        match self.session.save_as(destination) {
+        match self.session.save_as(destination, self.quality) {
             Ok(()) => {
-                self.notice = Some(neutral(format!("Saved to {}.", destination.display())));
-                self.microphone_vu.reset();
-                self.system_vu.reset();
+                self.saving_to = Some(destination.to_path_buf());
             }
             Err(SaveError::NoTake) => {}
             Err(SaveError::Write(detail)) => self.notice = Some(warn(detail)),
@@ -293,6 +300,7 @@ impl Recorder {
     }
 
     fn discard(&mut self) {
+        self.saving_to = None;
         match self.session.discard() {
             Ok(()) => {
                 self.microphone_vu.reset();
@@ -348,22 +356,54 @@ impl Recorder {
         self.output = Some(index);
     }
 
+    fn select_quality(&mut self, index: usize) {
+        if matches!(self.session, Session::Recording(_) | Session::Saving(_)) {
+            return;
+        }
+        let Some(quality) = ExportQuality::from_index(index) else {
+            return;
+        };
+        self.quality = quality;
+    }
+
     fn advance_meters(&mut self) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         self.microphone_vu.advance(dt);
         self.system_vu.advance(dt);
+        self.drive_save();
+    }
+
+    fn drive_save(&mut self) {
+        match self.session.poll() {
+            None => {}
+            Some(Ok(())) => {
+                if let Some(path) = self.saving_to.take() {
+                    self.notice = Some(neutral(format!("Saved to {}.", path.display())));
+                }
+                self.microphone_vu.reset();
+                self.system_vu.reset();
+            }
+            Some(Err(SaveError::NoTake)) => {}
+            Some(Err(SaveError::Write(detail))) => {
+                self.saving_to = None;
+                self.notice = Some(warn(detail));
+            }
+        }
     }
 
     fn consider_closing(&mut self) {
         self.pending_ask = Some(match &self.session {
             Session::Idle | Session::Failed(_) => Ask::Close,
-            Session::Recording(_) | Session::AwaitingSave(_) => Ask::ConfirmClose,
+            Session::Recording(_) | Session::AwaitingSave(_) | Session::Saving(_) => {
+                Ask::ConfirmClose
+            }
         });
     }
 
     fn abandon_and_close(&mut self) {
+        self.saving_to = None;
         if matches!(self.session, Session::Recording(_)) {
             self.session.stop();
         }
@@ -381,6 +421,10 @@ impl Recorder {
             None
         };
         let pickers_enabled = matches!(self.session, Session::Idle | Session::Failed(_));
+        let quality_enabled = matches!(
+            self.session,
+            Session::Idle | Session::Failed(_) | Session::AwaitingSave(_)
+        );
         let recording = matches!(self.session, Session::Recording(_));
         View {
             endpoints,
@@ -391,6 +435,10 @@ impl Recorder {
             output: Selector {
                 selected: self.output,
                 enabled: pickers_enabled,
+            },
+            quality: Selector {
+                selected: Some(self.quality.index()),
+                enabled: quality_enabled,
             },
             transport: self.transport(),
             elapsed: format_elapsed(self.session.elapsed().unwrap_or_default()),
@@ -405,6 +453,7 @@ impl Recorder {
                     system: Level::ZERO,
                 }
             },
+            progress: self.session.save_progress(),
             status: self.notice.clone().unwrap_or_else(|| self.derived_status()),
             ask: self.pending_ask.take(),
         }
@@ -436,6 +485,12 @@ impl Recorder {
                 save_enabled: false,
                 discard_enabled: false,
             },
+            Session::Saving(_) => Transport {
+                toggle_label: "Start recording",
+                toggle_enabled: false,
+                save_enabled: false,
+                discard_enabled: false,
+            },
         }
     }
 
@@ -454,6 +509,7 @@ impl Recorder {
             Session::AwaitingSave(_) => {
                 neutral("Take ready. Save or discard it before the next one.")
             }
+            Session::Saving(_) => neutral("Saving MP3…"),
             Session::Failed(failed) => Status {
                 text: failed.to_string(),
                 tone: Tone::Failure,
@@ -640,6 +696,17 @@ mod tests {
         recorder.apply(Intent::Toggle)
     }
 
+    fn finish_save(recorder: &mut Recorder) -> View {
+        let mut view = recorder.apply(Intent::Tick);
+        for _ in 0..10_000 {
+            if view.progress.is_none() {
+                return view;
+            }
+            view = recorder.apply(Intent::Tick);
+        }
+        panic!("save did not reach Idle")
+    }
+
     #[test]
     fn picker_change_opens_nothing() {
         let (mut recorder, opens) = recorder(MicKind::Tone(0.25), false);
@@ -767,11 +834,70 @@ mod tests {
         assert_eq!(recorder.apply(Intent::Tick).ask, None);
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("take.mp3");
-        let saved = recorder.apply(Intent::SaveTo(path.clone()));
+        let started = recorder.apply(Intent::SaveTo(path.clone()));
+        let progress = started.progress.expect("save started");
+        assert_eq!(progress.done, 0);
+        assert!(progress.total > 0);
+        assert!(!started.transport.save_enabled);
+        assert!(!started.transport.toggle_enabled);
+        assert!(!started.quality.enabled);
+        assert_eq!(started.status.text, "Saving MP3…");
+        let saved = finish_save(&mut recorder);
         assert_eq!(saved.transport.toggle_label, "Start recording");
         assert!(saved.transport.toggle_enabled);
         assert!(!saved.transport.save_enabled);
+        assert!(saved.progress.is_none());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn quality_defaults_to_standard_and_changes_while_idle() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        let view = recorder.apply(Intent::Tick);
+        assert_eq!(view.quality.selected, Some(ExportQuality::Standard.index()));
+        assert!(view.quality.enabled);
+        let high = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert_eq!(high.quality.selected, Some(ExportQuality::High.index()));
+    }
+
+    #[test]
+    fn quality_is_ignored_while_recording() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::ChooseQuality(ExportQuality::Compact.index()));
+        recorder.apply(Intent::Toggle);
+        let ignored = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert_eq!(
+            ignored.quality.selected,
+            Some(ExportQuality::Compact.index())
+        );
+        assert!(!ignored.quality.enabled);
+        recorder.apply(Intent::Toggle);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn quality_stays_enabled_while_awaiting_save() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        let stopped = stop_take(&mut recorder);
+        assert!(stopped.quality.enabled);
+        let changed = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert_eq!(changed.quality.selected, Some(ExportQuality::High.index()));
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn choose_quality_before_save_to_sets_the_file_bitrate() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        let dest = tempfile::tempdir().unwrap();
+        let path = dest.path().join("take.mp3");
+        recorder.apply(Intent::SaveTo(path.clone()));
+        finish_save(&mut recorder);
+        let mp3 = std::fs::read(&path).unwrap();
+        let frames = crate::mp3::parse_mpeg1_layer3_cbr(&mp3).unwrap();
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|frame| frame.bitrate_kbps == 320));
     }
 
     #[test]

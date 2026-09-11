@@ -22,7 +22,8 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::paint::{
-    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_MICROPHONE, ID_OUTPUT, ID_SAVE, ID_TOGGLE,
+    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_MICROPHONE, ID_OUTPUT, ID_QUALITY,
+    ID_SAVE, ID_TOGGLE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Recorder};
@@ -103,10 +104,7 @@ struct Shell {
 
 impl Shell {
     fn dispatch(&mut self, root: HWND, intent: Intent) {
-        let blocking = matches!(
-            intent,
-            Intent::Toggle | Intent::SaveTo(_) | Intent::DiscardAndClose
-        );
+        let blocking = matches!(intent, Intent::Toggle | Intent::DiscardAndClose);
         let _wait = blocking.then(WaitCursor::show);
         let view = self.recorder.apply(intent);
         self.controls.show(root, &view);
@@ -271,11 +269,15 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
     match (notification, id) {
         (CBN_SELENDOK, ID_MICROPHONE) => Some(Intent::ChooseMicrophone(selection(control)?)),
         (CBN_SELENDOK, ID_OUTPUT) => Some(Intent::ChooseOutput(selection(control)?)),
+        (CBN_SELENDOK, ID_QUALITY) => Some(Intent::ChooseQuality(selection(control)?)),
         (CBN_SELCHANGE, ID_MICROPHONE) if !list_dropped => {
             Some(Intent::ChooseMicrophone(selection(control)?))
         }
         (CBN_SELCHANGE, ID_OUTPUT) if !list_dropped => {
             Some(Intent::ChooseOutput(selection(control)?))
+        }
+        (CBN_SELCHANGE, ID_QUALITY) if !list_dropped => {
+            Some(Intent::ChooseQuality(selection(control)?))
         }
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),

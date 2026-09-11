@@ -18,17 +18,19 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
+use crate::mp3::{ExportQuality, SaveProgress};
 use crate::recorder::{Level, Levels, Selector, Status, Tone, View};
 use crate::RunError;
 
 pub(crate) const CLIENT_WIDTH: i32 = 460;
-pub(crate) const CLIENT_HEIGHT: i32 = 232;
+pub(crate) const CLIENT_HEIGHT: i32 = 264;
 
 pub(crate) const ID_MICROPHONE: u16 = 101;
 pub(crate) const ID_OUTPUT: u16 = 102;
 pub(crate) const ID_TOGGLE: u16 = 103;
 pub(crate) const ID_SAVE: u16 = 104;
 pub(crate) const ID_DISCARD: u16 = 105;
+pub(crate) const ID_QUALITY: u16 = 106;
 
 const MARGIN: i32 = 14;
 const LABEL_WIDTH: i32 = 92;
@@ -40,10 +42,11 @@ const DROPPED_HEIGHT: i32 = ROW_HEIGHT + 180;
 
 const MICROPHONE_Y: i32 = MARGIN;
 const OUTPUT_Y: i32 = 46;
-const MICROPHONE_METER_Y: i32 = 88;
-const SYSTEM_METER_Y: i32 = 114;
+const QUALITY_Y: i32 = 78;
+const MICROPHONE_METER_Y: i32 = 120;
+const SYSTEM_METER_Y: i32 = 146;
 const METER_HEIGHT: i32 = 18;
-const BUTTON_Y: i32 = 148;
+const BUTTON_Y: i32 = 180;
 const BUTTON_HEIGHT: i32 = 30;
 const TOGGLE_WIDTH: i32 = 140;
 const SAVE_X: i32 = 164;
@@ -51,7 +54,7 @@ const DISCARD_X: i32 = 262;
 const SMALL_BUTTON_WIDTH: i32 = 90;
 const ELAPSED_X: i32 = 364;
 const ELAPSED_WIDTH: i32 = CLIENT_WIDTH - MARGIN - ELAPSED_X;
-const STATUS_Y: i32 = 190;
+const STATUS_Y: i32 = 222;
 const STATUS_HEIGHT: i32 = 34;
 
 // SS_RIGHT lives in Win32::System::SystemServices, a feature nothing else here needs.
@@ -60,6 +63,7 @@ const SS_RIGHT: u32 = 0x0002;
 pub(crate) struct Controls {
     microphones: HWND,
     outputs: HWND,
+    quality: HWND,
     toggle: HWND,
     save: HWND,
     discard: HWND,
@@ -78,6 +82,7 @@ struct Painted {
     elapsed: String,
     status: Option<Status>,
     levels: Option<Levels>,
+    progress: Option<SaveProgress>,
 }
 
 impl Controls {
@@ -94,6 +99,7 @@ impl Controls {
         for (caption, top) in [
             (w!("Microphone"), MICROPHONE_Y + 3),
             (w!("System audio"), OUTPUT_Y + 3),
+            (w!("MP3 quality"), QUALITY_Y + 3),
             (w!("Mic"), MICROPHONE_METER_Y),
             (w!("System"), SYSTEM_METER_Y),
         ] {
@@ -103,6 +109,7 @@ impl Controls {
         let controls = Self {
             microphones: combo(root, instance, ID_MICROPHONE, MICROPHONE_Y)?,
             outputs: combo(root, instance, ID_OUTPUT, OUTPUT_Y)?,
+            quality: combo(root, instance, ID_QUALITY, QUALITY_Y)?,
             toggle: button(root, instance, ID_TOGGLE, MARGIN, TOGGLE_WIDTH)?,
             save: button(root, instance, ID_SAVE, SAVE_X, SMALL_BUTTON_WIDTH)?,
             discard: button(root, instance, ID_DISCARD, DISCARD_X, SMALL_BUTTON_WIDTH)?,
@@ -133,12 +140,14 @@ impl Controls {
                 elapsed: String::new(),
                 status: None,
                 levels: None,
+                progress: None,
             },
             list_dropped: false,
         };
         for control in [
             controls.microphones,
             controls.outputs,
+            controls.quality,
             controls.toggle,
             controls.save,
             controls.discard,
@@ -151,6 +160,10 @@ impl Controls {
             let _ = SetWindowTextW(controls.save, w!("Save..."));
             let _ = SetWindowTextW(controls.discard, w!("Discard"));
         }
+        refill(
+            controls.quality,
+            &ExportQuality::ALL.map(|quality| quality.label().to_string()),
+        );
         Ok(controls)
     }
 
@@ -177,6 +190,7 @@ impl Controls {
         }
         choose(self.microphones, view.microphone);
         choose(self.outputs, view.output);
+        choose(self.quality, view.quality);
 
         if self.painted.toggle_label != view.transport.toggle_label {
             self.painted.toggle_label = view.transport.toggle_label;
@@ -203,8 +217,9 @@ impl Controls {
                 let _ = SetWindowTextW(self.status, &status);
             }
         }
-        if self.painted.levels != Some(view.levels) {
+        if self.painted.levels != Some(view.levels) || self.painted.progress != view.progress {
             self.painted.levels = Some(view.levels);
+            self.painted.progress = view.progress;
             for rect in [meter(MICROPHONE_METER_Y), meter(SYSTEM_METER_Y)] {
                 unsafe {
                     let _ = InvalidateRect(root, Some(&rect), false);
@@ -214,6 +229,12 @@ impl Controls {
     }
 
     pub(crate) fn draw_meters(&self, hdc: HDC) {
+        if let Some(progress) = self.painted.progress {
+            let fraction = bar_linear(progress.done, progress.total);
+            self.fill_linear(hdc, meter(MICROPHONE_METER_Y), fraction);
+            self.fill_linear(hdc, meter(SYSTEM_METER_Y), fraction);
+            return;
+        }
         let Some(levels) = self.painted.levels else {
             return;
         };
@@ -257,6 +278,19 @@ impl Controls {
         };
         unsafe { FillRect(hdc, &lit, brush) };
     }
+
+    fn fill_linear(&self, hdc: HDC, rect: RECT, fraction: f32) {
+        unsafe { FillRect(hdc, &rect, self.trough) };
+        let filled = ((rect.right - rect.left) as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+        if filled <= 0 {
+            return;
+        }
+        let lit = RECT {
+            right: rect.left + filled,
+            ..rect
+        };
+        unsafe { FillRect(hdc, &lit, self.signal) };
+    }
 }
 
 impl Drop for Controls {
@@ -277,6 +311,13 @@ fn bar_fraction(peak: f32) -> f32 {
         return 0.0;
     }
     ((20.0 * peak.log10() + METER_FLOOR_DB) / METER_FLOOR_DB).clamp(0.0, 1.0)
+}
+
+fn bar_linear(done: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (done as f64 / total as f64).clamp(0.0, 1.0) as f32
 }
 
 fn meter(top: i32) -> RECT {
@@ -561,6 +602,10 @@ mod tests {
                 selected: Some(0),
                 enabled: true,
             },
+            quality: Selector {
+                selected: Some(ExportQuality::Standard.index()),
+                enabled: true,
+            },
             transport: Transport {
                 toggle_label: "Start recording",
                 toggle_enabled: true,
@@ -572,6 +617,7 @@ mod tests {
                 microphone: Level::ZERO,
                 system: Level::ZERO,
             },
+            progress: None,
             status: Status {
                 text: String::new(),
                 tone: Tone::Neutral,

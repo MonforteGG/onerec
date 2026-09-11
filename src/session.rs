@@ -11,14 +11,26 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{CaptureRead, CaptureSource};
 use crate::ids::{MicrophoneId, OutputDeviceId};
+use crate::mp3::Encode;
 use crate::staging::StagingFile;
 use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+
+pub use crate::mp3::{ExportQuality, SaveProgress};
+
+const SAVE_SLICE: Duration = Duration::from_millis(30);
 
 pub enum Session {
     Idle,
     Recording(ActiveRecording),
     AwaitingSave(PendingRecording),
+    Saving(ActiveSave),
     Failed(FailedSession),
+}
+
+pub struct ActiveSave {
+    pending: PendingRecording,
+    destination: PathBuf,
+    encode: Encode,
 }
 
 pub struct ActiveRecording {
@@ -72,6 +84,14 @@ impl std::fmt::Debug for Session {
                 .field("elapsed", &pending.elapsed)
                 .field("degraded", &pending.degraded)
                 .field("staging_file", &pending.staging_file)
+                .finish(),
+            Session::Saving(active) => f
+                .debug_struct("Saving")
+                .field("elapsed", &active.pending.elapsed)
+                .field("degraded", &active.pending.degraded)
+                .field("staging_file", &active.pending.staging_file)
+                .field("destination", &active.destination)
+                .field("progress", &active.encode.progress())
                 .finish(),
             Session::Failed(failed) => f.debug_tuple("Failed").field(&failed.detail).finish(),
         }
@@ -178,28 +198,75 @@ impl Session {
         };
     }
 
-    pub fn save_as(&mut self, destination: &Path) -> Result<(), SaveError> {
-        let Session::AwaitingSave(pending) = self else {
-            return Err(SaveError::NoTake);
+    pub fn save_as(&mut self, destination: &Path, quality: ExportQuality) -> Result<(), SaveError> {
+        if matches!(self, Session::Saving(_)) {
+            return Ok(());
+        }
+        let staged = match self {
+            Session::AwaitingSave(pending) => pending.staging_file().to_path_buf(),
+            _ => return Err(SaveError::NoTake),
         };
-        crate::mp3::write(destination, pending.staging_file())
+        let encode = Encode::start(destination, &staged, quality)
             .map_err(|error| SaveError::Write(error.to_string()))?;
-        *self = Session::Idle;
+        let Session::AwaitingSave(pending) = std::mem::replace(self, Session::Idle) else {
+            unreachable!()
+        };
+        *self = Session::Saving(ActiveSave {
+            pending,
+            destination: destination.to_path_buf(),
+            encode,
+        });
         Ok(())
     }
 
-    pub fn discard(&mut self) -> Result<(), DiscardError> {
-        let Session::AwaitingSave(pending) = self else {
-            return Ok(());
+    pub fn poll(&mut self) -> Option<Result<(), SaveError>> {
+        if !matches!(self, Session::Saving(_)) {
+            return None;
+        }
+        let outcome = {
+            let Session::Saving(active) = self else {
+                unreachable!()
+            };
+            active.encode.pump(SAVE_SLICE)
         };
-        pending
-            .staging_file
-            .unlink()
-            .map_err(|source| DiscardError {
-                path: pending.staging_file.path().to_path_buf(),
-                source,
-            })?;
-        *self = Session::Idle;
+        match outcome {
+            Ok(false) => None,
+            Ok(true) => {
+                *self = Session::Idle;
+                Some(Ok(()))
+            }
+            Err(error) => {
+                let Session::Saving(active) = std::mem::replace(self, Session::Idle) else {
+                    unreachable!()
+                };
+                *self = Session::AwaitingSave(active.pending);
+                Some(Err(SaveError::Write(error.to_string())))
+            }
+        }
+    }
+
+    pub fn save_progress(&self) -> Option<SaveProgress> {
+        match self {
+            Session::Saving(active) => Some(active.encode.progress()),
+            _ => None,
+        }
+    }
+
+    pub fn discard(&mut self) -> Result<(), DiscardError> {
+        let pending = match std::mem::replace(self, Session::Idle) {
+            Session::AwaitingSave(pending) => pending,
+            Session::Saving(active) => active.pending,
+            other => {
+                *self = other;
+                return Ok(());
+            }
+        };
+        let mut pending = pending;
+        if let Err(source) = pending.staging_file.unlink() {
+            let path = pending.staging_file.path().to_path_buf();
+            *self = Session::AwaitingSave(pending);
+            return Err(DiscardError { path, source });
+        }
         Ok(())
     }
 
@@ -221,6 +288,7 @@ impl Session {
         match self {
             Session::Recording(active) => Some(active.started_at.elapsed()),
             Session::AwaitingSave(pending) => Some(pending.elapsed),
+            Session::Saving(active) => Some(active.pending.elapsed),
             Session::Idle | Session::Failed(_) => None,
         }
     }
@@ -229,6 +297,7 @@ impl Session {
         match self {
             Session::Recording(active) => active.degraded.load(Ordering::SeqCst),
             Session::AwaitingSave(pending) => pending.degraded,
+            Session::Saving(active) => active.pending.degraded,
             Session::Idle | Session::Failed(_) => false,
         }
     }
@@ -624,6 +693,31 @@ mod tests {
         assert_eq!(pending.staging_file(), Path::new("onerec-missing-take.f32"));
     }
 
+    fn poll_until_terminal(session: &mut Session) -> Result<(), SaveError> {
+        loop {
+            match session.poll() {
+                None => {
+                    if !matches!(session, Session::Saving(_)) {
+                        return Ok(());
+                    }
+                }
+                Some(result) => return result,
+            }
+        }
+    }
+
+    fn stage_silence(path: &Path, frames: usize) {
+        std::fs::write(path, vec![0u8; frames * 8]).unwrap();
+    }
+
+    fn leftovers(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("onerec-part"))
+            .count()
+    }
+
     #[test]
     fn save_as_writes_mp3_then_goes_idle() {
         let (mut session, path) = record_silence();
@@ -632,12 +726,55 @@ mod tests {
         assert!(path.exists());
         let dest_dir = tempfile::tempdir().unwrap();
         let dest = dest_dir.path().join("take.mp3");
-        session.save_as(&dest).unwrap();
+        session.save_as(&dest, ExportQuality::Standard).unwrap();
+        assert!(matches!(session, Session::Saving(_)));
+        poll_until_terminal(&mut session).unwrap();
         assert!(matches!(session, Session::Idle));
         assert!(!path.exists());
         let mp3 = std::fs::read(&dest).unwrap();
         assert_eq!(mp3[0], 0xFF);
         assert_eq!(mp3[1] & 0xE0, 0xE0);
+    }
+
+    #[test]
+    fn save_as_then_poll_sees_progress_before_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("take.f32");
+        let dest = dir.path().join("take.mp3");
+        let frames = MIX_SAMPLE_RATE as usize * 10;
+        stage_silence(&staged, frames);
+        let mut session = Session::AwaitingSave(PendingRecording {
+            staging_file: StagingFile::reserved(staged.clone()),
+            elapsed: Duration::from_secs(10),
+            degraded: false,
+        });
+        session.save_as(&dest, ExportQuality::Compact).unwrap();
+        assert!(matches!(session, Session::Saving(_)));
+        let start = session.save_progress().unwrap();
+        assert_eq!(start.done, 0);
+        assert_eq!(start.total, frames as u64);
+
+        let mut saw_partial = false;
+        loop {
+            match session.poll() {
+                None => {
+                    let progress = session.save_progress().expect("still saving");
+                    if progress.done > 0 && progress.done < progress.total {
+                        saw_partial = true;
+                    }
+                }
+                Some(Ok(())) => break,
+                Some(Err(error)) => panic!("{error}"),
+            }
+        }
+        assert!(saw_partial, "done never rose below total before Idle");
+        assert!(matches!(session, Session::Idle));
+        assert!(!staged.exists());
+        assert!(dest.exists());
+        let mp3 = std::fs::read(&dest).unwrap();
+        let mpeg = crate::mp3::parse_mpeg1_layer3_cbr(&mp3).unwrap();
+        assert!(mpeg.iter().all(|frame| frame.bitrate_kbps == 128));
+        assert_eq!(leftovers(dir.path()), 0);
     }
 
     #[test]
@@ -651,7 +788,7 @@ mod tests {
             degraded: false,
         });
         let dest = dir.path().join("take.mp3");
-        session.save_as(&dest).unwrap_err();
+        session.save_as(&dest, ExportQuality::Standard).unwrap_err();
         assert!(matches!(session, Session::AwaitingSave(_)));
         assert!(staged.exists());
         assert!(!dest.exists());
@@ -663,9 +800,28 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         session.stop();
         let dest = tempfile::tempdir().unwrap();
-        session.save_as(dest.path()).unwrap_err();
+        session
+            .save_as(dest.path(), ExportQuality::Standard)
+            .unwrap();
+        assert!(matches!(session, Session::Saving(_)));
+        poll_until_terminal(&mut session).unwrap_err();
         assert!(matches!(session, Session::AwaitingSave(_)));
         assert!(path.exists());
+        assert_eq!(leftovers(dest.path()), 0);
+    }
+
+    #[test]
+    fn discard_never_constructs_encode() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(30));
+        session.stop();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("take.mp3");
+        session.discard().unwrap();
+        assert!(matches!(session, Session::Idle));
+        assert!(!path.exists());
+        assert!(!dest.exists());
+        assert_eq!(leftovers(dest_dir.path()), 0);
     }
 
     #[test]
