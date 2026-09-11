@@ -1,7 +1,5 @@
-// Window wiring in unit 3 is the first non-test caller.
-#![allow(dead_code)]
-
 mod level;
+#[cfg(windows)]
 mod wasapi;
 
 use std::path::PathBuf;
@@ -13,7 +11,8 @@ use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::session::{SaveError, Session};
 use crate::staging::StagingArea;
 
-use self::level::{Level, Vu};
+pub(crate) use self::level::Level;
+use self::level::Vu;
 
 pub(crate) trait Devices: 'static {
     fn survey(&self) -> Result<Endpoints, AudioError>;
@@ -32,6 +31,8 @@ pub(crate) enum Intent {
     CancelSave,
     Discard,
     Closing,
+    DiscardAndClose,
+    HotkeyUnavailable,
 }
 
 #[derive(Debug)]
@@ -89,12 +90,13 @@ pub(crate) enum Tone {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ask {
     SaveDestination(SavePrompt),
+    ConfirmClose,
     Close,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SavePrompt {
-    pub suggested_file_name: String,
+    pub name_stem: &'static str,
     pub filter_label: &'static str,
     pub extension: &'static str,
 }
@@ -115,6 +117,7 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
+    #[cfg(windows)]
     pub(crate) fn new(staging: StagingArea) -> Self {
         Self::with_devices(Box::new(wasapi::Wasapi), staging)
     }
@@ -162,6 +165,12 @@ impl Recorder {
             Intent::CancelSave => self.cancel_save(),
             Intent::Discard => self.discard(),
             Intent::Closing => self.consider_closing(),
+            Intent::DiscardAndClose => self.abandon_and_close(),
+            Intent::HotkeyUnavailable => {
+                self.notice = Some(warn(
+                    "Another app holds Ctrl+Shift+R. Use the Start recording button.",
+                ))
+            }
         }
         self.view()
     }
@@ -257,7 +266,7 @@ impl Recorder {
             return;
         }
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
-            suggested_file_name: "onerec.wav".into(),
+            name_stem: "onerec",
             filter_label: "Waveform audio",
             extension: "wav",
         }));
@@ -348,14 +357,24 @@ impl Recorder {
     }
 
     fn consider_closing(&mut self) {
-        match &self.session {
-            Session::Idle | Session::Failed(_) => {
-                self.pending_ask = Some(Ask::Close);
-            }
-            Session::Recording(_) | Session::AwaitingSave(_) => {
-                self.notice = Some(warn("Save or discard this take before closing."));
-            }
+        self.pending_ask = Some(match &self.session {
+            Session::Idle | Session::Failed(_) => Ask::Close,
+            Session::Recording(_) | Session::AwaitingSave(_) => Ask::ConfirmClose,
+        });
+    }
+
+    fn abandon_and_close(&mut self) {
+        if matches!(self.session, Session::Recording(_)) {
+            self.session.stop();
         }
+        // A take that will not delete is not a reason to keep the user in the window. The
+        // staging handle retries the unlink when the recorder drops.
+        if let Err(error) = self.session.discard() {
+            self.notice = Some(warn(error.to_string()));
+        }
+        self.microphone_vu.reset();
+        self.system_vu.reset();
+        self.pending_ask = Some(Ask::Close);
     }
 
     fn view(&mut self) -> View {
@@ -744,7 +763,7 @@ mod tests {
         assert_eq!(
             asked.ask,
             Some(Ask::SaveDestination(SavePrompt {
-                suggested_file_name: "onerec.wav".into(),
+                name_stem: "onerec",
                 filter_label: "Waveform audio",
                 extension: "wav",
             }))
@@ -788,17 +807,60 @@ mod tests {
     }
 
     #[test]
-    fn closing_while_recording_warns_without_destroying() {
+    fn closing_while_recording_asks_for_confirmation_first() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         recorder.apply(Intent::Toggle);
-        let view = recorder.apply(Intent::Closing);
-        assert_eq!(view.ask, None);
-        assert_eq!(view.transport.toggle_label, "Stop recording");
+        let asked = recorder.apply(Intent::Closing);
+        assert_eq!(asked.ask, Some(Ask::ConfirmClose));
+        assert_eq!(asked.transport.toggle_label, "Stop recording");
+        let kept = recorder.apply(Intent::Tick);
+        assert_eq!(kept.ask, None);
+        assert_eq!(kept.transport.toggle_label, "Stop recording");
+        recorder.apply(Intent::Toggle);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn closing_when_idle_asks_to_close_outright() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        assert_eq!(recorder.apply(Intent::Closing).ask, Some(Ask::Close));
+    }
+
+    #[test]
+    fn discard_and_close_unlinks_the_pending_take() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        let Session::AwaitingSave(pending) = &recorder.session else {
+            panic!("the take should be waiting to be saved");
+        };
+        let staged = pending.staging_file().to_path_buf();
+        assert!(staged.exists());
+        let closing = recorder.apply(Intent::DiscardAndClose);
+        assert_eq!(closing.ask, Some(Ask::Close));
+        assert!(!staged.exists(), "{} was left behind", staged.display());
+    }
+
+    #[test]
+    fn discard_and_close_stops_a_running_take_first() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        let closing = recorder.apply(Intent::DiscardAndClose);
+        assert_eq!(closing.ask, Some(Ask::Close));
+        assert_eq!(closing.transport.toggle_label, "Start recording");
+        assert!(!closing.transport.save_enabled);
+        assert!(!closing.transport.discard_enabled);
+    }
+
+    #[test]
+    fn a_taken_hotkey_says_so_and_leaves_the_button() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        let view = recorder.apply(Intent::HotkeyUnavailable);
         assert_eq!(
             view.status.text,
-            "Save or discard this take before closing."
+            "Another app holds Ctrl+Shift+R. Use the Start recording button."
         );
         assert_eq!(view.status.tone, Tone::Warning);
-        recorder.apply(Intent::Toggle);
+        assert!(view.transport.toggle_enabled);
     }
 }
