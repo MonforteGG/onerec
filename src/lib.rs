@@ -18,7 +18,9 @@ pub use capture::{
     SessionFrame, TimedStereoFrames,
 };
 pub use ids::{DeviceIdError, MicrophoneId, OutputDeviceId};
-pub use session::{DiscardError, FailedSession, PendingRecording, SaveError, Session};
+pub use session::{
+    DiscardError, ExportQuality, FailedSession, PendingRecording, SaveError, SaveProgress, Session,
+};
 pub use staging::{StagingArea, StagingFile};
 pub use timeline::{draw, Draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE, MIX_TICK};
 
