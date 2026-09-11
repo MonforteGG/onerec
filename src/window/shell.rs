@@ -14,11 +14,11 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, MessageBoxW,
     PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, BN_CLICKED, CBN_DROPDOWN, CBN_SELCHANGE, CB_GETCURSEL,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, IDC_ARROW, IDC_WAIT, IDYES,
-    MB_ICONWARNING, MB_YESNO, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_HOTKEY, WM_PAINT, WM_TIMER, WNDCLASSEXW,
-    WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    ShowWindow, TranslateMessage, BN_CLICKED, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE,
+    CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR,
+    IDC_ARROW, IDC_WAIT, IDYES, MB_ICONWARNING, MB_YESNO, MSG, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_HOTKEY,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::paint::{
@@ -206,7 +206,25 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
-        WM_TIMER | WM_HOTKEY | WM_COMMAND | WM_DEVICECHANGE | WM_CLOSE => {
+        WM_COMMAND => {
+            let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            let list_dropped =
+                with_shell(root, |shell| shell.controls.list_dropped()).unwrap_or(false);
+            if let Some(intent) = command(wparam, lparam, list_dropped) {
+                with_shell(root, |shell| shell.dispatch(root, intent));
+            }
+            match notification {
+                CBN_DROPDOWN => {
+                    with_shell(root, |shell| shell.controls.set_list_dropped(true));
+                }
+                CBN_CLOSEUP => {
+                    with_shell(root, |shell| shell.controls.set_list_dropped(false));
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER | WM_HOTKEY | WM_DEVICECHANGE | WM_CLOSE => {
             if let Some(intent) = translate(message, wparam, lparam) {
                 with_shell(root, |shell| shell.dispatch(root, intent));
             }
@@ -236,24 +254,29 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-fn translate(message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Intent> {
+fn translate(message: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<Intent> {
     match message {
         WM_TIMER if wparam.0 == TICK_TIMER => Some(Intent::Tick),
         WM_HOTKEY if wparam.0 as i32 == TOGGLE_HOTKEY => Some(Intent::Toggle),
         WM_DEVICECHANGE => Some(Intent::RefreshEndpoints),
         WM_CLOSE => Some(Intent::Closing),
-        WM_COMMAND => command(wparam, lparam),
         _ => None,
     }
 }
 
-fn command(wparam: WPARAM, lparam: LPARAM) -> Option<Intent> {
+fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent> {
     let id = (wparam.0 & 0xffff) as u16;
     let notification = ((wparam.0 >> 16) & 0xffff) as u32;
     let control = HWND(lparam.0 as *mut c_void);
     match (notification, id) {
-        (CBN_SELCHANGE, ID_MICROPHONE) => Some(Intent::ChooseMicrophone(selection(control)?)),
-        (CBN_SELCHANGE, ID_OUTPUT) => Some(Intent::ChooseOutput(selection(control)?)),
+        (CBN_SELENDOK, ID_MICROPHONE) => Some(Intent::ChooseMicrophone(selection(control)?)),
+        (CBN_SELENDOK, ID_OUTPUT) => Some(Intent::ChooseOutput(selection(control)?)),
+        (CBN_SELCHANGE, ID_MICROPHONE) if !list_dropped => {
+            Some(Intent::ChooseMicrophone(selection(control)?))
+        }
+        (CBN_SELCHANGE, ID_OUTPUT) if !list_dropped => {
+            Some(Intent::ChooseOutput(selection(control)?))
+        }
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),

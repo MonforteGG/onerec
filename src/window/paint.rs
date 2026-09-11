@@ -70,6 +70,7 @@ pub(crate) struct Controls {
     signal: HBRUSH,
     clipping: HBRUSH,
     painted: Painted,
+    list_dropped: bool,
 }
 
 struct Painted {
@@ -133,6 +134,7 @@ impl Controls {
                 status: None,
                 levels: None,
             },
+            list_dropped: false,
         };
         for control in [
             controls.microphones,
@@ -152,7 +154,23 @@ impl Controls {
         Ok(controls)
     }
 
+    pub(crate) fn set_list_dropped(&mut self, dropped: bool) {
+        self.list_dropped = dropped;
+    }
+
+    pub(crate) fn list_dropped(&self) -> bool {
+        self.list_dropped
+    }
+
+    #[cfg(test)]
+    fn microphone_combo(&self) -> HWND {
+        self.microphones
+    }
+
     pub(crate) fn show(&mut self, root: HWND, view: &View) {
+        if self.list_dropped {
+            return;
+        }
         if let Some(lists) = &view.endpoints {
             refill(self.microphones, &lists.microphones);
             refill(self.outputs, &lists.outputs);
@@ -285,7 +303,6 @@ fn refill(list: HWND, names: &[String]) {
     }
 }
 
-/// Reading the selection back first keeps the tick from reaching into a dropped-open list.
 fn choose(list: HWND, selector: Selector) {
     let wanted = selector.selected.map_or(-1, |index| index as isize);
     let current = unsafe { SendMessageW(list, CB_GETCURSEL, WPARAM(0), LPARAM(0)) };
@@ -432,4 +449,180 @@ fn message_font() -> HFONT {
 
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF(red as u32 | (green as u32) << 8 | (blue as u32) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recorder::{Level, Levels, Status, Tone, Transport, View};
+    use std::sync::Once;
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DestroyWindow, RegisterClassExW, ShowWindow, CB_GETDROPPEDSTATE,
+        CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, LB_GETCURSEL, SW_SHOW, WNDCLASSEXW,
+        WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
+    };
+
+    struct Harness {
+        root: HWND,
+        combo: HWND,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.root);
+            }
+        }
+    }
+
+    unsafe extern "system" fn proc(
+        root: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(root, message, wparam, lparam)
+    }
+
+    fn harness() -> Harness {
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(proc),
+                lpszClassName: w!("onerec.combo.test"),
+                ..Default::default()
+            };
+            unsafe { RegisterClassExW(&class) };
+        });
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let root = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("onerec.combo.test"),
+                w!("combo-test"),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CLIENT_WIDTH + 32,
+                CLIENT_HEIGHT + 48,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .expect("test window");
+        unsafe {
+            let _ = ShowWindow(root, SW_SHOW);
+        }
+        let combo = combo(root, instance, ID_MICROPHONE, MICROPHONE_Y).expect("combo");
+        refill(
+            combo,
+            &[
+                "Mic A".into(),
+                "Mic B".into(),
+                "Mic C".into(),
+                "Mic D".into(),
+            ],
+        );
+        Harness { root, combo }
+    }
+
+    fn current(combo: HWND) -> isize {
+        unsafe { SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0
+    }
+
+    fn list_sel(combo: HWND) -> isize {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetComboBoxInfo(combo, &mut info) }.expect("combo info");
+        unsafe { SendMessageW(info.hwndList, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0
+    }
+
+    fn dropped(combo: HWND) -> bool {
+        unsafe { SendMessageW(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)) }.0 != 0
+    }
+
+    fn idle_view(microphone: Option<usize>) -> View {
+        View {
+            endpoints: None,
+            microphone: Selector {
+                selected: microphone,
+                enabled: true,
+            },
+            output: Selector {
+                selected: Some(0),
+                enabled: true,
+            },
+            transport: Transport {
+                toggle_label: "Start recording",
+                toggle_enabled: true,
+                save_enabled: false,
+                discard_enabled: false,
+            },
+            elapsed: "00:00".into(),
+            levels: Levels {
+                microphone: Level::ZERO,
+                system: Level::ZERO,
+            },
+            status: Status {
+                text: String::new(),
+                tone: Tone::Neutral,
+            },
+            ask: None,
+        }
+    }
+
+    #[test]
+    fn show_leaves_hover_highlight_while_the_list_is_dropped() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).expect("controls");
+        let combo = controls.microphone_combo();
+        refill(
+            combo,
+            &[
+                "Mic A".into(),
+                "Mic B".into(),
+                "Mic C".into(),
+                "Mic D".into(),
+            ],
+        );
+        unsafe {
+            SendMessageW(combo, CB_SETCURSEL, WPARAM(2), LPARAM(0));
+            SendMessageW(combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+            SendMessageW(combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+        }
+        assert_eq!(list_sel(combo), 0);
+
+        controls.set_list_dropped(true);
+        controls.show(ui.root, &idle_view(Some(2)));
+
+        assert_eq!(list_sel(combo), 0);
+    }
+
+    #[test]
+    fn choose_applies_the_committed_row_when_the_list_is_closed() {
+        let ui = harness();
+        unsafe { SendMessageW(ui.combo, CB_SETCURSEL, WPARAM(2), LPARAM(0)) };
+        assert!(!dropped(ui.combo));
+        assert_eq!(current(ui.combo), 2);
+
+        choose(
+            ui.combo,
+            Selector {
+                selected: Some(0),
+                enabled: true,
+            },
+        );
+
+        assert_eq!(current(ui.combo), 0);
+    }
 }
