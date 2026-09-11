@@ -1,6 +1,11 @@
 pub const MIX_QUANTUM_FRAMES: usize = 480;
 pub const MAX_BACKLOG_FRAMES: usize = 12_000;
 pub const MIX_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+pub const MIX_SAMPLE_RATE: u32 = 48_000;
+
+const _: () = assert!(
+    MIX_SAMPLE_RATE as u64 * MIX_TICK.as_millis() as u64 == MIX_QUANTUM_FRAMES as u64 * 1_000
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Draw {
