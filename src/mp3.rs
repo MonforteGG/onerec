@@ -92,7 +92,6 @@ fn lame() -> io::Result<Encoder> {
     builder.set_brate(Bitrate::Kbps192).map_err(encode_fail)?;
     builder.set_quality(Quality::Best).map_err(encode_fail)?;
     builder.set_mode(Mode::JointStereo).map_err(encode_fail)?;
-    // LAME's 576-byte Info frame is the 42nd CBR frame in a measured 1 s file.
     builder.set_to_write_vbr_tag(true).map_err(encode_fail)?;
     builder.build().map_err(encode_fail)
 }
@@ -140,20 +139,9 @@ impl PartFile {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "part file is closed"))?;
         file.sync_all()?;
         drop(file);
-        match fs::rename(&self.path, destination) {
-            Ok(()) => {
-                self.committed = true;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                // Win32 rename refuses to replace an existing destination.
-                fs::remove_file(destination)?;
-                fs::rename(&self.path, destination)?;
-                self.committed = true;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        fs::rename(&self.path, destination)?;
+        self.committed = true;
+        Ok(())
     }
 }
 
@@ -315,6 +303,19 @@ mod tests {
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take");
         stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        write(&dest, &staged).unwrap();
+        let mp3 = fs::read(&dest).unwrap();
+        assert_eq!(mp3.len(), 24_192);
+        assert_eq!(parse_mpeg1_layer3_cbr(&mp3).unwrap().len(), 42);
+    }
+
+    #[test]
+    fn write_replaces_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("take.f32");
+        let dest = dir.path().join("take.mp3");
+        stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        fs::write(&dest, b"old").unwrap();
         write(&dest, &staged).unwrap();
         let mp3 = fs::read(&dest).unwrap();
         assert_eq!(mp3.len(), 24_192);
