@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub(crate) const CLIENT_WIDTH: i32 = 480;
 pub(crate) const CLIENT_HEIGHT: i32 = 348;
+pub(crate) const CLIENT_HUD_HEIGHT: i32 = 112;
 pub(crate) const ID_MICROPHONE: u16 = 101;
 pub(crate) const ID_OUTPUT: u16 = 102;
 pub(crate) const ID_TOGGLE: u16 = 103;
@@ -68,6 +69,7 @@ struct Painted {
     percent: Option<u32>,
     saved_file: bool,
     missing_devices: bool,
+    hud: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -243,6 +245,16 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         };
+        if self.painted.hud {
+            place(self.heading, 20, 12, 220, 20);
+            place(self.elapsed, 20, 36, 220, 44);
+            place(self.toggle, 256, 36, 204, 40);
+            place(self.save, 256, 36, 204, 40);
+            place(self.shortcut, 20, 84, 200, 18);
+            place(self.pause, 356, 80, 104, 24);
+            self.fit_client(root, CLIENT_WIDTH, CLIENT_HUD_HEIGHT);
+            return;
+        }
         place(self.heading, 20, 16, 440, 20);
         place(self.elapsed, 20, 36, 220, 44);
         place(self.toggle, 256, 36, 204, 40);
@@ -296,12 +308,27 @@ impl Controls {
             }
             dropdown_width(list, self.fonts.body, self.s(440), self.s(32));
         }
-        unsafe {
-            let mut frame = RECT {
+        self.apply_frame(
+            root,
+            RECT {
                 right: self.s(CLIENT_WIDTH),
                 bottom: self.s(314) + height,
                 ..Default::default()
-            };
+            },
+        );
+    }
+
+    fn fit_client(&self, root: HWND, client_w: i32, client_h: i32) {
+        let frame = RECT {
+            right: self.s(client_w),
+            bottom: self.s(client_h),
+            ..Default::default()
+        };
+        self.apply_frame(root, frame);
+    }
+
+    fn apply_frame(&self, root: HWND, mut frame: RECT) {
+        unsafe {
             let style = WINDOW_STYLE(GetWindowLongW(root, GWL_STYLE) as u32);
             let ex_style = WINDOW_EX_STYLE(GetWindowLongW(root, GWL_EXSTYLE) as u32);
             let _ = AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, self.dpi);
@@ -363,6 +390,7 @@ impl Controls {
         let pending = view.phase == Phase::AwaitingSave;
         let saving = view.phase == Phase::Saving;
         let live = matches!(view.phase, Phase::Recording | Phase::Paused);
+        let hud = live;
         let phase_changed = self.painted.phase != Some(view.phase);
         if phase_changed && !matches!(view.phase, Phase::Idle | Phase::Failed) {
             for list in [self.microphones, self.outputs, self.quality] {
@@ -394,13 +422,21 @@ impl Controls {
         let previous_focus = unsafe { GetFocus() };
         if phase_changed {
             self.painted.phase = Some(view.phase);
+            self.painted.hud = hud;
             visible(self.toggle, !pending && !saving);
             visible(self.save, pending || saving);
             visible(self.discard, pending);
             visible(self.pause, live);
-            visible(self.shortcut, !pending && !saving && !live);
-            visible(self.quality, !saving);
-            visible(self.quality_label, !saving);
+            visible(self.shortcut, hud || (!pending && !saving && !live));
+            visible(self.quality, !hud && !saving);
+            visible(self.quality_label, !hud && !saving);
+            visible(self.microphone_label, !hud);
+            visible(self.microphones, !hud);
+            visible(self.microphone_level, !hud);
+            visible(self.output_label, !hud);
+            visible(self.outputs, !hud);
+            visible(self.output_level, !hud);
+            visible(self.status, !hud);
             visible(self.progress, saving);
             visible(self.progress_label, saving);
             set_text(
@@ -419,6 +455,7 @@ impl Controls {
                     "&Save recording…"
                 },
             );
+            self.layout(root);
         }
         if self.painted.toggle_label != view.transport.toggle_label {
             self.painted.toggle_label = view.transport.toggle_label;
@@ -453,8 +490,10 @@ impl Controls {
             }
             Phase::Idle if view.saved_path.is_some() => "Recording saved",
             Phase::Idle => "Ready to record",
+            Phase::Recording if hud => "REC",
             Phase::Recording if view.status.tone == Tone::Warning => "Recording · check audio",
             Phase::Recording => "Recording",
+            Phase::Paused if hud => "PAUSED",
             Phase::Paused => "Recording paused",
             Phase::AwaitingSave => "Recording not saved",
             Phase::Saving => "Saving MP3",
@@ -513,6 +552,9 @@ impl Controls {
                 }
                 set_text(self.progress_label, &format!("Exporting MP3 · {percent}%"));
             }
+        }
+        if self.painted.hud {
+            return;
         }
         for (index, level) in [view.levels.microphone, view.levels.system]
             .into_iter()
@@ -573,6 +615,9 @@ impl Controls {
         self.theme.background
     }
     pub(crate) fn draw_meters(&self, hdc: HDC) {
+        if self.painted.hud {
+            return;
+        }
         unsafe {
             FillRect(
                 hdc,
@@ -616,6 +661,8 @@ impl Controls {
             } else {
                 self.theme.red
             }
+        } else if control == self.heading && self.painted.phase == Some(Phase::Paused) {
+            self.theme.warning
         } else if control == self.status {
             match tone {
                 Some(Tone::Failure) => self.theme.red,
