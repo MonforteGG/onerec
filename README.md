@@ -10,8 +10,10 @@ onerec records a Windows meeting into one mixed MP3.
 4. Select **Start recording**, or press **Ctrl+Shift+R**.
 5. Watch the meter under each device and the elapsed time.
 6. Select **Stop recording**, or press **Ctrl+Shift+R** again.
-7. Select **Save recording…**, then choose the destination. A separate progress bar shows the export of the 48 kHz stereo MP3.
+7. Select **Save recording…**. The dialog suggests a dated name such as `2026-09-12 14-03 Meeting.mp3` and opens in the last folder you saved to.
 8. After saving, select **Open folder** to find the file.
+
+The next launch restores the last microphone, output device, MP3 quality, and save folder. Choices live in `onerec.ini` next to the executable.
 
 If you cancel the save dialog, onerec keeps the recording and stays in Awaiting save.
 Choose **Save recording…** to retry or **Discard…** to delete the take after confirmation. You cannot start another recording until you do. Stopping does not open the save dialog automatically.

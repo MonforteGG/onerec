@@ -9,6 +9,9 @@ use crate::audio::{AudioError, Endpoint, Endpoints};
 use crate::capture::CaptureSource;
 use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::{ExportQuality, SaveProgress};
+#[cfg(windows)]
+use crate::prefs::prefs_path;
+use crate::prefs::{dated_file_name, CivilTime, Prefs};
 use crate::session::{SaveError, Session};
 use crate::staging::StagingArea;
 
@@ -121,9 +124,10 @@ pub(crate) enum Ask {
     Close,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SavePrompt {
-    pub name_stem: &'static str,
+    pub file_name: String,
+    pub folder: Option<PathBuf>,
     pub filter_label: &'static str,
     pub extension: &'static str,
 }
@@ -143,15 +147,28 @@ pub(crate) struct Recorder {
     last_tick: Instant,
     pending_ask: Option<Ask>,
     saved_path: Option<PathBuf>,
+    prefs: Prefs,
+    store: Option<PathBuf>,
 }
 
 impl Recorder {
     #[cfg(windows)]
     pub(crate) fn new(staging: StagingArea) -> Self {
-        Self::with_devices(Box::new(wasapi::Wasapi), staging)
+        let path = prefs_path();
+        let prefs = Prefs::read(&path);
+        Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path))
     }
 
     pub(crate) fn with_devices(devices: Box<dyn Devices>, staging: StagingArea) -> Self {
+        Self::with_prefs(devices, staging, Prefs::default(), None)
+    }
+
+    pub(crate) fn with_prefs(
+        devices: Box<dyn Devices>,
+        staging: StagingArea,
+        prefs: Prefs,
+        store: Option<PathBuf>,
+    ) -> Self {
         let mut notice = None;
         let endpoints = match devices.survey() {
             Ok(endpoints) => endpoints,
@@ -160,12 +177,24 @@ impl Recorder {
                 Endpoints::from_enumerated(Vec::new(), Vec::new(), None, None)
             }
         };
+        let remembered_mic = prefs
+            .microphone
+            .as_ref()
+            .and_then(|raw| MicrophoneId::parse(raw.clone()).ok());
+        let remembered_out = prefs
+            .output
+            .as_ref()
+            .and_then(|raw| OutputDeviceId::parse(raw.clone()).ok());
         let microphone = pick_index(
             endpoints.microphones(),
-            None,
+            remembered_mic.as_ref(),
             endpoints.default_microphone(),
         );
-        let output = pick_index(endpoints.outputs(), None, endpoints.default_output());
+        let output = pick_index(
+            endpoints.outputs(),
+            remembered_out.as_ref(),
+            endpoints.default_output(),
+        );
         Self {
             devices,
             staging,
@@ -173,7 +202,7 @@ impl Recorder {
             endpoints_dirty: true,
             microphone,
             output,
-            quality: ExportQuality::Meeting,
+            quality: prefs.quality,
             session: Session::Idle,
             microphone_vu: Vu::new(),
             system_vu: Vu::new(),
@@ -181,6 +210,8 @@ impl Recorder {
             last_tick: Instant::now(),
             pending_ask: None,
             saved_path: None,
+            prefs,
+            store,
         }
     }
 
@@ -305,7 +336,8 @@ impl Recorder {
             return;
         }
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
-            name_stem: "onerec",
+            file_name: dated_file_name(self.quality, CivilTime::local()),
+            folder: self.prefs.folder.clone().filter(|path| path.is_dir()),
             filter_label: "MP3 audio",
             extension: "mp3",
         }));
@@ -375,6 +407,7 @@ impl Recorder {
             return;
         }
         self.microphone = Some(index);
+        self.persist();
     }
 
     fn select_output(&mut self, index: usize) {
@@ -385,6 +418,7 @@ impl Recorder {
             return;
         }
         self.output = Some(index);
+        self.persist();
     }
 
     fn select_quality(&mut self, index: usize) {
@@ -395,6 +429,7 @@ impl Recorder {
             return;
         };
         self.quality = quality;
+        self.persist();
     }
 
     fn advance_meters(&mut self) {
@@ -417,6 +452,10 @@ impl Recorder {
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
                 self.notice = Some(neutral(format!("Saved: {name}")));
+                if let Some(folder) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                    self.prefs.folder = Some(folder.to_path_buf());
+                    self.persist();
+                }
                 self.saved_path = Some(path);
                 self.microphone_vu.reset();
                 self.system_vu.reset();
@@ -601,6 +640,18 @@ impl Recorder {
             .and_then(|index| self.endpoints.outputs().get(index))
             .map(|endpoint| endpoint.id().clone())
     }
+
+    fn persist(&mut self) {
+        self.prefs.microphone = self
+            .selected_microphone_id()
+            .map(|id| id.as_str().to_owned());
+        self.prefs.output = self.selected_output_id().map(|id| id.as_str().to_owned());
+        self.prefs.quality = self.quality;
+        let Some(path) = &self.store else {
+            return;
+        };
+        let _ = self.prefs.write(path);
+    }
 }
 
 fn pick_index<Id: PartialEq>(
@@ -742,6 +793,20 @@ mod tests {
         (recorder, opens)
     }
 
+    fn recorder_with_prefs(prefs: Prefs, store: Option<PathBuf>) -> Recorder {
+        Recorder::with_prefs(
+            Box::new(FakeDevices {
+                opens: Arc::new(AtomicUsize::new(0)),
+                endpoints: test_endpoints(),
+                fail_mic: false,
+                mic: MicKind::Tone(0.25),
+            }),
+            StagingArea::open().unwrap(),
+            prefs,
+            store,
+        )
+    }
+
     fn wait_mix() {
         thread::sleep(Duration::from_millis(50));
     }
@@ -880,14 +945,17 @@ mod tests {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         stop_take(&mut recorder);
         let asked = recorder.apply(Intent::Save);
-        assert_eq!(
-            asked.ask,
-            Some(Ask::SaveDestination(SavePrompt {
-                name_stem: "onerec",
-                filter_label: "MP3 audio",
-                extension: "mp3",
-            }))
+        let Ask::SaveDestination(prompt) = asked.ask.expect("save prompt") else {
+            panic!("expected a save prompt");
+        };
+        assert!(
+            prompt.file_name.ends_with(" Meeting"),
+            "{}",
+            prompt.file_name
         );
+        assert_eq!(prompt.filter_label, "MP3 audio");
+        assert_eq!(prompt.extension, "mp3");
+        assert_eq!(prompt.folder, None);
         assert_eq!(recorder.apply(Intent::Tick).ask, None);
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("take.mp3");
@@ -941,6 +1009,88 @@ mod tests {
         assert!(view.quality.enabled);
         let high = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
         assert_eq!(high.quality.selected, Some(ExportQuality::High.index()));
+    }
+
+    #[test]
+    fn remembered_devices_beat_windows_defaults() {
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                microphone: Some("mic-b".into()),
+                output: Some("out-b".into()),
+                quality: ExportQuality::Voice,
+                folder: None,
+            },
+            None,
+        );
+        let view = recorder.apply(Intent::Tick);
+        assert_eq!(view.microphone.selected, Some(1));
+        assert_eq!(view.output.selected, Some(1));
+        assert_eq!(view.quality.selected, Some(ExportQuality::Voice.index()));
+    }
+
+    #[test]
+    fn missing_remembered_device_falls_back_to_default() {
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                microphone: Some("mic-gone".into()),
+                output: None,
+                quality: ExportQuality::Meeting,
+                folder: None,
+            },
+            None,
+        );
+        let view = recorder.apply(Intent::Tick);
+        assert_eq!(view.microphone.selected, Some(0));
+        assert_eq!(view.output.selected, Some(0));
+    }
+
+    #[test]
+    fn choosing_quality_writes_prefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        recorder.apply(Intent::ChooseMicrophone(1));
+        recorder.apply(Intent::ChooseOutput(1));
+        recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        let loaded = Prefs::read(&path);
+        assert_eq!(loaded.microphone.as_deref(), Some("mic-b"));
+        assert_eq!(loaded.output.as_deref(), Some("out-b"));
+        assert_eq!(loaded.quality, ExportQuality::High);
+    }
+
+    #[test]
+    fn save_prompt_uses_quality_name_and_last_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                microphone: None,
+                output: None,
+                quality: ExportQuality::High,
+                folder: Some(folder.path().to_path_buf()),
+            },
+            None,
+        );
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::Save);
+        let Ask::SaveDestination(prompt) = asked.ask.expect("save prompt") else {
+            panic!("expected a save prompt");
+        };
+        assert!(prompt.file_name.ends_with(" High"), "{}", prompt.file_name);
+        assert_eq!(prompt.folder.as_deref(), Some(folder.path()));
+    }
+
+    #[test]
+    fn successful_save_remembers_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("onerec.ini");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("take.mp3");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(store.clone()));
+        stop_take(&mut recorder);
+        recorder.apply(Intent::SaveTo(dest));
+        finish_save(&mut recorder);
+        let loaded = Prefs::read(&store);
+        assert_eq!(loaded.folder.as_deref(), Some(dest_dir.path()));
     }
 
     #[test]
