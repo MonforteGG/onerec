@@ -220,6 +220,44 @@ mod tests {
     }
 
     #[test]
+    fn pause_shows_only_while_live_and_quality_stays_locked() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.pause).as_bool() });
+        view.phase = Phase::Recording;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
+        view.transport.toggle_label = "Stop recording";
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.shortcut).as_bool() });
+        assert!(!unsafe { IsWindowEnabled(controls.quality).as_bool() });
+        assert_eq!(caption(controls.pause), "&Pause");
+        view.phase = Phase::Paused;
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
+        assert_eq!(caption(controls.pause), "&Resume");
+        assert!(!unsafe { IsWindowEnabled(controls.quality).as_bool() });
+        view.phase = Phase::AwaitingSave;
+        view.transport.toggle_enabled = false;
+        view.transport.save_enabled = true;
+        view.transport.discard_enabled = true;
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.pause).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.discard).as_bool() });
+    }
+
+    fn caption(hwnd: HWND) -> String {
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    #[test]
     fn choose_applies_the_committed_row_when_the_list_is_closed() {
         let ui = harness();
         unsafe { SendMessageW(ui.combo, CB_SETCURSEL, WPARAM(2), LPARAM(0)) };
