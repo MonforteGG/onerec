@@ -5,3 +5,7 @@ This application is licensed under the MIT License. See LICENSE.
 
 This build statically links LAME 3.100.
 LAME is licensed under the GNU Lesser General Public License (LGPL).
+
+Button icons use Lucide 0.468.0 (ISC, with portions derived from Feather/MIT).
+The original icon outlines are embedded as a seven-glyph font subset.
+See assets/lucide-LICENSE and assets/lucide-SOURCE.txt.

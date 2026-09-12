@@ -83,6 +83,18 @@ fn render_native_states() {
                 settle(root);
                 snapshot(root, &directory.join(format!("{name}-{dpi}.bmp")));
             }
+            // Exercise the shared painter with the native pressed/disabled state
+            // and the direct-save variant, without recording or moving the cursor.
+            let mut pending = fixture(Phase::AwaitingSave);
+            pending.save_direct = true;
+            shell.borrow_mut().controls.show(root, &pending);
+            settle(root);
+            snapshot(root, &directory.join(format!("DirectSave-{dpi}.bmp")));
+            let pause = GetDlgItem(root, i32::from(ID_PAUSE)).unwrap();
+            shell.borrow_mut().controls.show(root, &fixture(Phase::Paused));
+            SendMessageW(pause, BM_SETSTATE, WPARAM(1), LPARAM(0));
+            snapshot(root, &directory.join(format!("ResumePressed-{dpi}.bmp")));
+            SendMessageW(pause, BM_SETSTATE, WPARAM(0), LPARAM(0));
         }
         SetWindowLongPtrW(root, GWLP_USERDATA, 0);
         DestroyWindow(root).unwrap();
@@ -110,6 +122,62 @@ unsafe fn settle(root: HWND) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+#[test]
+fn hover_frames_are_stable_and_only_transitions_invalidate_the_button() {
+    unsafe {
+        let instance: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+        register_class(instance).unwrap();
+        let _apartment = super::super::Apartment::enter().unwrap();
+        let root = create_window(instance).unwrap();
+        let shell = RefCell::new(Shell {
+            recorder: Recorder::new(crate::staging::StagingArea::open().unwrap()),
+            controls: Controls::create(root, instance).unwrap(),
+            icons: Icons::load(root, instance), timer_ms: None, phase: Phase::Idle,
+            saved_path: None, modal: false, refresh_after_picker: false,
+        });
+        SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize);
+        install_command_button_subclasses(&shell.borrow().controls);
+        // All messages and rendering target a hidden test window, never the cursor.
+        shell.borrow_mut().controls.show(root, &fixture(Phase::Idle));
+        let button = GetDlgItem(root, i32::from(ID_TOGGLE)).unwrap();
+        let original = sample_button(button);
+        SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | 12));
+        let hover = sample_button(button);
+        assert_ne!(original, hover, "enter did not change the button fill");
+        let _ = ValidateRect(button, None);
+        for x in 12..80 {
+            SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | x));
+            assert!(!GetUpdateRect(button, None, false).as_bool(), "mouse movement caused a redundant repaint");
+            assert_eq!(sample_button(button), hover);
+        }
+        SendMessageW(button, BM_SETSTATE, WPARAM(1), LPARAM(0));
+        assert_ne!(sample_button(button), hover, "pressed state was lost");
+        SendMessageW(button, BM_SETSTATE, WPARAM(0), LPARAM(0));
+        assert_eq!(sample_button(button), hover);
+        SendMessageW(button, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+        assert_eq!(sample_button(button), original, "leave did not restore the normal fill");
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, false);
+        let disabled = sample_button(button);
+        SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | 12));
+        assert_eq!(sample_button(button), disabled, "disabled button reacted to hover");
+        SetWindowLongPtrW(root, GWLP_USERDATA, 0);
+        DestroyWindow(root).unwrap();
+        drop(shell);
+    }
+}
+
+unsafe fn sample_button(button: HWND) -> u32 {
+    let reference = GetDC(None);
+    let mut rect = RECT::default();
+    GetClientRect(button, &mut rect).unwrap();
+    let frame = super::super::buffered::PaintBuffer::new(reference, rect.right, rect.bottom).unwrap();
+    SendMessageW(button, WM_PRINTCLIENT, WPARAM(frame.dc().0 as usize), LPARAM(0));
+    let color = GetPixel(frame.dc(), 6, rect.bottom / 2).0;
+    ReleaseDC(None, reference);
+    assert_ne!(color, CLR_INVALID, "could not sample button pixels");
+    color
 }
 
 fn fixture(phase: Phase) -> View {

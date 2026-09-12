@@ -31,6 +31,8 @@ pub(crate) enum Intent {
     ChooseOutput(usize),
     ChooseQuality(usize),
     Toggle,
+    Start,
+    Stop,
     Pause,
     Save,
     SaveAs,
@@ -231,6 +233,12 @@ impl Recorder {
             Intent::ChooseOutput(index) => self.select_output(index),
             Intent::ChooseQuality(index) => self.select_quality(index),
             Intent::Toggle => self.toggle(),
+            Intent::Start => {
+                if matches!(self.session, Session::Idle | Session::Failed(_)) { self.toggle(); }
+            }
+            Intent::Stop => {
+                if matches!(self.session, Session::Recording(_) | Session::Paused(_)) { self.toggle(); }
+            }
             Intent::Pause => self.pause(),
             Intent::Save => self.request_destination(),
             Intent::SaveAs => self.request_save_as(),
@@ -387,9 +395,6 @@ impl Recorder {
     }
 
     fn open_settings(&mut self) {
-        if !matches!(self.session, Session::Idle) {
-            return;
-        }
         self.pending_ask = Some(Ask::Settings {
             save_direct: self.prefs.save_direct,
         });
@@ -1286,6 +1291,41 @@ mod tests {
         assert_eq!(paused.transport.toggle_label, "Stop recording");
         let stopped = recorder.apply(Intent::Toggle);
         assert_eq!(stopped.phase, Phase::AwaitingSave);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn explicit_record_and_stop_never_toggle_the_opposite_action() {
+        let (mut recorder, opens) = recorder(MicKind::Tone(0.25), false);
+        assert_eq!(recorder.apply(Intent::Stop).phase, Phase::Idle);
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(recorder.apply(Intent::Start).phase, Phase::Recording);
+        assert_eq!(recorder.apply(Intent::Start).phase, Phase::Recording);
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        wait_mix();
+        assert_eq!(recorder.apply(Intent::Pause).phase, Phase::Paused);
+        assert_eq!(recorder.apply(Intent::Start).phase, Phase::Paused);
+        assert_eq!(recorder.apply(Intent::Stop).phase, Phase::AwaitingSave);
+        assert_eq!(recorder.apply(Intent::Stop).phase, Phase::AwaitingSave);
+        assert_eq!(recorder.apply(Intent::Start).phase, Phase::AwaitingSave);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn settings_can_be_opened_and_changed_without_interrupting_a_take() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::Start);
+        wait_mix();
+        for (intent, expected) in [(Intent::Tick, Phase::Recording),
+            (Intent::Pause, Phase::Paused), (Intent::Stop, Phase::AwaitingSave)] {
+            recorder.apply(intent);
+            let view = recorder.apply(Intent::OpenSettings);
+            assert_eq!(view.phase, expected);
+            assert!(matches!(view.ask, Some(Ask::Settings { .. })));
+            let updated = recorder.apply(Intent::SetSaveDirect(true));
+            assert_eq!(updated.phase, expected);
+            assert!(updated.save_direct);
+        }
         recorder.apply(Intent::Discard);
     }
 

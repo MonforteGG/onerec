@@ -1,4 +1,6 @@
 mod paint;
+mod buffered;
+mod rounded;
 mod save_dialog;
 mod settings;
 mod shell;

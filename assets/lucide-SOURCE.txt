@@ -1,0 +1,17 @@
+Lucide Icons — https://lucide.dev/
+Upstream: https://github.com/lucide-icons/lucide
+Package: lucide-static 0.468.0
+Font: https://unpkg.com/lucide-static@0.468.0/font/lucide.ttf
+Codepoint map: https://unpkg.com/lucide-static@0.468.0/font/lucide.css
+License: https://raw.githubusercontent.com/lucide-icons/lucide/0.468.0/LICENSE
+Original font SHA-256: 0ff17e4ce16364d2dae72689336262960e7d5067cfcdb07ca283465a2a34af48
+
+onerec-lucide.ttf contains these original, unmodified Lucide glyph outlines:
+E07A circle (record), E16A square (stop), E131 pause, E13F play (resume),
+E18D trash-2 (discard), E157 settings, E150 save.
+
+Subset generated with fontTools 4.65.0:
+python -m fontTools.subset lucide-original.ttf --output-file=onerec-lucide.ttf --unicodes=U+E07A,U+E131,U+E13F,U+E150,U+E157,U+E16A,U+E18D --name-IDs=* --name-legacy --name-languages=*
+
+Windows renders the embedded TrueType outlines with grayscale antialiasing
+at the current DPI and theme color. No font is installed on the machine.

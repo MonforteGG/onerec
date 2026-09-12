@@ -1,10 +1,13 @@
-use super::theme::{rgb, Theme};
+use super::buffered::PaintBuffer;
+use super::rounded::RoundedButtons;
+use super::theme::Theme;
 use crate::mp3::ExportQuality;
 use crate::recorder::{Phase, Selector, Status, Tone, View};
 use crate::RunError;
+use std::cell::Cell;
 use std::ffi::c_void;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{
@@ -16,8 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub(crate) const CLIENT_WIDTH: i32 = 480;
-pub(crate) const CLIENT_HEIGHT: i32 = 348;
-pub(crate) const CLIENT_HUD_HEIGHT: i32 = 112;
+pub(crate) const CLIENT_HEIGHT: i32 = 372;
+pub(crate) const CLIENT_HUD_HEIGHT: i32 = 164;
 pub(crate) const ID_MICROPHONE: u16 = 101;
 pub(crate) const ID_OUTPUT: u16 = 102;
 pub(crate) const ID_TOGGLE: u16 = 103;
@@ -29,18 +32,18 @@ pub(crate) const ID_REFRESH: u16 = 108;
 pub(crate) const ID_PAUSE: u16 = 110;
 pub(crate) const ID_SETTINGS: u16 = 111;
 pub(crate) const ID_SAVE_AS: u16 = 112;
-const MICROPHONE_Y: i32 = 130;
+pub(crate) const ID_STOP: u16 = 113;
+const MICROPHONE_Y: i32 = 176;
 
 pub(crate) struct Controls {
     microphones: HWND,
     outputs: HWND,
     quality: HWND,
-    microphone_label: HWND,
-    output_label: HWND,
     quality_label: HWND,
     microphone_level: HWND,
     output_level: HWND,
     toggle: HWND,
+    stop: HWND,
     save: HWND,
     discard: HWND,
     pause: HWND,
@@ -50,12 +53,13 @@ pub(crate) struct Controls {
     refresh: HWND,
     elapsed: HWND,
     heading: HWND,
-    shortcut: HWND,
     status: HWND,
     progress: HWND,
     progress_label: HWND,
     fonts: Fonts,
     theme: Theme,
+    rounded: RoundedButtons,
+    hovered_button: Cell<Option<HWND>>,
     dpi: u32,
     units: u32,
     painted: Painted,
@@ -66,7 +70,7 @@ pub(crate) struct Controls {
 #[derive(Default)]
 struct Painted {
     phase: Option<Phase>,
-    toggle_label: &'static str,
+    save_direct: bool,
     elapsed: String,
     heading: String,
     status: Option<Status>,
@@ -87,6 +91,8 @@ struct Fonts {
     body: HFONT,
     strong: HFONT,
     timer: HFONT,
+    icons: HFONT,
+    icon_resource: HANDLE,
     units: u32,
 }
 
@@ -100,18 +106,21 @@ impl Controls {
         }
         let dpi = unsafe { GetDpiForWindow(root) }.max(96);
         let fonts = Fonts::new(dpi);
-        // Keep each native label immediately before its associated field.
-        let microphone_label = static_text(root, instance, w!("&Microphone"), 0)?;
         let microphones = combo(root, instance, ID_MICROPHONE, MICROPHONE_Y)?;
-        let output_label = static_text(root, instance, w!("System &audio"), 0)?;
         let outputs = combo(root, instance, ID_OUTPUT, 202)?;
+        name_device_controls(microphones, outputs);
+        control_tooltip(root, instance, microphones, w!("Microphone"))?;
+        control_tooltip(root, instance, outputs, w!("System audio"))?;
         let quality_label = static_text(root, instance, w!("MP3 &quality"), 0)?;
         let quality = combo(root, instance, ID_QUALITY, 254)?;
-        let toggle = button(root, instance, ID_TOGGLE, w!("Start &recording"))?;
-        let save = button(root, instance, ID_SAVE, w!("&Save recording…"))?;
+        let toggle = button(root, instance, ID_TOGGLE, w!("&Record"))?;
+        let stop = button(root, instance, ID_STOP, w!("S&top"))?;
+        let save = button(root, instance, ID_SAVE, w!("&Save"))?;
         let discard = button(root, instance, ID_DISCARD, w!("&Discard…"))?;
         let pause = button(root, instance, ID_PAUSE, w!("&Pause"))?;
-        let settings = button(root, instance, ID_SETTINGS, w!("&Settings"))?;
+        let settings = button(root, instance, ID_SETTINGS, w!("Settin&gs"))?;
+        control_tooltip(root, instance, settings, w!("Settings (Alt+G)"))?;
+        control_tooltip(root, instance, discard, w!("Discard recording (Alt+D)"))?;
         let save_as = button(root, instance, ID_SAVE_AS, w!("Save &as…"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
@@ -119,12 +128,11 @@ impl Controls {
             microphones,
             outputs,
             quality,
-            microphone_label,
-            output_label,
             quality_label,
             microphone_level: static_text(root, instance, w!(""), 2)?,
             output_level: static_text(root, instance, w!(""), 2)?,
             toggle,
+            stop,
             save,
             discard,
             pause,
@@ -134,11 +142,10 @@ impl Controls {
             refresh,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
             heading: static_text(root, instance, w!("Ready"), 0)?,
-            shortcut: static_text(root, instance, w!("Ctrl+Shift+R"), 2)?,
             status: static_text(
                 root,
                 instance,
-                w!("Levels appear when recording."),
+                w!(""),
                 0x0080 | 0x4000, // SS_EDITCONTROL | SS_ENDELLIPSIS
             )?,
             progress: child(
@@ -153,16 +160,14 @@ impl Controls {
             units: fonts.units,
             fonts,
             theme: Theme::new(),
+            rounded: RoundedButtons::new(),
+            hovered_button: Cell::new(None),
             dpi,
             painted: Painted::default(),
             list_dropped: false,
             meter_top: [0; 2],
         };
         for control in [
-            save,
-            discard,
-            pause,
-            settings,
             save_as,
             folder,
             refresh,
@@ -177,27 +182,19 @@ impl Controls {
             &ExportQuality::ALL.map(|q| q.label().to_owned()),
         );
         controls.layout(root);
-        // Visual styles draw a focus halo after NM_CUSTOMDRAW. Strip them so
-        // the command buttons only show the rounded fill we paint.
-        for hwnd in [controls.toggle, controls.save] {
-            unsafe {
-                let _ = SetWindowTheme(hwnd, w!(""), w!(""));
-            }
-        }
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 22] {
+    fn all(&self) -> [HWND; 20] {
         [
-            self.microphone_label,
             self.microphones,
-            self.output_label,
             self.outputs,
             self.quality_label,
             self.quality,
             self.microphone_level,
             self.output_level,
             self.toggle,
+            self.stop,
             self.save,
             self.discard,
             self.pause,
@@ -207,7 +204,6 @@ impl Controls {
             self.refresh,
             self.elapsed,
             self.heading,
-            self.shortcut,
             self.status,
             self.progress,
             self.progress_label,
@@ -270,35 +266,30 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
         };
+        // Transport geometry is identical in the full and compact views.
+        place(self.heading, 20, 12, 392, 20);
+        place(self.elapsed, 20, 36, 392, 44);
+        place(self.settings, 428, 12, 32, 32);
+        place(self.toggle, 20, 108, 96, 40);
+        place(self.pause, 124, 108, 96, 40);
+        place(self.stop, 228, 108, 88, 40);
+        place(self.save, 324, 108, 88, 40);
+        place(self.discard, 420, 108, 40, 40);
         if self.painted.hud {
-            place(self.heading, 20, 12, 220, 20);
-            place(self.elapsed, 20, 36, 220, 44);
-            place(self.toggle, 256, 36, 204, 40);
-            place(self.save, 256, 36, 204, 40);
-            place(self.shortcut, 20, 84, 200, 18);
-            place(self.pause, 356, 80, 104, 24);
             self.fit_client(root, CLIENT_WIDTH, CLIENT_HUD_HEIGHT);
             return;
         }
-        place(self.heading, 20, 16, 440, 20);
-        place(self.elapsed, 20, 36, 220, 44);
-        place(self.toggle, 256, 36, 204, 40);
-        place(self.save, 256, 36, 204, 40);
-        let idle = self.painted.phase == Some(Phase::Idle);
-        place(self.shortcut, 256, 80, if idle { 92 } else { 204 }, 18);
-        place(self.save_as, 256, 80, 92, 24);
-        place(self.discard, 356, 80, 104, 24);
-        place(self.pause, 356, 80, 104, 24);
-        place(self.settings, 356, 80, 104, 24);
-        place(self.microphone_label, 20, 110, 440, 18);
-        place_combo(self.microphones, 20, 130, 440, 220);
-        place(self.output_label, 20, 182, 440, 18);
-        place_combo(self.outputs, 20, 202, 440, 220);
-        place(self.quality_label, 20, 259, 136, 20);
-        place_combo(self.quality, 178, 254, 282, 220);
-        place(self.progress_label, 20, 254, 440, 20);
-        place(self.progress, 20, 278, 440, 10);
-        let text_width = if self.painted.saved_file || self.painted.missing_devices {
+        place_combo(self.microphones, 20, MICROPHONE_Y, 440, 220);
+        place_combo(self.outputs, 20, 230, 440, 220);
+        place(self.quality_label, 20, 287, 136, 20);
+        place_combo(self.quality, 178, 282, 282, 220);
+        place(self.progress_label, 20, 282, 440, 20);
+        place(self.progress, 20, 306, 440, 10);
+        place(self.save_as, 320, 326, 140, 32);
+        let text_width = if self.painted.saved_file
+            || self.painted.missing_devices
+            || (self.painted.phase == Some(Phase::AwaitingSave) && self.painted.save_direct)
+        {
             288
         } else {
             440
@@ -309,14 +300,14 @@ impl Controls {
                 self.status,
                 None,
                 self.s(20),
-                self.s(298),
+                self.s(326),
                 self.s(text_width),
                 height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        place(self.folder, 320, 298, 140, 30);
-        place(self.refresh, 320, 298, 140, 30);
+        place(self.folder, 320, 326, 140, 32);
+        place(self.refresh, 320, 326, 140, 32);
         for list in [self.microphones, self.outputs, self.quality] {
             unsafe {
                 SendMessageW(
@@ -364,7 +355,7 @@ impl Controls {
             root,
             RECT {
                 right: self.s(CLIENT_WIDTH),
-                bottom: self.s(314) + height,
+                bottom: self.s(342) + height,
                 ..Default::default()
             },
         );
@@ -472,22 +463,16 @@ impl Controls {
             choose(self.quality, view.quality);
         }
         let previous_focus = unsafe { GetFocus() };
+        let preference_changed = self.painted.save_direct != view.save_direct;
+        self.painted.save_direct = view.save_direct;
+        visible(self.save_as, pending && view.save_direct);
         if phase_changed {
             self.painted.phase = Some(view.phase);
             self.painted.hud = hud;
-            visible(self.toggle, !pending && !saving);
-            visible(self.save, pending || saving);
-            visible(self.discard, pending);
-            visible(self.pause, live);
-            visible(self.settings, view.phase == Phase::Idle);
-            visible(self.save_as, pending && view.save_direct);
-            visible(self.shortcut, hud || (!pending && !saving && !live));
             visible(self.quality, !hud && !saving);
             visible(self.quality_label, !hud && !saving);
-            visible(self.microphone_label, !hud);
             visible(self.microphones, !hud);
             visible(self.microphone_level, !hud);
-            visible(self.output_label, !hud);
             visible(self.outputs, !hud);
             visible(self.output_level, !hud);
             visible(self.status, !hud);
@@ -501,38 +486,38 @@ impl Controls {
                     "&Pause"
                 },
             );
-            set_text(
-                self.save,
-                if saving {
-                    "Saving MP3…"
-                } else if view.save_direct {
-                    "&Save recording"
-                } else {
-                    "&Save recording…"
-                },
-            );
+        }
+        if phase_changed || preference_changed {
             self.layout(root);
         }
-        if self.painted.toggle_label != view.transport.toggle_label {
-            self.painted.toggle_label = view.transport.toggle_label;
-            set_text(
-                self.toggle,
-                if matches!(view.phase, Phase::Recording | Phase::Paused) {
-                    "Stop &recording"
-                } else {
-                    "Start &recording"
-                },
-            );
-        }
-        enable(self.toggle, view.transport.toggle_enabled);
+        enable(
+            self.toggle,
+            matches!(view.phase, Phase::Idle | Phase::Failed) && view.transport.toggle_enabled,
+        );
+        enable(self.stop, live && view.transport.toggle_enabled);
+        enable(self.pause, live);
         enable(self.save, view.transport.save_enabled);
         enable(self.discard, view.transport.discard_enabled);
+        // A disabled action must not keep keyboard focus after a transition.
         if phase_changed
-            && !saving
-            && [self.toggle, self.save, self.discard].contains(&previous_focus)
+            && self.command_buttons().contains(&previous_focus)
+            && unsafe { !IsWindowEnabled(previous_focus).as_bool() }
         {
+            let next = if live {
+                self.stop
+            } else if pending {
+                self.save
+            } else if saving {
+                self.settings
+            } else {
+                self.toggle
+            };
             unsafe {
-                let _ = SetFocus(if pending { self.save } else { self.toggle });
+                let _ = SetFocus(if IsWindowEnabled(next).as_bool() {
+                    next
+                } else {
+                    self.settings
+                });
             }
         }
         if self.painted.elapsed != view.elapsed {
@@ -565,7 +550,7 @@ impl Controls {
         let mut status = view.status.clone();
         status.text = match (view.phase, status.text.as_str()) {
             (Phase::Idle, "Ready. Ctrl+Shift+R starts recording.") => {
-                "Levels appear when recording.".into()
+                String::new()
             }
             (Phase::Recording, "Recording.") => "Recording microphone and system audio.".into(),
             (Phase::Paused, "Recording paused.") => {
@@ -684,9 +669,9 @@ impl Controls {
                 hdc,
                 &RECT {
                     left: self.s(20),
-                    top: self.s(104),
+                    top: self.s(CLIENT_HUD_HEIGHT),
                     right: self.s(460),
-                    bottom: self.s(104) + 1,
+                    bottom: self.s(CLIENT_HUD_HEIGHT) + 1,
                 },
                 self.theme.divider,
             );
@@ -737,8 +722,6 @@ impl Controls {
             } else {
                 self.theme.muted
             }
-        } else if control == self.shortcut {
-            self.theme.muted
         } else {
             self.theme.ink
         };
@@ -749,96 +732,311 @@ impl Controls {
         self.theme.background
     }
 
-    pub(crate) fn command_buttons(&self) -> [HWND; 2] {
-        [self.toggle, self.save]
+    pub(crate) fn command_buttons(&self) -> [HWND; 9] {
+        [
+            self.toggle,
+            self.stop,
+            self.save,
+            self.pause,
+            self.discard,
+            self.settings,
+            self.save_as,
+            self.folder,
+            self.refresh,
+        ]
     }
 
     pub(crate) fn paints_command_button(&self, hwnd: HWND) -> bool {
-        [self.toggle, self.save].contains(&hwnd) && !self.theme.high_contrast
+        self.command_buttons().contains(&hwnd)
     }
 
-    // Native BUTTON keeps keyboard, accessibility and hover/pressed tracking.
-    pub(crate) fn draw_button(&self, draw: &NMCUSTOMDRAW) -> Option<u32> {
-        if !self.paints_command_button(draw.hdr.hwndFrom) {
-            return None;
+    // Track only state transitions; moving within a button needs no new frame.
+    pub(crate) fn set_button_hover(&self, hwnd: HWND, hovered: bool) -> bool {
+        let previous = self.hovered_button.get();
+        let next = if hovered {
+            Some(hwnd)
+        } else if previous == Some(hwnd) {
+            None
+        } else {
+            previous
+        };
+        if previous == next {
+            return false;
         }
-        match draw.dwDrawStage {
-            CDDS_PREPAINT => {
-                self.paint_command_button(draw.hdr.hwndFrom, draw.hdc);
-                Some(CDRF_SKIPDEFAULT | CDRF_NOTIFYPOSTPAINT)
-            }
-            CDDS_POSTPAINT => {
-                self.paint_command_button(draw.hdr.hwndFrom, draw.hdc);
-                Some(CDRF_SKIPDEFAULT)
-            }
-            _ => Some(CDRF_DODEFAULT),
-        }
+        self.hovered_button.set(next);
+        true
     }
 
-    pub(crate) fn paint_command_button(&self, hwnd: HWND, hdc: HDC) -> bool {
+    pub(crate) fn paint_command_button(&self, hwnd: HWND, target: HDC) -> bool {
         if !self.paints_command_button(hwnd) {
             return false;
         }
-        let state = unsafe { SendMessageW(hwnd, BM_GETSTATE, WPARAM(0), LPARAM(0)) }.0 as u32;
-        let disabled = unsafe { !IsWindowEnabled(hwnd).as_bool() };
-        let brush = if disabled {
-            self.theme.disabled
-        } else if state & BST_PUSHED != 0 {
-            self.theme.pressed
-        } else if state & BST_HOT != 0 {
-            self.theme.hover
-        } else {
-            self.theme.primary
-        };
-        let caption = if hwnd == self.save {
-            if self.painted.phase == Some(Phase::Saving) {
-                "Saving MP3…"
-            } else {
-                "Save recording…"
-            }
-        } else {
-            self.painted.toggle_label
-        };
-        let mut text: Vec<u16> = caption.encode_utf16().collect();
         let mut rect = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rect);
+        }
+        if let Some(buffer) = PaintBuffer::new(target, rect.right, rect.bottom) {
+            self.paint_button_contents(hwnd, buffer.dc());
+            if buffer.present(target) {
+                return true;
+            }
+        }
+        self.paint_button_contents(hwnd, target)
+    }
+
+    fn paint_button_contents(&self, hwnd: HWND, hdc: HDC) -> bool {
+        let state = unsafe { SendMessageW(hwnd, BM_GETSTATE, WPARAM(0), LPARAM(0)) }.0 as u32;
+        let disabled = unsafe { !IsWindowEnabled(hwnd).as_bool() };
+        let pressed = state & BST_PUSHED != 0;
+        let primary = hwnd == self.toggle || hwnd == self.save || hwnd == self.stop;
+        let destructive = hwnd == self.discard;
+        let settings = hwnd == self.settings;
+        let icon_only = settings || destructive;
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rect);
+        }
+        let hovered = self.hovered_button.get() == Some(hwnd);
+        let brush = if disabled {
+            self.theme.disabled
+        } else if hwnd == self.save {
+            if pressed {
+                self.theme.save_pressed
+            } else if hovered {
+                self.theme.save_hover
+            } else {
+                self.theme.save
+            }
+        } else if primary {
+            if pressed {
+                self.theme.pressed
+            } else if hovered {
+                self.theme.hover
+            } else {
+                self.theme.primary
+            }
+        } else if pressed {
+            self.theme.secondary_pressed
+        } else if hovered && destructive {
+            self.theme.danger_hover
+        } else if hovered {
+            self.theme.secondary_hover
+        } else {
+            self.theme.secondary
+        };
+        let ink = if disabled {
+            self.theme.disabled_ink
+        } else if primary {
+            self.theme.primary_ink
+        } else if destructive && (hovered || pressed) {
+            self.theme.red
+        } else {
+            self.theme.ink
+        };
+        // Native captions, including access keys, remain the accessible names.
+        let mut caption = [0u16; 128];
+        let count = unsafe { GetWindowTextW(hwnd, &mut caption) } as usize;
+        let mut text: Vec<u16> = String::from_utf16_lossy(&caption[..count])
+            .replace('&', "")
+            .encode_utf16()
+            .collect();
+        let icon = if settings {
+            Some(ButtonIcon::Settings)
+        } else if hwnd == self.toggle {
+            Some(ButtonIcon::Record)
+        } else if hwnd == self.stop {
+            Some(ButtonIcon::Stop)
+        } else if hwnd == self.pause {
+            Some(if self.painted.phase == Some(Phase::Paused) {
+                ButtonIcon::Resume
+            } else {
+                ButtonIcon::Pause
+            })
+        } else if destructive {
+            Some(ButtonIcon::Discard)
+        } else if hwnd == self.save {
+            Some(ButtonIcon::Save)
+        } else {
+            None
+        };
+        unsafe {
+            let saved_dc = SaveDC(hdc);
             let _ = SetROP2(hdc, R2_COPYPEN);
             FillRect(hdc, &rect, self.theme.background);
-            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-            let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-            let _ = RoundRect(
-                hdc,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                self.s(10),
-                self.s(10),
-            );
-            let old_font = SelectObject(hdc, HGDIOBJ(self.fonts.strong.0));
+            if !self.rounded.fill(hdc, rect, self.s(12), brush) {
+                SelectObject(hdc, GetStockObject(NULL_PEN));
+                SelectObject(hdc, HGDIOBJ(brush.0));
+                let _ = RoundRect(hdc, 0, 0, rect.right, rect.bottom, self.s(12), self.s(12));
+            }
+            let font = if primary {
+                self.fonts.strong
+            } else {
+                self.fonts.body
+            };
+            SelectObject(hdc, HGDIOBJ(font.0));
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(
-                hdc,
-                if disabled {
-                    self.theme.muted
-                } else {
-                    rgb(255, 255, 255)
-                },
-            );
-            let mut text_rect = rect;
-            DrawTextW(
-                hdc,
-                &mut text,
-                &mut text_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(hdc, old_font);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
+            SetTextColor(hdc, ink);
+            let mut size = SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
+            let icon_size = self.s(20);
+            let gap = if icon.is_some() && !icon_only {
+                self.s(8)
+            } else {
+                0
+            };
+            let width = if icon_only {
+                icon_size
+            } else {
+                size.cx + gap + if icon.is_some() { icon_size } else { 0 }
+            };
+            let offset = if pressed && !disabled { self.s(1) } else { 0 };
+            let left = (rect.right - width) / 2 + offset;
+            if let Some(icon) = icon {
+                SelectObject(hdc, HGDIOBJ(self.fonts.icons.0));
+                let transform = MAT2 {
+                    eM11: FIXED { value: 1, fract: 0 },
+                    eM22: FIXED { value: 1, fract: 0 },
+                    ..Default::default()
+                };
+                let mut bounds = GLYPHMETRICS::default();
+                GetGlyphOutlineW(
+                    hdc,
+                    u32::from(icon.glyph()),
+                    GGO_METRICS,
+                    &mut bounds,
+                    0,
+                    None,
+                    &transform,
+                );
+                // Center the actual outline, not the font's asymmetric padding.
+                let alignment = SetTextAlign(hdc, TA_LEFT | TA_BASELINE);
+                let _ = TextOutW(
+                    hdc,
+                    left + (icon_size - bounds.gmBlackBoxX as i32) / 2 - bounds.gmptGlyphOrigin.x,
+                    (rect.bottom - bounds.gmBlackBoxY as i32) / 2
+                        + bounds.gmptGlyphOrigin.y
+                        + offset,
+                    &[icon.glyph()],
+                );
+                SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(alignment));
+                SelectObject(hdc, HGDIOBJ(font.0));
+            }
+            if !icon_only {
+                let mut text_rect = RECT {
+                    left: left + if icon.is_some() { icon_size + gap } else { 0 },
+                    top: offset,
+                    right: rect.right - self.s(8) + offset,
+                    bottom: rect.bottom + offset,
+                };
+                DrawTextW(
+                    hdc,
+                    &mut text,
+                    &mut text_rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+            let show_focus = SendMessageW(hwnd, WM_QUERYUISTATE, WPARAM(0), LPARAM(0)).0
+                & UISF_HIDEFOCUS as isize
+                == 0;
+            if GetFocus() == hwnd && !disabled && show_focus {
+                let inset = self.s(4);
+                let focus = RECT {
+                    left: inset,
+                    top: inset,
+                    right: rect.right - inset,
+                    bottom: rect.bottom - inset,
+                };
+                let _ = DrawFocusRect(hdc, &focus);
+            }
+            let _ = RestoreDC(hdc, saved_dc);
         }
         true
     }
+}
+
+#[derive(Clone, Copy)]
+enum ButtonIcon {
+    Record,
+    Stop,
+    Pause,
+    Resume,
+    Discard,
+    Settings,
+    Save,
+}
+
+impl ButtonIcon {
+    // Codepoints from lucide-static 0.468.0; see assets/lucide-SOURCE.txt.
+    fn glyph(self) -> u16 {
+        match self {
+            Self::Record => 0xe07a,
+            Self::Stop => 0xe16a,
+            Self::Pause => 0xe131,
+            Self::Resume => 0xe13f,
+            Self::Discard => 0xe18d,
+            Self::Settings => 0xe157,
+            Self::Save => 0xe150,
+        }
+    }
+}
+
+fn name_device_controls(microphones: HWND, outputs: HWND) {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, PROPID_ACC_NAME};
+    // Explicit accessible names replace the removed visual labels.
+    unsafe {
+        if let Ok(names) =
+            CoCreateInstance::<_, IAccPropServices>(&CAccPropServices, None, CLSCTX_INPROC_SERVER)
+        {
+            for (control, name) in [
+                (microphones, w!("Microphone")),
+                (outputs, w!("System audio")),
+            ] {
+                let _ =
+                    names.SetHwndPropStr(control, OBJID_CLIENT.0 as u32, 0, PROPID_ACC_NAME, name);
+            }
+        }
+    }
+}
+
+fn control_tooltip(
+    root: HWND,
+    instance: HINSTANCE,
+    control: HWND,
+    text: PCWSTR,
+) -> Result<(), RunError> {
+    unsafe {
+        let tooltip = CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            w!(""),
+            WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            root,
+            None,
+            instance,
+            None,
+        )
+        .map_err(|e| RunError::new(format!("creating control tooltip failed: {e}")))?;
+        let info = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: root,
+            uId: control.0 as usize,
+            lpszText: windows::core::PWSTR(text.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        SendMessageW(
+            tooltip,
+            TTM_ADDTOOLW,
+            WPARAM(0),
+            LPARAM(&info as *const _ as isize),
+        );
+    }
+    Ok(())
 }
 
 impl Fonts {
@@ -882,19 +1080,48 @@ impl Fonts {
         base.lfWeight = 400;
         base.lfHeight = -scale(34, units);
         let timer = unsafe { CreateFontIndirectW(&base) };
+        // Private to this process: no installed font or runtime download needed.
+        let icon_bytes = include_bytes!("../../assets/onerec-lucide.ttf");
+        let mut count = 0u32;
+        let icon_resource = unsafe {
+            AddFontMemResourceEx(
+                icon_bytes.as_ptr().cast(),
+                icon_bytes.len() as u32,
+                None,
+                &mut count,
+            )
+        };
+        let mut icon_face = LOGFONTW {
+            lfHeight: -scale(20, units),
+            lfWeight: 400,
+            lfCharSet: DEFAULT_CHARSET,
+            lfQuality: ANTIALIASED_QUALITY,
+            ..Default::default()
+        };
+        for (to, from) in icon_face.lfFaceName.iter_mut().zip("lucide".encode_utf16()) {
+            *to = from;
+        }
+        let icons = unsafe { CreateFontIndirectW(&icon_face) };
         Self {
             body,
             strong,
             timer,
+            icons,
+            icon_resource,
             units,
         }
     }
 }
 impl Drop for Fonts {
     fn drop(&mut self) {
-        for font in [self.body, self.strong, self.timer] {
+        for font in [self.body, self.strong, self.timer, self.icons] {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+        if !self.icon_resource.is_invalid() {
+            unsafe {
+                let _ = RemoveFontMemResourceEx(self.icon_resource);
             }
         }
     }
@@ -1050,7 +1277,14 @@ fn combo(root: HWND, instance: HINSTANCE, id: u16, _top: i32) -> Result<HWND, Ru
     )
 }
 fn button(root: HWND, instance: HINSTANCE, id: u16, caption: PCWSTR) -> Result<HWND, RunError> {
-    child(root, instance, w!("BUTTON"), caption, WS_TABSTOP, id)
+    child(
+        root,
+        instance,
+        w!("BUTTON"),
+        caption,
+        WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        id,
+    )
 }
 fn static_text(
     root: HWND,

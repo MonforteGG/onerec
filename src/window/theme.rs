@@ -14,13 +14,21 @@ pub(super) struct Theme {
     pub primary: HBRUSH,
     pub hover: HBRUSH,
     pub pressed: HBRUSH,
+    pub save: HBRUSH,
+    pub save_hover: HBRUSH,
+    pub save_pressed: HBRUSH,
     pub disabled: HBRUSH,
+    pub disabled_ink: COLORREF,
+    pub secondary: HBRUSH,
+    pub secondary_hover: HBRUSH,
+    pub secondary_pressed: HBRUSH,
+    pub danger_hover: HBRUSH,
+    pub primary_ink: COLORREF,
     pub divider: HBRUSH,
     pub ink: COLORREF,
     pub muted: COLORREF,
     pub red: COLORREF,
     pub warning: COLORREF,
-    pub high_contrast: bool,
 }
 
 impl Theme {
@@ -55,16 +63,72 @@ impl Theme {
                 rgb(0x23, 0x83, 0x49)
             }),
             clipping: brush(red),
-            primary: brush(red),
-            hover: brush(rgb(0xa2, 0x20, 0x2b)),
-            pressed: brush(rgb(0x88, 0x1b, 0x24)),
-            disabled: brush(sys(COLOR_BTNFACE)),
+            primary: brush(if hc { sys(COLOR_HIGHLIGHT) } else { red }),
+            hover: brush(if hc {
+                sys(COLOR_HIGHLIGHT)
+            } else {
+                rgb(0xa2, 0x20, 0x2b)
+            }),
+            pressed: brush(if hc {
+                sys(COLOR_HIGHLIGHT)
+            } else {
+                rgb(0x88, 0x1b, 0x24)
+            }),
+            save: brush(if hc {
+                sys(COLOR_HIGHLIGHT)
+            } else {
+                rgb(0x2d, 0x37, 0x45)
+            }),
+            save_hover: brush(if hc {
+                sys(COLOR_HIGHLIGHT)
+            } else {
+                rgb(0x21, 0x2a, 0x36)
+            }),
+            save_pressed: brush(if hc {
+                sys(COLOR_HIGHLIGHT)
+            } else {
+                rgb(0x17, 0x1e, 0x28)
+            }),
+            disabled: brush(if hc {
+                sys(COLOR_BTNFACE)
+            } else {
+                rgb(0xf5, 0xf6, 0xf8)
+            }),
+            disabled_ink: if hc {
+                sys(COLOR_GRAYTEXT)
+            } else {
+                rgb(0xab, 0xb2, 0xbd)
+            },
+            secondary: brush(if hc {
+                sys(COLOR_BTNFACE)
+            } else {
+                rgb(0xe7, 0xeb, 0xf0)
+            }),
+            secondary_hover: brush(if hc {
+                sys(COLOR_BTNFACE)
+            } else {
+                rgb(0xda, 0xe0, 0xe8)
+            }),
+            secondary_pressed: brush(if hc {
+                sys(COLOR_BTNFACE)
+            } else {
+                rgb(0xcb, 0xd3, 0xde)
+            }),
+            danger_hover: brush(if hc {
+                sys(COLOR_BTNFACE)
+            } else {
+                rgb(0xfc, 0xeb, 0xed)
+            }),
+            primary_ink: if hc {
+                sys(COLOR_HIGHLIGHTTEXT)
+            } else {
+                rgb(255, 255, 255)
+            },
             divider: brush(if hc { ink } else { rgb(0xe6, 0xea, 0xee) }),
             ink,
             muted: if hc { ink } else { rgb(0x59, 0x63, 0x6e) },
             red,
             warning: if hc { ink } else { rgb(0x85, 0x56, 0x00) },
-            high_contrast: hc,
         }
     }
 }
@@ -79,7 +143,14 @@ impl Drop for Theme {
             self.primary,
             self.hover,
             self.pressed,
+            self.save,
+            self.save_hover,
+            self.save_pressed,
             self.disabled,
+            self.secondary,
+            self.secondary_hover,
+            self.secondary_pressed,
+            self.danger_hover,
             self.divider,
         ] {
             unsafe {

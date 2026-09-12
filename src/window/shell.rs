@@ -4,42 +4,44 @@ use std::ffi::c_void;
 use ::windows::core::{w, HSTRING, PCWSTR};
 use ::windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use ::windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetDC, GetSysColorBrush, ReleaseDC, UpdateWindow, COLOR_WINDOW,
+    BeginPaint, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, UpdateWindow, COLOR_WINDOW,
     HDC, PAINTSTRUCT,
 };
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use ::windows::Win32::UI::Controls::{NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW};
+use ::windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
 use ::windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
 };
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+    IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT,
+    MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use ::windows::Win32::UI::Shell::ShellExecuteW;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, CallWindowProcW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetParent, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, LoadImageW,
     MessageBoxW, PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, CBN_CLOSEUP, CBN_DROPDOWN,
-    CBN_SELCHANGE, CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    GWLP_WNDPROC, HCURSOR, HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR,
-    MB_ICONWARNING, MB_YESNO, MSG, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DEVICECHANGE, WM_ERASEBKGND, WM_HOTKEY, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT,
-    WM_SETFOCUS, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED,
-    WS_SYSMENU,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, BM_SETSTATE, BN_CLICKED, CBN_CLOSEUP,
+    CBN_DROPDOWN, CBN_SELCHANGE, CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, GWLP_WNDPROC, HCURSOR, HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MB_ICONWARNING, MB_YESNO, MSG, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND,
+    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTEXT, WM_SHOWWINDOW, WM_TIMER,
+    WM_UPDATEUISTATE, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::paint::{
     Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
-    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SAVE_AS, ID_SETTINGS, ID_TOGGLE,
+    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SAVE_AS, ID_SETTINGS, ID_STOP, ID_TOGGLE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
 use crate::RunError;
 use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_NOTIFY, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
     WM_SYSCOLORCHANGE, WM_THEMECHANGED, WS_CLIPCHILDREN,
 };
 
@@ -137,7 +139,10 @@ fn dispatch(root: HWND, intent: Intent) {
         if shell.modal && !matches!(intent, Intent::Tick) {
             return None;
         }
-        let blocking = matches!(intent, Intent::Toggle | Intent::DiscardAndClose);
+        let blocking = matches!(
+            intent,
+            Intent::Toggle | Intent::Start | Intent::Stop | Intent::DiscardAndClose
+        );
         let _wait = blocking.then(WaitCursor::show);
         let view = shell.recorder.apply(intent);
         shell.phase = view.phase;
@@ -419,9 +424,41 @@ unsafe extern "system" fn command_button_proc(
             }
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_SETFOCUS | WM_KILLFOCUS => {
+        WM_MOUSEMOVE => {
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let x = lparam.0 as i16 as i32;
+            let y = (lparam.0 >> 16) as i16 as i32;
+            let hovered = IsWindowEnabled(hwnd).as_bool()
+                && x >= 0
+                && x < rect.right
+                && y >= 0
+                && y < rect.bottom;
+            if update_button_hover(hwnd, hovered) && hovered {
+                let mut tracking = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    ..Default::default()
+                };
+                let _ = TrackMouseEvent(&mut tracking);
+            }
+            CallWindowProcW(original, hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            update_button_hover(hwnd, false);
+            CallWindowProcW(original, hwnd, message, wparam, lparam)
+        }
+        WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_KEYUP
+        | WM_ENABLE | WM_SETTEXT | WM_UPDATEUISTATE | BM_SETSTATE | WM_CAPTURECHANGED
+        | WM_CANCELMODE | WM_SHOWWINDOW => {
+            if (message == WM_ENABLE || message == WM_SHOWWINDOW) && wparam.0 == 0
+                || message == WM_CANCELMODE
+            {
+                update_button_hover(hwnd, false);
+            }
             let result = CallWindowProcW(original, hwnd, message, wparam, lparam);
-            cover_command_button(hwnd);
+            let _ = InvalidateRect(hwnd, None, false);
             result
         }
         WM_NCDESTROY => {
@@ -441,17 +478,18 @@ fn parent_of(hwnd: HWND) -> Option<HWND> {
     }
 }
 
-fn cover_command_button(hwnd: HWND) {
-    let Some(root) = parent_of(hwnd) else {
-        return;
-    };
-    unsafe {
-        let hdc = GetDC(hwnd);
-        if !hdc.0.is_null() {
-            with_shell_read(root, |shell| shell.controls.paint_command_button(hwnd, hdc));
-            let _ = ReleaseDC(hwnd, hdc);
+fn update_button_hover(hwnd: HWND, hovered: bool) -> bool {
+    let changed = parent_of(hwnd)
+        .and_then(|root| {
+            with_shell_read(root, |shell| shell.controls.set_button_hover(hwnd, hovered))
+        })
+        .unwrap_or(false);
+    if changed {
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
         }
     }
+    changed
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -537,15 +575,14 @@ unsafe extern "system" fn wnd_proc(
             FillRect(HDC(wparam.0 as *mut c_void), &rect, brush);
             LRESULT(1)
         }
-        WM_NOTIFY => {
-            if let Some(header) = (lparam.0 as *const NMHDR).as_ref() {
-                if header.code == NM_CUSTOMDRAW {
-                    let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
-                    if let Some(result) =
-                        with_shell(root, |shell| shell.controls.draw_button(draw)).flatten()
-                    {
-                        return LRESULT(result as isize);
-                    }
+        WM_DRAWITEM => {
+            if let Some(draw) = (lparam.0 as *const DRAWITEMSTRUCT).as_ref() {
+                if with_shell_read(root, |shell| {
+                    shell.controls.paint_command_button(draw.hwndItem, draw.hDC)
+                })
+                .unwrap_or(false)
+                {
+                    return LRESULT(1);
                 }
             }
             DefWindowProcW(root, message, wparam, lparam)
@@ -628,7 +665,8 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
             Some(Intent::ChooseQuality(selection(control)?))
         }
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
-        (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
+        (BN_CLICKED, ID_TOGGLE) => Some(Intent::Start),
+        (BN_CLICKED, ID_STOP) => Some(Intent::Stop),
         (BN_CLICKED, ID_PAUSE) => Some(Intent::Pause),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
         (BN_CLICKED, ID_SAVE_AS) => Some(Intent::SaveAs),
