@@ -159,6 +159,7 @@ impl Recorder {
         Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path))
     }
 
+    #[cfg(test)]
     pub(crate) fn with_devices(devices: Box<dyn Devices>, staging: StagingArea) -> Self {
         Self::with_prefs(devices, staging, Prefs::default(), None)
     }
