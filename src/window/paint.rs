@@ -672,17 +672,6 @@ impl Controls {
                 &mut text_rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            if draw.uItemState.contains(CDIS_FOCUS) {
-                let _ = DrawFocusRect(
-                    draw.hdc,
-                    &RECT {
-                        left: rect.left + self.s(4),
-                        top: rect.top + self.s(4),
-                        right: rect.right - self.s(4),
-                        bottom: rect.bottom - self.s(4),
-                    },
-                );
-            }
             SelectObject(draw.hdc, old_font);
             SelectObject(draw.hdc, old_brush);
             SelectObject(draw.hdc, old_pen);
