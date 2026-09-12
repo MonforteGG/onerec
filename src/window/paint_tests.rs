@@ -3,13 +3,13 @@ mod tests {
     use super::*;
     use crate::recorder::{Level, Levels, Status, Tone, Transport, View};
     use std::sync::Once;
-    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::Foundation::{LRESULT, RECT};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, RegisterClassExW, ShowWindow, CB_GETDROPPEDSTATE,
-        CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, LB_GETCURSEL, SW_SHOW, WNDCLASSEXW,
-        WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
+        DefWindowProcW, DestroyWindow, GetClientRect, RegisterClassExW, ShowWindow,
+        CB_GETDROPPEDSTATE, CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+        LB_GETCURSEL, SW_SHOW, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
     };
 
     struct Harness {
@@ -234,7 +234,7 @@ mod tests {
         view.transport.toggle_label = "Stop recording";
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
-        assert!(!unsafe { IsWindowVisible(controls.shortcut).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.shortcut).as_bool() });
         assert!(!unsafe { IsWindowEnabled(controls.quality).as_bool() });
         assert_eq!(caption(controls.pause), "&Pause");
         view.phase = Phase::Paused;
@@ -249,6 +249,62 @@ mod tests {
         controls.show(ui.root, &view);
         assert!(!unsafe { IsWindowVisible(controls.pause).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.discard).as_bool() });
+    }
+
+    fn client_h(root: HWND) -> i32 {
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetClientRect(root, &mut rect);
+        }
+        rect.bottom
+    }
+
+    #[test]
+    fn recording_hud_hides_device_combos() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        controls.show(ui.root, &view);
+        let idle_h = client_h(ui.root);
+        assert!(unsafe { IsWindowVisible(controls.microphones).as_bool() });
+        view.phase = Phase::Recording;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
+        view.transport.toggle_label = "Stop recording";
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.microphones).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.outputs).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.quality).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.shortcut).as_bool() });
+        assert!(client_h(ui.root) < idle_h);
+    }
+
+    #[test]
+    fn stop_restores_full_layout() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        view.phase = Phase::Recording;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
+        view.transport.toggle_label = "Stop recording";
+        controls.show(ui.root, &view);
+        let hud_h = client_h(ui.root);
+        view.phase = Phase::AwaitingSave;
+        view.transport.toggle_enabled = false;
+        view.transport.save_enabled = true;
+        view.transport.discard_enabled = true;
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.microphones).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.save).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.discard).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.pause).as_bool() });
+        assert!(client_h(ui.root) > hud_h);
     }
 
     fn caption(hwnd: HWND) -> String {
