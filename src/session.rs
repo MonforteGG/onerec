@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -13,11 +13,12 @@ use crate::capture::{CaptureRead, CaptureSource};
 use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::Encode;
 use crate::staging::StagingFile;
-use crate::timeline::{draw, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
+use crate::timeline::{draw, fold_mix, MAX_BACKLOG_FRAMES, MIX_QUANTUM_FRAMES, MIX_TICK};
 
 pub use crate::mp3::{ExportQuality, SaveProgress};
 
 const SAVE_SLICE: Duration = Duration::from_millis(30);
+const STAGING_BUFFER: usize = 64 * 1024;
 
 pub enum Session {
     Idle,
@@ -106,12 +107,14 @@ pub struct ActiveRecording {
     worker: Option<JoinHandle<Result<(), FailedSession>>>,
     degraded: Arc<AtomicBool>,
     staging_file: StagingFile,
+    quality: ExportQuality,
 }
 
 pub struct PendingRecording {
     staging_file: StagingFile,
     elapsed: Duration,
     degraded: bool,
+    quality: ExportQuality,
 }
 
 #[derive(Debug)]
@@ -142,18 +145,21 @@ impl std::fmt::Debug for Session {
                 .field("output", &active.output)
                 .field("elapsed", &active.started_at.elapsed())
                 .field("degraded", &active.degraded.load(Ordering::SeqCst))
+                .field("quality", &active.quality)
                 .field("staging_file", &active.staging_file)
                 .finish_non_exhaustive(),
             Session::AwaitingSave(pending) => f
                 .debug_struct("AwaitingSave")
                 .field("elapsed", &pending.elapsed)
                 .field("degraded", &pending.degraded)
+                .field("quality", &pending.quality)
                 .field("staging_file", &pending.staging_file)
                 .finish(),
             Session::Saving(active) => f
                 .debug_struct("Saving")
                 .field("elapsed", &active.pending.elapsed)
                 .field("degraded", &active.pending.degraded)
+                .field("quality", &active.pending.quality)
                 .field("staging_file", &active.pending.staging_file)
                 .field("destination", &active.destination)
                 .field("progress", &active.worker.progress())
@@ -174,6 +180,10 @@ impl PendingRecording {
 
     pub fn is_degraded(&self) -> bool {
         self.degraded
+    }
+
+    pub fn quality(&self) -> ExportQuality {
+        self.quality
     }
 }
 
@@ -231,6 +241,7 @@ impl Session {
         microphone_source: impl CaptureSource,
         system: impl CaptureSource,
         staging_file: StagingFile,
+        quality: ExportQuality,
     ) {
         if !matches!(self, Session::Idle) {
             return;
@@ -241,6 +252,7 @@ impl Session {
             microphone_source,
             system,
             staging_file,
+            quality,
         ) {
             Ok(active) => Session::Recording(active),
             Err(failed) => Session::Failed(failed),
@@ -263,12 +275,14 @@ impl Session {
         };
     }
 
-    pub fn save_as(&mut self, destination: &Path, quality: ExportQuality) -> Result<(), SaveError> {
+    pub fn save_as(&mut self, destination: &Path) -> Result<(), SaveError> {
         if matches!(self, Session::Saving(_)) {
             return Ok(());
         }
-        let staged = match self {
-            Session::AwaitingSave(pending) => pending.staging_file().to_path_buf(),
+        let (staged, quality) = match self {
+            Session::AwaitingSave(pending) => {
+                (pending.staging_file().to_path_buf(), pending.quality)
+            }
             _ => return Err(SaveError::NoTake),
         };
         let encode = Encode::start(destination, &staged, quality)
@@ -379,6 +393,7 @@ impl ActiveRecording {
         microphone_source: impl CaptureSource,
         system: impl CaptureSource,
         staging_file: StagingFile,
+        quality: ExportQuality,
     ) -> Result<Self, FailedSession> {
         let file = match File::create(staging_file.path()) {
             Ok(file) => file,
@@ -400,6 +415,7 @@ impl ActiveRecording {
                     Box::new(microphone_source),
                     Box::new(system),
                     file,
+                    quality,
                     stop_rx,
                     degraded_worker,
                 )
@@ -420,6 +436,7 @@ impl ActiveRecording {
             worker: Some(worker),
             degraded,
             staging_file,
+            quality,
         })
     }
 
@@ -434,6 +451,7 @@ impl ActiveRecording {
                     staging_file,
                     elapsed: self.started_at.elapsed(),
                     degraded: self.degraded.load(Ordering::SeqCst),
+                    quality: self.quality,
                 }),
                 Ok(Err(mut failed)) => {
                     failed.staging = Some(staging_file);
@@ -473,14 +491,17 @@ fn io_fail(error: io::Error) -> FailedSession {
 fn mix_loop(
     mut microphone: Box<dyn CaptureSource>,
     mut system: Box<dyn CaptureSource>,
-    mut file: File,
+    file: File,
+    quality: ExportQuality,
     stop_rx: Receiver<()>,
     degraded: Arc<AtomicBool>,
 ) -> Result<(), FailedSession> {
+    let mut file = BufWriter::with_capacity(STAGING_BUFFER, file);
     let mut mic_buf = VecDeque::new();
     let mut sys_buf = VecDeque::new();
     let mut mic_live = true;
     let mut sys_live = true;
+    let mut staged = Vec::with_capacity(MIX_QUANTUM_FRAMES * quality.staging_frame_bytes());
     let origin = Instant::now();
     let mut quanta = 0u32;
 
@@ -496,7 +517,13 @@ fn mix_loop(
         let mic = take_quantum(&mut mic_buf);
         let sys = take_quantum(&mut sys_buf);
         let block = mix(&mic, &sys);
-        write_block(&mut file, &block)?;
+        fold_mix(
+            &block,
+            quality.staging_factor(),
+            quality.staging_channels(),
+            &mut staged,
+        );
+        file.write_all(&staged).map_err(io_fail)?;
         quanta = quanta.saturating_add(1);
 
         let due = origin + MIX_TICK * quanta;
@@ -510,7 +537,8 @@ fn mix_loop(
         }
     }
 
-    file.sync_all().map_err(io_fail)?;
+    file.flush().map_err(io_fail)?;
+    file.get_ref().sync_all().map_err(io_fail)?;
     Ok(())
 }
 
@@ -558,14 +586,6 @@ fn clamp(sample: f32) -> f32 {
     sample.clamp(-1.0, 1.0)
 }
 
-fn write_block(file: &mut File, block: &[[f32; 2]]) -> Result<(), FailedSession> {
-    for [left, right] in block {
-        file.write_all(&left.to_le_bytes()).map_err(io_fail)?;
-        file.write_all(&right.to_le_bytes()).map_err(io_fail)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +607,17 @@ mod tests {
         system: impl CaptureSource,
         staging: StagingFile,
     ) {
-        session.start(mic_id(), out_id(), microphone, system, staging);
+        start_quality(session, microphone, system, staging, ExportQuality::Meeting);
+    }
+
+    fn start_quality(
+        session: &mut Session,
+        microphone: impl CaptureSource,
+        system: impl CaptureSource,
+        staging: StagingFile,
+        quality: ExportQuality,
+    ) {
+        session.start(mic_id(), out_id(), microphone, system, staging, quality);
     }
 
     fn record_silence() -> (Session, PathBuf) {
@@ -598,17 +628,30 @@ mod tests {
         (session, path)
     }
 
-    fn staged_frame_count(path: &Path) -> u64 {
-        std::fs::metadata(path).unwrap().len() / 8
+    fn staged_frame_count(path: &Path, quality: ExportQuality) -> u64 {
+        std::fs::metadata(path).unwrap().len() / quality.staging_frame_bytes() as u64
     }
 
-    fn staged_interleaved_f32(path: &Path) -> Vec<f32> {
+    fn staged_samples(path: &Path) -> Vec<f32> {
         let bytes = std::fs::read(path).unwrap();
-        assert_eq!(bytes.len() % 8, 0, "staging length {}", bytes.len());
+        assert_eq!(bytes.len() % 4, 0, "staging length {}", bytes.len());
         bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
+    }
+
+    fn awaiting(
+        staging: StagingFile,
+        elapsed: Duration,
+        quality: ExportQuality,
+    ) -> PendingRecording {
+        PendingRecording {
+            staging_file: staging,
+            elapsed,
+            degraded: false,
+            quality,
+        }
     }
 
     #[test]
@@ -644,7 +687,8 @@ mod tests {
             panic!("expected AwaitingSave, got {session:?}");
         };
         let mixed = Duration::from_secs_f64(
-            staged_frame_count(pending.staging_file()) as f64 / f64::from(MIX_SAMPLE_RATE),
+            staged_frame_count(pending.staging_file(), pending.quality()) as f64
+                / f64::from(pending.quality().staging_hz()),
         );
         let elapsed = pending.elapsed();
         assert!(
@@ -695,10 +739,9 @@ mod tests {
         let Session::AwaitingSave(pending) = &session else {
             panic!("expected AwaitingSave, got {session:?}");
         };
-        let pcm = staged_interleaved_f32(pending.staging_file());
+        let pcm = staged_samples(pending.staging_file());
         assert!(
-            pcm.chunks_exact(2)
-                .any(|frame| frame[0] != 0.0 || frame[1] != 0.0),
+            pcm.iter().any(|sample| *sample != 0.0),
             "second start must not replace the live tone source"
         );
     }
@@ -727,10 +770,9 @@ mod tests {
             panic!("expected AwaitingSave, got {session:?}");
         };
         assert!(pending.is_degraded());
-        let pcm = staged_interleaved_f32(pending.staging_file());
+        let pcm = staged_samples(pending.staging_file());
         assert!(
-            pcm.chunks_exact(2)
-                .any(|frame| (frame[0] - 0.5).abs() < 1e-6 && (frame[1] - 0.5).abs() < 1e-6),
+            pcm.iter().any(|sample| (*sample - 0.5).abs() < 1e-6),
             "microphone frames must remain after the system device is lost"
         );
     }
@@ -749,11 +791,8 @@ mod tests {
     #[test]
     fn discard_failure_keeps_awaiting_save() {
         let staging = StagingFile::reserved(PathBuf::from("onerec-missing-take.f32"));
-        let mut session = Session::AwaitingSave(PendingRecording {
-            staging_file: staging,
-            elapsed: Duration::ZERO,
-            degraded: false,
-        });
+        let mut session =
+            Session::AwaitingSave(awaiting(staging, Duration::ZERO, ExportQuality::Meeting));
         session.discard().unwrap_err();
         assert!(matches!(session, Session::AwaitingSave(_)));
         let Session::AwaitingSave(pending) = &session else {
@@ -779,8 +818,8 @@ mod tests {
         }
     }
 
-    fn stage_silence(path: &Path, frames: usize) {
-        std::fs::write(path, vec![0u8; frames * 8]).unwrap();
+    fn stage_silence(path: &Path, frames: usize, quality: ExportQuality) {
+        std::fs::write(path, vec![0u8; frames * quality.staging_frame_bytes()]).unwrap();
     }
 
     fn leftovers(dir: &Path) -> usize {
@@ -793,13 +832,22 @@ mod tests {
 
     #[test]
     fn save_as_writes_mp3_then_goes_idle() {
-        let (mut session, path) = record_silence();
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let path = staging.path().to_path_buf();
+        let mut session = Session::Idle;
+        start_quality(
+            &mut session,
+            PcmSource::silence(),
+            NoPacketSource,
+            staging,
+            ExportQuality::Standard,
+        );
         thread::sleep(Duration::from_millis(40));
         session.stop();
         assert!(path.exists());
         let dest_dir = tempfile::tempdir().unwrap();
         let dest = dest_dir.path().join("take.mp3");
-        session.save_as(&dest, ExportQuality::Standard).unwrap();
+        session.save_as(&dest).unwrap();
         assert!(matches!(session, Session::Saving(_)));
         assert_eq!(poll_until_terminal(&mut session).unwrap(), dest);
         assert!(matches!(session, Session::Idle));
@@ -815,13 +863,13 @@ mod tests {
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take.mp3");
         let frames = MIX_SAMPLE_RATE as usize * 10;
-        stage_silence(&staged, frames);
-        let mut session = Session::AwaitingSave(PendingRecording {
-            staging_file: StagingFile::reserved(staged.clone()),
-            elapsed: Duration::from_secs(10),
-            degraded: false,
-        });
-        session.save_as(&dest, ExportQuality::Compact).unwrap();
+        stage_silence(&staged, frames, ExportQuality::Compact);
+        let mut session = Session::AwaitingSave(awaiting(
+            StagingFile::reserved(staged.clone()),
+            Duration::from_secs(10),
+            ExportQuality::Compact,
+        ));
+        session.save_as(&dest).unwrap();
         assert!(matches!(session, Session::Saving(_)));
         let start = session.save_progress().unwrap();
         assert!(start.done <= start.total);
@@ -856,13 +904,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take.mp3");
-        stage_silence(&staged, MIX_SAMPLE_RATE as usize * 2);
-        let mut session = Session::AwaitingSave(PendingRecording {
-            staging_file: StagingFile::reserved(staged.clone()),
-            elapsed: Duration::from_secs(2),
-            degraded: false,
-        });
-        session.save_as(&dest, ExportQuality::Standard).unwrap();
+        stage_silence(
+            &staged,
+            MIX_SAMPLE_RATE as usize * 2,
+            ExportQuality::Standard,
+        );
+        let mut session = Session::AwaitingSave(awaiting(
+            StagingFile::reserved(staged.clone()),
+            Duration::from_secs(2),
+            ExportQuality::Standard,
+        ));
+        session.save_as(&dest).unwrap();
         let Session::Saving(active) = &session else {
             panic!("expected saving");
         };
@@ -891,14 +943,14 @@ mod tests {
         let dest = dir.path().join("take.mp3");
         File::create(&staged)
             .unwrap()
-            .set_len(MIX_SAMPLE_RATE as u64 * 60 * 8)
+            .set_len(MIX_SAMPLE_RATE as u64 * 60 * ExportQuality::High.staging_frame_bytes() as u64)
             .unwrap();
-        let mut session = Session::AwaitingSave(PendingRecording {
-            staging_file: StagingFile::reserved(staged.clone()),
-            elapsed: Duration::from_secs(60),
-            degraded: false,
-        });
-        session.save_as(&dest, ExportQuality::High).unwrap();
+        let mut session = Session::AwaitingSave(awaiting(
+            StagingFile::reserved(staged.clone()),
+            Duration::from_secs(60),
+            ExportQuality::High,
+        ));
+        session.save_as(&dest).unwrap();
         session.discard().unwrap();
         assert!(matches!(session, Session::Idle));
         assert!(!staged.exists());
@@ -917,13 +969,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         std::fs::write(&staged, [0u8; 7]).unwrap();
-        let mut session = Session::AwaitingSave(PendingRecording {
-            staging_file: StagingFile::reserved(staged.clone()),
-            elapsed: Duration::ZERO,
-            degraded: false,
-        });
+        let mut session = Session::AwaitingSave(awaiting(
+            StagingFile::reserved(staged.clone()),
+            Duration::ZERO,
+            ExportQuality::Standard,
+        ));
         let dest = dir.path().join("take.mp3");
-        session.save_as(&dest, ExportQuality::Standard).unwrap_err();
+        session.save_as(&dest).unwrap_err();
         assert!(matches!(session, Session::AwaitingSave(_)));
         assert!(staged.exists());
         assert!(!dest.exists());
@@ -935,9 +987,7 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         session.stop();
         let dest = tempfile::tempdir().unwrap();
-        session
-            .save_as(dest.path(), ExportQuality::Standard)
-            .unwrap();
+        session.save_as(dest.path()).unwrap();
         assert!(matches!(session, Session::Saving(_)));
         poll_until_terminal(&mut session).unwrap_err();
         assert!(matches!(session, Session::AwaitingSave(_)));
@@ -977,6 +1027,40 @@ mod tests {
         assert!(path.exists());
         drop(session);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn meeting_staging_is_much_smaller_than_high() {
+        let area = StagingArea::open().unwrap();
+        let meeting_file = area.next_take().unwrap();
+        let high_file = area.next_take().unwrap();
+        let meeting_path = meeting_file.path().to_path_buf();
+        let high_path = high_file.path().to_path_buf();
+        let mut meeting = Session::Idle;
+        let mut high = Session::Idle;
+        start_quality(
+            &mut meeting,
+            PcmSource::silence(),
+            NoPacketSource,
+            meeting_file,
+            ExportQuality::Meeting,
+        );
+        start_quality(
+            &mut high,
+            PcmSource::silence(),
+            NoPacketSource,
+            high_file,
+            ExportQuality::High,
+        );
+        thread::sleep(Duration::from_millis(200));
+        meeting.stop();
+        high.stop();
+        let meeting_bytes = std::fs::metadata(&meeting_path).unwrap().len();
+        let high_bytes = std::fs::metadata(&high_path).unwrap().len();
+        assert!(
+            meeting_bytes * 8 < high_bytes,
+            "meeting {meeting_bytes} B was not far smaller than high {high_bytes} B"
+        );
     }
 
     #[test]

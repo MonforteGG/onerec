@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Meter::new(microphone, Arc::clone(&microphone_meter)),
         Meter::new(loopback, Arc::clone(&loopback_meter)),
         staging,
+        onerec::ExportQuality::Standard,
     );
     thread::sleep(Duration::from_secs(2));
     session.stop();
@@ -65,7 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     probe::report("microphone", &microphone_meter);
     probe::report("loopback", &loopback_meter);
-    let mixed_frames = std::fs::metadata(pending.staging_file())?.len() / 8;
+    let mixed_frames = std::fs::metadata(pending.staging_file())?.len()
+        / pending.quality().staging_frame_bytes() as u64;
     println!(
         "mixed: {} frames over {:?}, degraded {}",
         mixed_frames,

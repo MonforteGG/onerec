@@ -308,6 +308,7 @@ impl Recorder {
             self.microphone_vu.tap(mic),
             self.system_vu.tap(sys),
             staging,
+            self.quality,
         );
         self.dismiss_failed_start();
     }
@@ -344,7 +345,7 @@ impl Recorder {
     }
 
     fn save_to(&mut self, destination: &std::path::Path) {
-        match self.session.save_as(destination, self.quality) {
+        match self.session.save_as(destination) {
             Ok(()) => {
                 if matches!(self.session, Session::Saving(_)) {
                     self.notice = None;
@@ -422,7 +423,7 @@ impl Recorder {
     }
 
     fn select_quality(&mut self, index: usize) {
-        if matches!(self.session, Session::Recording(_) | Session::Saving(_)) {
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
             return;
         }
         let Some(quality) = ExportQuality::from_index(index) else {
@@ -494,10 +495,6 @@ impl Recorder {
             None
         };
         let pickers_enabled = matches!(self.session, Session::Idle | Session::Failed(_));
-        let quality_enabled = matches!(
-            self.session,
-            Session::Idle | Session::Failed(_) | Session::AwaitingSave(_)
-        );
         let recording = matches!(self.session, Session::Recording(_));
         View {
             phase: match self.session {
@@ -518,7 +515,7 @@ impl Recorder {
             },
             quality: Selector {
                 selected: Some(self.quality.index()),
-                enabled: quality_enabled,
+                enabled: pickers_enabled,
             },
             transport: self.transport(),
             elapsed: format_elapsed(self.session.elapsed().unwrap_or_default()),
@@ -1109,20 +1106,23 @@ mod tests {
     }
 
     #[test]
-    fn quality_stays_enabled_while_awaiting_save() {
+    fn quality_is_locked_while_awaiting_save() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         let stopped = stop_take(&mut recorder);
-        assert!(stopped.quality.enabled);
-        let changed = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
-        assert_eq!(changed.quality.selected, Some(ExportQuality::High.index()));
+        assert!(!stopped.quality.enabled);
+        let ignored = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert_eq!(
+            ignored.quality.selected,
+            Some(ExportQuality::Meeting.index())
+        );
         recorder.apply(Intent::Discard);
     }
 
     #[test]
-    fn choose_quality_before_save_to_sets_the_file_bitrate() {
+    fn choose_quality_before_recording_sets_the_file_bitrate() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
-        stop_take(&mut recorder);
         recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        stop_take(&mut recorder);
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("take.mp3");
         recorder.apply(Intent::SaveTo(path.clone()));

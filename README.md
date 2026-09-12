@@ -10,7 +10,7 @@ onerec records a Windows meeting into one mixed MP3.
 4. Select **Start recording**, or press **Ctrl+Shift+R**.
 5. Watch the meter under each device and the elapsed time.
 6. Select **Stop recording**, or press **Ctrl+Shift+R** again.
-7. Select **Save recording…**. The dialog suggests a dated name such as `2026-09-12 14-03 Meeting.mp3` and opens in the last folder you saved to.
+7. Select **Save recording…**. The dialog suggests a dated name such as `2026-09-12 14-03 Meeting.mp3` and opens in the last folder you saved to. Quality is locked for that take: pick it before you press Start.
 8. After saving, select **Open folder** to find the file.
 
 The next launch restores the last microphone, output device, MP3 quality, and save folder. Choices live in `onerec.ini` next to the executable.
@@ -18,7 +18,7 @@ The next launch restores the last microphone, output device, MP3 quality, and sa
 If you cancel the save dialog, onerec keeps the recording and stays in Awaiting save.
 Choose **Save recording…** to retry or **Discard…** to delete the take after confirmation. You cannot start another recording until you do. Stopping does not open the save dialog automatically.
 
-Staging is always 48 kHz stereo PCM. Meeting and Voice downsample and downmix when the MP3 is written.
+Capture and mixing stay at 48 kHz stereo. The temporary take is folded to the chosen quality as it is written: Meeting is 8 kHz mono (~115 MB/h), Voice is 16 kHz mono (~230 MB/h), Compact and above stay 48 kHz stereo (~1.4 GB/h). You cannot re-export a Meeting take as High.
 
 v1 is a portable Windows 10 executable. This commit has WASAPI capture, the recorder window, and statically linked LAME 3.100.
 

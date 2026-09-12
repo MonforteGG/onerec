@@ -7,18 +7,15 @@ use std::time::{Duration, Instant};
 
 use mp3lame_encoder::{Bitrate, Builder, Encoder, FlushNoGap, InterleavedPcm, Mode, Quality};
 
-use crate::timeline::MIX_SAMPLE_RATE;
+use crate::timeline::{MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE};
 
-const CHANNELS: u8 = 2;
-const STEREO_FRAME_BYTES: u64 = 8;
-const CHUNK_FRAMES: usize = MIX_SAMPLE_RATE as usize / 10;
+const SAMPLE_BYTES: usize = 4;
 const FLUSH_CAPACITY: usize = 7200;
 
 static NEXT_PART: AtomicU64 = AtomicU64::new(0);
 
 struct Profile {
     bitrate: Bitrate,
-    output_hz: u32,
     mode: Mode,
 }
 
@@ -86,32 +83,67 @@ impl ExportQuality {
         match self {
             Self::Meeting => Profile {
                 bitrate: Bitrate::Kbps8,
-                output_hz: 8_000,
                 mode: Mode::Mono,
             },
             Self::Voice => Profile {
                 bitrate: Bitrate::Kbps24,
-                output_hz: 16_000,
                 mode: Mode::Mono,
             },
             Self::Compact => Profile {
                 bitrate: Bitrate::Kbps128,
-                output_hz: 48_000,
                 mode: Mode::JointStereo,
             },
             Self::Standard => Profile {
                 bitrate: Bitrate::Kbps192,
-                output_hz: 48_000,
                 mode: Mode::JointStereo,
             },
             Self::High => Profile {
                 bitrate: Bitrate::Kbps320,
-                output_hz: 48_000,
                 mode: Mode::JointStereo,
             },
         }
     }
+
+    /// Sample rate of the PCM take. Matches the MP3, so Meeting cannot be
+    /// re-exported as High later.
+    pub const fn staging_hz(self) -> u32 {
+        match self {
+            Self::Meeting => 8_000,
+            Self::Voice => 16_000,
+            Self::Compact | Self::Standard | Self::High => 48_000,
+        }
+    }
+
+    pub const fn staging_channels(self) -> u8 {
+        match self {
+            Self::Meeting | Self::Voice => 1,
+            Self::Compact | Self::Standard | Self::High => 2,
+        }
+    }
+
+    pub const fn staging_frame_bytes(self) -> usize {
+        SAMPLE_BYTES * self.staging_channels() as usize
+    }
+
+    pub const fn staging_factor(self) -> usize {
+        MIX_SAMPLE_RATE as usize / self.staging_hz() as usize
+    }
+
+    const fn chunk_frames(self) -> usize {
+        self.staging_hz() as usize / 10
+    }
 }
+
+const _: () = {
+    let mut i = 0;
+    while i < ExportQuality::ALL.len() {
+        let quality = ExportQuality::ALL[i];
+        assert!(MIX_SAMPLE_RATE % quality.staging_hz() == 0);
+        assert!(MIX_QUANTUM_FRAMES % quality.staging_factor() == 0);
+        assert!(quality.staging_hz() % 10 == 0);
+        i += 1;
+    }
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaveProgress {
@@ -139,6 +171,8 @@ pub(crate) struct Encode {
     destination: PathBuf,
     total: u64,
     done: u64,
+    frame_bytes: u64,
+    channels: u8,
     raw: Vec<u8>,
     pcm: Vec<f32>,
     encoded: Vec<u8>,
@@ -151,25 +185,30 @@ impl Encode {
         staged: &Path,
         quality: ExportQuality,
     ) -> io::Result<Self> {
+        let frame_bytes = quality.staging_frame_bytes() as u64;
         let bytes = fs::metadata(staged)?.len();
-        if bytes % STEREO_FRAME_BYTES != 0 {
+        if bytes % frame_bytes != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "staging file is not a whole number of stereo frames",
+                "staging file is not a whole number of PCM frames",
             ));
         }
         let encoder = lame(quality)?;
         let src = File::open(staged)?;
         let part = PartFile::create(destination)?;
+        let chunk_frames = quality.chunk_frames();
+        let channels = quality.staging_channels();
         Ok(Self {
             encoder,
             src,
             part: Some(part),
             destination: destination.to_path_buf(),
-            total: bytes / STEREO_FRAME_BYTES,
+            total: bytes / frame_bytes,
             done: 0,
-            raw: vec![0u8; CHUNK_FRAMES * STEREO_FRAME_BYTES as usize],
-            pcm: Vec::with_capacity(CHUNK_FRAMES * usize::from(CHANNELS)),
+            frame_bytes,
+            channels,
+            raw: vec![0u8; chunk_frames * frame_bytes as usize],
+            pcm: Vec::with_capacity(chunk_frames * usize::from(channels)),
             encoded: Vec::new(),
             armed_flush: false,
         })
@@ -207,22 +246,22 @@ impl Encode {
             self.armed_flush = true;
             return Ok(false);
         }
-        if n as u64 % STEREO_FRAME_BYTES != 0 {
+        if n as u64 % self.frame_bytes != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "staging file is not a whole number of stereo frames",
+                "staging file is not a whole number of PCM frames",
             ));
         }
         self.pcm.clear();
         self.pcm.extend(
             self.raw[..n]
-                .chunks_exact(4)
+                .chunks_exact(SAMPLE_BYTES)
                 .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())),
         );
         self.encoded.clear();
         self.encoded
             .reserve(mp3lame_encoder::max_required_buffer_size(
-                self.pcm.len() / 2,
+                self.pcm.len() / usize::from(self.channels),
             ));
         self.encoder
             .encode_to_vec(InterleavedPcm(self.pcm.as_slice()), &mut self.encoded)
@@ -231,7 +270,7 @@ impl Encode {
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "part file is closed"))?
             .write_all(&self.encoded)?;
-        self.done += n as u64 / STEREO_FRAME_BYTES;
+        self.done += n as u64 / self.frame_bytes;
         Ok(false)
     }
 
@@ -272,15 +311,16 @@ fn fill(src: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 
 fn lame(quality: ExportQuality) -> io::Result<Encoder> {
     let profile = quality.profile();
+    let hz = quality.staging_hz();
     let mut builder = Builder::new().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "could not allocate the MP3 encoder")
     })?;
-    builder.set_num_channels(CHANNELS).map_err(encode_fail)?;
     builder
-        .set_sample_rate(MIX_SAMPLE_RATE)
+        .set_num_channels(quality.staging_channels())
         .map_err(encode_fail)?;
+    builder.set_sample_rate(hz).map_err(encode_fail)?;
     builder
-        .set_output_sample_rate(NonZeroU32::new(profile.output_hz))
+        .set_output_sample_rate(NonZeroU32::new(hz))
         .map_err(encode_fail)?;
     builder.set_brate(profile.bitrate).map_err(encode_fail)?;
     builder.set_quality(Quality::Best).map_err(encode_fail)?;
@@ -457,28 +497,39 @@ mod tests {
 
     const SECOND_FRAMES: usize = MIX_SAMPLE_RATE as usize;
 
-    fn stage_frames(path: &Path, frames: usize, sample: impl Fn(usize) -> [f32; 2]) {
-        let mut bytes = Vec::with_capacity(frames * STEREO_FRAME_BYTES as usize);
+    fn stage_frames(
+        path: &Path,
+        quality: ExportQuality,
+        frames: usize,
+        sample: impl Fn(usize) -> [f32; 2],
+    ) {
+        let mut bytes = Vec::with_capacity(frames * quality.staging_frame_bytes());
         for i in 0..frames {
             let [left, right] = sample(i);
-            bytes.extend_from_slice(&left.to_le_bytes());
-            bytes.extend_from_slice(&right.to_le_bytes());
+            if quality.staging_channels() == 1 {
+                bytes.extend_from_slice(&((left + right) * 0.5).clamp(-1.0, 1.0).to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&left.to_le_bytes());
+                bytes.extend_from_slice(&right.to_le_bytes());
+            }
         }
         fs::write(path, bytes).unwrap();
     }
 
-    fn sine_frame(i: usize) -> [f32; 2] {
-        let t = i as f32 / MIX_SAMPLE_RATE as f32;
+    fn sine_frame(i: usize, hz: u32) -> [f32; 2] {
+        let t = i as f32 / hz as f32;
         [
             (t * 440.0 * 2.0 * PI).sin() * 0.5,
             (t * 660.0 * 2.0 * PI).sin() * 0.25,
         ]
     }
 
-    fn encode_frames(dir: &Path, name: &str, frames: usize, quality: ExportQuality) -> Vec<u8> {
+    fn encode_seconds(dir: &Path, name: &str, seconds: usize, quality: ExportQuality) -> Vec<u8> {
+        let hz = quality.staging_hz();
+        let frames = hz as usize * seconds;
         let staged = dir.join(format!("{name}.f32"));
         let dest = dir.join(name);
-        stage_frames(&staged, frames, sine_frame);
+        stage_frames(&staged, quality, frames, |i| sine_frame(i, hz));
         write(&dest, &staged, quality).unwrap();
         fs::read(&dest).unwrap()
     }
@@ -500,6 +551,18 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().contains("onerec-part"))
             .count()
+    }
+
+    #[test]
+    fn meeting_stages_8khz_mono() {
+        assert_eq!(ExportQuality::Meeting.staging_hz(), 8_000);
+        assert_eq!(ExportQuality::Meeting.staging_channels(), 1);
+        assert_eq!(ExportQuality::Meeting.staging_factor(), 6);
+        assert_eq!(ExportQuality::Voice.staging_hz(), 16_000);
+        assert_eq!(ExportQuality::Voice.staging_channels(), 1);
+        assert_eq!(ExportQuality::High.staging_hz(), 48_000);
+        assert_eq!(ExportQuality::High.staging_channels(), 2);
+        assert_eq!(ExportQuality::High.staging_factor(), 1);
     }
 
     #[test]
@@ -541,12 +604,7 @@ mod tests {
     #[test]
     fn writes_one_second_of_mpeg_layer_iii() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(
-            dir.path(),
-            "one-second",
-            SECOND_FRAMES,
-            ExportQuality::Standard,
-        );
+        let mp3 = encode_seconds(dir.path(), "one-second", 1, ExportQuality::Standard);
         assert_eq!(mp3.len(), 24_192);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert_eq!(frames.len(), 42);
@@ -559,7 +617,7 @@ mod tests {
     #[test]
     fn compact_headers_are_128_kbps() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(dir.path(), "compact", SECOND_FRAMES, ExportQuality::Compact);
+        let mp3 = encode_seconds(dir.path(), "compact", 1, ExportQuality::Compact);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
@@ -571,7 +629,7 @@ mod tests {
     #[test]
     fn high_headers_are_320_kbps() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(dir.path(), "high", SECOND_FRAMES, ExportQuality::High);
+        let mp3 = encode_seconds(dir.path(), "high", 1, ExportQuality::High);
         let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
@@ -583,8 +641,8 @@ mod tests {
     #[test]
     fn meeting_headers_are_8_kbps_8_khz_mono() {
         let dir = tempfile::tempdir().unwrap();
-        let meeting = encode_frames(dir.path(), "meeting", SECOND_FRAMES, ExportQuality::Meeting);
-        let compact = encode_frames(dir.path(), "compact", SECOND_FRAMES, ExportQuality::Compact);
+        let meeting = encode_seconds(dir.path(), "meeting", 1, ExportQuality::Meeting);
+        let compact = encode_seconds(dir.path(), "compact", 1, ExportQuality::Compact);
         let frames = parse_layer3_cbr(&meeting).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
@@ -601,7 +659,7 @@ mod tests {
     #[test]
     fn voice_headers_are_24_kbps_16_khz_mono() {
         let dir = tempfile::tempdir().unwrap();
-        let mp3 = encode_frames(dir.path(), "voice", SECOND_FRAMES, ExportQuality::Voice);
+        let mp3 = encode_seconds(dir.path(), "voice", 1, ExportQuality::Voice);
         let frames = parse_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
@@ -612,18 +670,8 @@ mod tests {
     #[test]
     fn longer_pcm_yields_more_mpeg_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let short = encode_frames(
-            dir.path(),
-            "one-second",
-            SECOND_FRAMES,
-            ExportQuality::Standard,
-        );
-        let long = encode_frames(
-            dir.path(),
-            "two-seconds",
-            SECOND_FRAMES * 2,
-            ExportQuality::Standard,
-        );
+        let short = encode_seconds(dir.path(), "one-second", 1, ExportQuality::Standard);
+        let long = encode_seconds(dir.path(), "two-seconds", 2, ExportQuality::Standard);
         let short_frames = parse_mpeg1_layer3_cbr(&short).unwrap();
         let long_frames = parse_mpeg1_layer3_cbr(&long).unwrap();
         assert!(
@@ -643,7 +691,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take");
-        stage_frames(&staged, SECOND_FRAMES, sine_frame);
+        stage_frames(&staged, ExportQuality::Standard, SECOND_FRAMES, |i| {
+            sine_frame(i, MIX_SAMPLE_RATE)
+        });
         write(&dest, &staged, ExportQuality::Standard).unwrap();
         let mp3 = fs::read(&dest).unwrap();
         assert_eq!(mp3.len(), 24_192);
@@ -655,7 +705,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
         let dest = dir.path().join("take.mp3");
-        stage_frames(&staged, SECOND_FRAMES, sine_frame);
+        stage_frames(&staged, ExportQuality::Standard, SECOND_FRAMES, |i| {
+            sine_frame(i, MIX_SAMPLE_RATE)
+        });
         fs::write(&dest, b"old").unwrap();
         write(&dest, &staged, ExportQuality::Standard).unwrap();
         let mp3 = fs::read(&dest).unwrap();
@@ -679,7 +731,9 @@ mod tests {
     fn unwritable_destination_unlinks_the_part() {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("take.f32");
-        stage_frames(&staged, SECOND_FRAMES, |_| [0.0, 0.0]);
+        stage_frames(&staged, ExportQuality::Standard, SECOND_FRAMES, |_| {
+            [0.0, 0.0]
+        });
         write(dir.path(), &staged, ExportQuality::Standard).unwrap_err();
         assert_eq!(leftovers(dir.path()), 0);
         assert!(dir.path().is_dir());
@@ -690,13 +744,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("ten.f32");
         let dest = dir.path().join("ten.mp3");
-        stage_frames(&staged, CHUNK_FRAMES * 10, sine_frame);
+        let chunk = ExportQuality::Standard.chunk_frames();
+        stage_frames(&staged, ExportQuality::Standard, chunk * 10, |i| {
+            sine_frame(i, MIX_SAMPLE_RATE)
+        });
         let mut encode = Encode::start(&dest, &staged, ExportQuality::Standard).unwrap();
         assert_eq!(
             encode.progress(),
             SaveProgress {
                 done: 0,
-                total: CHUNK_FRAMES as u64 * 10
+                total: chunk as u64 * 10
             }
         );
         assert!(!encode.pump(Duration::ZERO).unwrap());
@@ -718,7 +775,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("one.f32");
         let dest = dir.path().join("one.mp3");
-        stage_frames(&staged, CHUNK_FRAMES, sine_frame);
+        let chunk = ExportQuality::Standard.chunk_frames();
+        stage_frames(&staged, ExportQuality::Standard, chunk, |i| {
+            sine_frame(i, MIX_SAMPLE_RATE)
+        });
         let mut encode = Encode::start(&dest, &staged, ExportQuality::Standard).unwrap();
         assert!(!encode.pump(Duration::ZERO).unwrap());
         while encode.progress().done < encode.progress().total {

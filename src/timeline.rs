@@ -7,6 +7,43 @@ const _: () = assert!(
     MIX_SAMPLE_RATE as u64 * MIX_TICK.as_millis() as u64 == MIX_QUANTUM_FRAMES as u64 * 1_000
 );
 
+/// Average `factor` mix frames into the staging PCM layout and append LE f32 bytes.
+///
+/// Meeting and Voice are mono: each output sample is the mean of both channels
+/// over `factor` mix frames (6 at 8 kHz, 3 at 16 kHz). Compact and above stay
+/// 48 kHz stereo (`factor` 1, two samples per frame).
+pub fn fold_mix(frames: &[[f32; 2]], factor: usize, channels: u8, out: &mut Vec<u8>) {
+    debug_assert!(factor > 0);
+    debug_assert_eq!(frames.len() % factor, 0);
+    out.clear();
+    match channels {
+        1 => {
+            let n = 2.0 * factor as f32;
+            for chunk in frames.chunks_exact(factor) {
+                let acc: f32 = chunk.iter().map(|[left, right]| left + right).sum();
+                out.extend_from_slice(&(acc / n).clamp(-1.0, 1.0).to_le_bytes());
+            }
+        }
+        2 if factor == 1 => {
+            for [left, right] in frames {
+                out.extend_from_slice(&left.to_le_bytes());
+                out.extend_from_slice(&right.to_le_bytes());
+            }
+        }
+        2 => {
+            let n = factor as f32;
+            for chunk in frames.chunks_exact(factor) {
+                let (left, right) = chunk
+                    .iter()
+                    .fold((0.0, 0.0), |(l, r), [ml, mr]| (l + *ml, r + *mr));
+                out.extend_from_slice(&(left / n).clamp(-1.0, 1.0).to_le_bytes());
+                out.extend_from_slice(&(right / n).clamp(-1.0, 1.0).to_le_bytes());
+            }
+        }
+        _ => debug_assert!(false, "staging is mono or stereo"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Draw {
     pub discard: usize,
@@ -100,6 +137,26 @@ mod tests {
                 pad: 0,
             }
         );
+    }
+
+    #[test]
+    fn fold_mix_meeting_averages_six_stereo_frames_to_one_mono() {
+        let mut frames = [[0.0; 2]; 6];
+        frames[0] = [1.0, 1.0];
+        frames[1] = [-1.0, -1.0];
+        let mut out = Vec::new();
+        fold_mix(&frames, 6, 1, &mut out);
+        assert_eq!(out.len(), 4);
+        assert_eq!(f32::from_le_bytes(out.try_into().unwrap()), 0.0);
+    }
+
+    #[test]
+    fn fold_mix_stereo_passthrough_keeps_both_channels() {
+        let mut out = Vec::new();
+        fold_mix(&[[0.25, -0.5]], 1, 2, &mut out);
+        assert_eq!(out.len(), 8);
+        assert_eq!(f32::from_le_bytes(out[..4].try_into().unwrap()), 0.25);
+        assert_eq!(f32::from_le_bytes(out[4..].try_into().unwrap()), -0.5);
     }
 
     #[test]
