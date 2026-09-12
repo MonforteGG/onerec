@@ -123,7 +123,7 @@ fn fixture(phase: Phase) -> View {
         }),
         microphone: Selector { selected: Some(0), enabled },
         output: Selector { selected: Some(0), enabled },
-        quality: Selector { selected: Some(1), enabled: enabled || pending },
+        quality: Selector { selected: Some(1), enabled },
         transport: Transport {
             toggle_label: if recording { "Stop recording" } else { "Start recording" },
             toggle_enabled: recording || enabled,
