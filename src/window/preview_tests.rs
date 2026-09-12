@@ -56,6 +56,7 @@ fn render_native_states() {
             for phase in [
                 Phase::Idle,
                 Phase::Recording,
+                Phase::Paused,
                 Phase::AwaitingSave,
                 Phase::Saving,
                 Phase::Failed,
@@ -113,6 +114,7 @@ unsafe fn settle(root: HWND) {
 
 fn fixture(phase: Phase) -> View {
     let recording = phase == Phase::Recording;
+    let paused = phase == Phase::Paused;
     let pending = phase == Phase::AwaitingSave;
     let saving = phase == Phase::Saving;
     let enabled = phase == Phase::Idle || phase == Phase::Failed;
@@ -126,8 +128,8 @@ fn fixture(phase: Phase) -> View {
         output: Selector { selected: Some(0), enabled },
         quality: Selector { selected: Some(1), enabled },
         transport: Transport {
-            toggle_label: if recording { "Stop recording" } else { "Start recording" },
-            toggle_enabled: recording || enabled,
+            toggle_label: if recording || paused { "Stop recording" } else { "Start recording" },
+            toggle_enabled: recording || paused || enabled,
             save_enabled: pending, discard_enabled: pending,
         },
         elapsed: if phase == Phase::Idle { "00:00" } else { "1:23:45" }.into(),
@@ -140,6 +142,7 @@ fn fixture(phase: Phase) -> View {
             text: match phase {
                 Phase::Idle => "Ready. Ctrl+Shift+R starts recording.",
                 Phase::Recording => "Recording.",
+                Phase::Paused => "Recording paused.",
                 Phase::AwaitingSave => "Save cancelled. The take is kept.",
                 Phase::Saving => "Saving MP3…",
                 Phase::Failed => "The output device disconnected. Connect it again and choose a device before starting a new recording.",

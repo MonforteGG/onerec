@@ -25,6 +25,7 @@ pub(crate) const ID_DISCARD: u16 = 105;
 pub(crate) const ID_QUALITY: u16 = 106;
 pub(crate) const ID_FOLDER: u16 = 107;
 pub(crate) const ID_REFRESH: u16 = 108;
+pub(crate) const ID_PAUSE: u16 = 110;
 const MICROPHONE_Y: i32 = 130;
 
 pub(crate) struct Controls {
@@ -39,6 +40,7 @@ pub(crate) struct Controls {
     toggle: HWND,
     save: HWND,
     discard: HWND,
+    pause: HWND,
     folder: HWND,
     refresh: HWND,
     elapsed: HWND,
@@ -101,6 +103,7 @@ impl Controls {
         let toggle = button(root, instance, ID_TOGGLE, w!("Start &recording"))?;
         let save = button(root, instance, ID_SAVE, w!("&Save recording…"))?;
         let discard = button(root, instance, ID_DISCARD, w!("&Discard…"))?;
+        let pause = button(root, instance, ID_PAUSE, w!("&Pause"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
         let controls = Self {
@@ -115,6 +118,7 @@ impl Controls {
             toggle,
             save,
             discard,
+            pause,
             folder,
             refresh,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
@@ -145,6 +149,7 @@ impl Controls {
         for control in [
             save,
             discard,
+            pause,
             folder,
             refresh,
             controls.progress,
@@ -168,7 +173,7 @@ impl Controls {
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 19] {
+    fn all(&self) -> [HWND; 20] {
         [
             self.microphone_label,
             self.microphones,
@@ -181,6 +186,7 @@ impl Controls {
             self.toggle,
             self.save,
             self.discard,
+            self.pause,
             self.folder,
             self.refresh,
             self.elapsed,
@@ -243,6 +249,7 @@ impl Controls {
         place(self.save, 256, 36, 204, 40);
         place(self.shortcut, 256, 80, 204, 18);
         place(self.discard, 356, 80, 104, 24);
+        place(self.pause, 356, 80, 104, 24);
         place(self.microphone_label, 20, 110, 440, 18);
         place(self.microphones, 20, 130, 440, 220);
         place(self.microphone_level, 364, 155, 96, 20);
@@ -355,6 +362,7 @@ impl Controls {
     pub(crate) fn show(&mut self, root: HWND, view: &View) {
         let pending = view.phase == Phase::AwaitingSave;
         let saving = view.phase == Phase::Saving;
+        let live = matches!(view.phase, Phase::Recording | Phase::Paused);
         let phase_changed = self.painted.phase != Some(view.phase);
         if phase_changed && !matches!(view.phase, Phase::Idle | Phase::Failed) {
             for list in [self.microphones, self.outputs, self.quality] {
@@ -389,11 +397,20 @@ impl Controls {
             visible(self.toggle, !pending && !saving);
             visible(self.save, pending || saving);
             visible(self.discard, pending);
-            visible(self.shortcut, !pending && !saving);
+            visible(self.pause, live);
+            visible(self.shortcut, !pending && !saving && !live);
             visible(self.quality, !saving);
             visible(self.quality_label, !saving);
             visible(self.progress, saving);
             visible(self.progress_label, saving);
+            set_text(
+                self.pause,
+                if view.phase == Phase::Paused {
+                    "&Resume"
+                } else {
+                    "&Pause"
+                },
+            );
             set_text(
                 self.save,
                 if saving {
@@ -407,7 +424,7 @@ impl Controls {
             self.painted.toggle_label = view.transport.toggle_label;
             set_text(
                 self.toggle,
-                if view.phase == Phase::Recording {
+                if matches!(view.phase, Phase::Recording | Phase::Paused) {
                     "Stop &recording"
                 } else {
                     "Start &recording"
@@ -438,6 +455,7 @@ impl Controls {
             Phase::Idle => "Ready to record",
             Phase::Recording if view.status.tone == Tone::Warning => "Recording · check audio",
             Phase::Recording => "Recording",
+            Phase::Paused => "Recording paused",
             Phase::AwaitingSave => "Recording not saved",
             Phase::Saving => "Saving MP3",
             Phase::Failed => "Needs attention",
@@ -455,6 +473,9 @@ impl Controls {
                 "Levels appear when recording.".into()
             }
             (Phase::Recording, "Recording.") => "Recording microphone and system audio.".into(),
+            (Phase::Paused, "Recording paused.") => {
+                "Recording paused. Stop still ends the take.".into()
+            }
             (Phase::Saving, "Saving MP3…") => {
                 "You can keep working while the MP3 is saved.".into()
             }

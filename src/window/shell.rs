@@ -32,7 +32,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 
 use super::paint::{
     Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
-    ID_QUALITY, ID_REFRESH, ID_SAVE, ID_TOGGLE,
+    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_TOGGLE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
@@ -624,6 +624,7 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         }
         (CBN_DROPDOWN, ID_MICROPHONE | ID_OUTPUT) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
+        (BN_CLICKED, ID_PAUSE) => Some(Intent::Pause),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
         (BN_CLICKED, ID_DISCARD) => Some(Intent::RequestDiscard),
         (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),

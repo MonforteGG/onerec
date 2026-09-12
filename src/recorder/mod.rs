@@ -31,6 +31,7 @@ pub(crate) enum Intent {
     ChooseOutput(usize),
     ChooseQuality(usize),
     Toggle,
+    Pause,
     Save,
     SaveTo(PathBuf),
     CancelSave,
@@ -61,6 +62,7 @@ pub(crate) struct View {
 pub(crate) enum Phase {
     Idle,
     Recording,
+    Paused,
     AwaitingSave,
     Saving,
     Failed,
@@ -224,6 +226,7 @@ impl Recorder {
             Intent::ChooseOutput(index) => self.select_output(index),
             Intent::ChooseQuality(index) => self.select_quality(index),
             Intent::Toggle => self.toggle(),
+            Intent::Pause => self.pause(),
             Intent::Save => self.request_destination(),
             Intent::SaveTo(path) => self.save_to(&path),
             Intent::CancelSave => self.cancel_save(),
@@ -247,7 +250,7 @@ impl Recorder {
     fn toggle(&mut self) {
         if matches!(self.session, Session::Idle) {
             self.begin();
-        } else if matches!(self.session, Session::Recording(_)) {
+        } else if matches!(self.session, Session::Recording(_) | Session::Paused(_)) {
             self.session.stop();
             self.microphone_vu.reset();
             self.system_vu.reset();
@@ -312,6 +315,14 @@ impl Recorder {
             self.quality,
         );
         self.dismiss_failed_start();
+    }
+
+    fn pause(&mut self) {
+        match &self.session {
+            Session::Recording(_) => self.session.pause(),
+            Session::Paused(_) => self.session.resume(),
+            _ => {}
+        }
     }
 
     fn dismiss_failed_start(&mut self) {
@@ -472,14 +483,15 @@ impl Recorder {
     fn consider_closing(&mut self) {
         self.pending_ask = Some(match &self.session {
             Session::Idle | Session::Failed(_) => Ask::Close,
-            Session::Recording(_) | Session::AwaitingSave(_) | Session::Saving(_) => {
-                Ask::ConfirmClose
-            }
+            Session::Recording(_)
+            | Session::Paused(_)
+            | Session::AwaitingSave(_)
+            | Session::Saving(_) => Ask::ConfirmClose,
         });
     }
 
     fn abandon_and_close(&mut self) {
-        if matches!(self.session, Session::Recording(_)) {
+        if matches!(self.session, Session::Recording(_) | Session::Paused(_)) {
             self.session.stop();
         }
         let _ = self.session.discard();
@@ -501,6 +513,7 @@ impl Recorder {
             phase: match self.session {
                 Session::Idle => Phase::Idle,
                 Session::Recording(_) => Phase::Recording,
+                Session::Paused(_) => Phase::Paused,
                 Session::AwaitingSave(_) => Phase::AwaitingSave,
                 Session::Saving(_) => Phase::Saving,
                 Session::Failed(_) => Phase::Failed,
@@ -532,7 +545,10 @@ impl Recorder {
                 }
             },
             progress: self.session.save_progress(),
-            status: if matches!(self.session, Session::Recording(_) | Session::Saving(_)) {
+            status: if matches!(
+                self.session,
+                Session::Recording(_) | Session::Paused(_) | Session::Saving(_)
+            ) {
                 self.derived_status()
             } else {
                 self.notice.clone().unwrap_or_else(|| self.derived_status())
@@ -550,7 +566,7 @@ impl Recorder {
                 save_enabled: false,
                 discard_enabled: false,
             },
-            Session::Recording(_) => Transport {
+            Session::Recording(_) | Session::Paused(_) => Transport {
                 toggle_label: "Stop recording",
                 toggle_enabled: true,
                 save_enabled: false,
@@ -589,6 +605,10 @@ impl Recorder {
                 text: "Recording.".into(),
                 tone: Tone::Recording,
             },
+            Session::Paused(_) if self.session.is_degraded() => {
+                warn("Recording paused. One device dropped out; the other is still being recorded.")
+            }
+            Session::Paused(_) => neutral("Recording paused."),
             Session::AwaitingSave(_) => {
                 neutral("Take ready. Save or discard it before the next one.")
             }
@@ -1209,6 +1229,63 @@ mod tests {
     }
 
     #[test]
+    fn toggle_while_paused_stops() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        let paused = recorder.apply(Intent::Pause);
+        assert_eq!(paused.phase, Phase::Paused);
+        assert_eq!(paused.transport.toggle_label, "Stop recording");
+        let stopped = recorder.apply(Intent::Toggle);
+        assert_eq!(stopped.phase, Phase::AwaitingSave);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn pause_locks_quality() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::ChooseQuality(ExportQuality::Compact.index()));
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        recorder.apply(Intent::Pause);
+        let ignored = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert_eq!(ignored.phase, Phase::Paused);
+        assert!(!ignored.quality.enabled);
+        assert_eq!(
+            ignored.quality.selected,
+            Some(ExportQuality::Compact.index())
+        );
+        recorder.apply(Intent::Toggle);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn elapsed_does_not_advance_while_paused() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        recorder.apply(Intent::Pause);
+        let frozen = recorder.session.elapsed().expect("paused elapsed");
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(recorder.session.elapsed(), Some(frozen));
+        recorder.apply(Intent::Toggle);
+        recorder.apply(Intent::Discard);
+    }
+
+    #[test]
+    fn discard_and_close_stops_a_paused_take_first() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        recorder.apply(Intent::Pause);
+        let closing = recorder.apply(Intent::DiscardAndClose);
+        assert_eq!(closing.ask, Some(Ask::Close));
+        assert_eq!(closing.transport.toggle_label, "Start recording");
+        assert!(!closing.transport.save_enabled);
+        assert_eq!(closing.phase, Phase::Idle);
+    }
+
+    #[test]
     fn a_taken_hotkey_says_so_and_leaves_the_button() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         let view = recorder.apply(Intent::HotkeyUnavailable);
@@ -1251,7 +1328,7 @@ mod tests {
 
     #[test]
     fn timer_sleeps_when_idle_without_stalling_export_when_minimized() {
-        for phase in [Phase::Idle, Phase::AwaitingSave, Phase::Failed] {
+        for phase in [Phase::Idle, Phase::Paused, Phase::AwaitingSave, Phase::Failed] {
             assert_eq!(phase.timer_ms(false), None);
             assert_eq!(phase.timer_ms(true), None);
         }

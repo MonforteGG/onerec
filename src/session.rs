@@ -23,6 +23,7 @@ const STAGING_BUFFER: usize = 64 * 1024;
 pub enum Session {
     Idle,
     Recording(ActiveRecording),
+    Paused(ActiveRecording),
     AwaitingSave(PendingRecording),
     Saving(ActiveSave),
     Failed(FailedSession),
@@ -102,10 +103,12 @@ impl Drop for ExportWorker {
 pub struct ActiveRecording {
     microphone: MicrophoneId,
     output: OutputDeviceId,
-    started_at: Instant,
+    recorded: Duration,
+    segment_start: Instant,
     stop_tx: Option<Sender<()>>,
     worker: Option<JoinHandle<Result<(), FailedSession>>>,
     degraded: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     staging_file: StagingFile,
     quality: ExportQuality,
 }
@@ -139,15 +142,8 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Session::Idle => write!(f, "Idle"),
-            Session::Recording(active) => f
-                .debug_struct("Recording")
-                .field("microphone", &active.microphone)
-                .field("output", &active.output)
-                .field("elapsed", &active.started_at.elapsed())
-                .field("degraded", &active.degraded.load(Ordering::SeqCst))
-                .field("quality", &active.quality)
-                .field("staging_file", &active.staging_file)
-                .finish_non_exhaustive(),
+            Session::Recording(active) => debug_live(f, "Recording", active),
+            Session::Paused(active) => debug_live(f, "Paused", active),
             Session::AwaitingSave(pending) => f
                 .debug_struct("AwaitingSave")
                 .field("elapsed", &pending.elapsed)
@@ -167,6 +163,21 @@ impl std::fmt::Debug for Session {
             Session::Failed(failed) => f.debug_tuple("Failed").field(&failed.detail).finish(),
         }
     }
+}
+
+fn debug_live(
+    f: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    active: &ActiveRecording,
+) -> std::fmt::Result {
+    f.debug_struct(name)
+        .field("microphone", &active.microphone)
+        .field("output", &active.output)
+        .field("elapsed", &active.elapsed())
+        .field("degraded", &active.degraded.load(Ordering::SeqCst))
+        .field("quality", &active.quality)
+        .field("staging_file", &active.staging_file)
+        .finish_non_exhaustive()
 }
 
 impl PendingRecording {
@@ -260,13 +271,32 @@ impl Session {
     }
 
     pub fn stop(&mut self) {
-        if !matches!(self, Session::Recording(_)) {
-            return;
-        }
-        let Session::Recording(active) = std::mem::replace(self, Session::Idle) else {
-            return;
+        *self = match std::mem::replace(self, Session::Idle) {
+            Session::Recording(active) | Session::Paused(active) => active.seal(),
+            other => other,
         };
-        *self = active.seal();
+    }
+
+    pub fn pause(&mut self) {
+        *self = match std::mem::replace(self, Session::Idle) {
+            Session::Recording(mut active) => {
+                active.recorded += active.segment_start.elapsed();
+                active.paused.store(true, Ordering::SeqCst);
+                Session::Paused(active)
+            }
+            other => other,
+        };
+    }
+
+    pub fn resume(&mut self) {
+        *self = match std::mem::replace(self, Session::Idle) {
+            Session::Paused(mut active) => {
+                active.segment_start = Instant::now();
+                active.paused.store(false, Ordering::SeqCst);
+                Session::Recording(active)
+            }
+            other => other,
+        };
     }
 
     pub fn cancel_save(&mut self) {
@@ -369,7 +399,7 @@ impl Session {
 
     pub fn elapsed(&self) -> Option<Duration> {
         match self {
-            Session::Recording(active) => Some(active.started_at.elapsed()),
+            Session::Recording(active) | Session::Paused(active) => Some(active.elapsed()),
             Session::AwaitingSave(pending) => Some(pending.elapsed),
             Session::Saving(active) => Some(active.pending.elapsed),
             Session::Idle | Session::Failed(_) => None,
@@ -378,7 +408,9 @@ impl Session {
 
     pub fn is_degraded(&self) -> bool {
         match self {
-            Session::Recording(active) => active.degraded.load(Ordering::SeqCst),
+            Session::Recording(active) | Session::Paused(active) => {
+                active.degraded.load(Ordering::SeqCst)
+            }
             Session::AwaitingSave(pending) => pending.degraded,
             Session::Saving(active) => active.pending.degraded,
             Session::Idle | Session::Failed(_) => false,
@@ -406,8 +438,10 @@ impl ActiveRecording {
         };
         let (stop_tx, stop_rx) = mpsc::channel();
         let degraded = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let degraded_worker = Arc::clone(&degraded);
-        let started_at = Instant::now();
+        let paused_worker = Arc::clone(&paused);
+        let segment_start = Instant::now();
         let worker = match thread::Builder::new()
             .name("onerec-mix".into())
             .spawn(move || {
@@ -418,6 +452,7 @@ impl ActiveRecording {
                     quality,
                     stop_rx,
                     degraded_worker,
+                    paused_worker,
                 )
             }) {
             Ok(worker) => worker,
@@ -431,13 +466,23 @@ impl ActiveRecording {
         Ok(Self {
             microphone,
             output,
-            started_at,
+            recorded: Duration::ZERO,
+            segment_start,
             stop_tx: Some(stop_tx),
             worker: Some(worker),
             degraded,
+            paused,
             staging_file,
             quality,
         })
+    }
+
+    fn elapsed(&self) -> Duration {
+        if self.paused.load(Ordering::SeqCst) {
+            self.recorded
+        } else {
+            self.recorded + self.segment_start.elapsed()
+        }
     }
 
     fn seal(mut self) -> Session {
@@ -449,7 +494,7 @@ impl ActiveRecording {
             Some(worker) => match worker.join() {
                 Ok(Ok(())) => Session::AwaitingSave(PendingRecording {
                     staging_file,
-                    elapsed: self.started_at.elapsed(),
+                    elapsed: self.elapsed(),
                     degraded: self.degraded.load(Ordering::SeqCst),
                     quality: self.quality,
                 }),
@@ -495,6 +540,7 @@ fn mix_loop(
     quality: ExportQuality,
     stop_rx: Receiver<()>,
     degraded: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> Result<(), FailedSession> {
     let mut file = BufWriter::with_capacity(STAGING_BUFFER, file);
     let mut mic_buf = VecDeque::new();
@@ -502,8 +548,9 @@ fn mix_loop(
     let mut mic_live = true;
     let mut sys_live = true;
     let mut staged = Vec::with_capacity(MIX_QUANTUM_FRAMES * quality.staging_frame_bytes());
-    let origin = Instant::now();
+    let mut origin = Instant::now();
     let mut quanta = 0u32;
+    let mut was_paused = false;
 
     loop {
         match stop_rx.try_recv() {
@@ -513,6 +560,22 @@ fn mix_loop(
 
         pull(microphone.as_mut(), &mut mic_buf, &mut mic_live, &degraded);
         pull(system.as_mut(), &mut sys_buf, &mut sys_live, &degraded);
+
+        if paused.load(Ordering::SeqCst) {
+            let _ = take_quantum(&mut mic_buf);
+            let _ = take_quantum(&mut sys_buf);
+            was_paused = true;
+            match stop_rx.recv_timeout(MIX_TICK) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            continue;
+        }
+
+        if was_paused {
+            origin = Instant::now() - MIX_TICK * quanta;
+            was_paused = false;
+        }
 
         let mic = take_quantum(&mut mic_buf);
         let sys = take_quantum(&mut sys_buf);
@@ -751,6 +814,85 @@ mod tests {
         let mut session = Session::Idle;
         session.stop();
         assert!(matches!(session, Session::Idle));
+    }
+
+    #[test]
+    fn pause_then_resume_does_not_grow_staging() {
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let path = staging.path().to_path_buf();
+        let mut session = Session::Idle;
+        start_quality(
+            &mut session,
+            PcmSource::silence(),
+            NoPacketSource,
+            staging,
+            ExportQuality::High,
+        );
+        thread::sleep(Duration::from_millis(300));
+        session.pause();
+        assert!(matches!(session, Session::Paused(_)));
+        thread::sleep(MIX_TICK * 3);
+        let paused_at = std::fs::metadata(&path).unwrap().len();
+        assert!(paused_at > 0, "need bytes on disk before pause");
+        thread::sleep(Duration::from_millis(500));
+        let still = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(still, paused_at, "paused mix wrote {still} after {paused_at}");
+        session.resume();
+        assert!(matches!(session, Session::Recording(_)));
+        session.stop();
+    }
+
+    #[test]
+    fn stop_from_paused_seals_the_take() {
+        let (mut session, path) = record_silence();
+        thread::sleep(Duration::from_millis(40));
+        session.pause();
+        assert!(matches!(session, Session::Paused(_)));
+        session.stop();
+        let Session::AwaitingSave(pending) = &session else {
+            panic!("expected AwaitingSave, got {session:?}");
+        };
+        assert_eq!(pending.staging_file(), path.as_path());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn pause_then_resume_pcm_duration_still_tracks_elapsed() {
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, staging);
+        thread::sleep(Duration::from_millis(150));
+        session.pause();
+        let frozen = session.elapsed().expect("paused elapsed");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(session.elapsed(), Some(frozen));
+        session.resume();
+        thread::sleep(Duration::from_millis(150));
+        session.stop();
+        let Session::AwaitingSave(pending) = &session else {
+            panic!("expected AwaitingSave, got {session:?}");
+        };
+        let elapsed = pending.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "elapsed {elapsed:?} dropped the live segments"
+        );
+        assert!(
+            elapsed < frozen + Duration::from_millis(280),
+            "elapsed {elapsed:?} kept paused time after freeze {frozen:?}"
+        );
+        let mixed = Duration::from_secs_f64(
+            staged_frame_count(pending.staging_file(), pending.quality()) as f64
+                / f64::from(pending.quality().staging_hz()),
+        );
+        assert!(
+            mixed + MIX_TICK * 3 >= elapsed,
+            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
+        );
+        assert!(
+            mixed <= elapsed + MIX_TICK,
+            "mixed {mixed:?} ran past elapsed {elapsed:?}"
+        );
     }
 
     #[test]
