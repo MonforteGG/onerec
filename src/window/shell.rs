@@ -13,7 +13,7 @@ use ::windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
 };
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-    IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT,
+    IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
     MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use ::windows::Win32::UI::Shell::ShellExecuteW;
@@ -34,7 +34,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 
 use super::paint::{
     Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
-    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SAVE_AS, ID_SETTINGS, ID_STOP, ID_TOGGLE,
+    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SETTINGS, ID_STOP, ID_TOGGLE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
@@ -76,14 +76,7 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
     });
     unsafe { SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize) };
     install_command_button_subclasses(&shell.borrow().controls);
-    let hotkey = unsafe {
-        RegisterHotKey(
-            root,
-            TOGGLE_HOTKEY,
-            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-            b'R' as u32,
-        )
-    };
+    let hotkey = register_shortcut(root, shell.borrow().recorder.shortcut());
     dispatch(
         root,
         match hotkey {
@@ -187,12 +180,28 @@ fn dispatch(root: HWND, intent: Intent) {
             };
             dispatch(root, next);
         }
-        Some(Ask::Settings { save_direct }) => {
-            if let Some(next) = modal(root, || super::settings::ask(root, save_direct)) {
-                dispatch(root, Intent::SetSaveDirect(next));
+        Some(Ask::Settings { shortcut }) => {
+            // Release the current shortcut so the field can capture that same
+            // combination. Save registers the new one; Cancel restores this one.
+            unsafe { let _ = UnregisterHotKey(root, TOGGLE_HOTKEY); }
+            let initial = super::settings::Settings { shortcut };
+            if let Some(next) = modal(root, || super::settings::ask(root, initial)) {
+                dispatch(root, Intent::SetSettings { shortcut: next.shortcut });
+            } else if register_shortcut(root, shortcut).is_err() {
+                dispatch(root, Intent::HotkeyUnavailable);
             }
         }
     }
+}
+
+pub(super) fn register_shortcut(root: HWND, shortcut: crate::prefs::Shortcut) -> ::windows::core::Result<()> {
+    if shortcut.0 == 0 { return Ok(()); }
+    let flags = shortcut.0 >> 8;
+    let mut modifiers = MOD_NOREPEAT;
+    if flags & 1 != 0 { modifiers |= MOD_SHIFT; }
+    if flags & 2 != 0 { modifiers |= MOD_CONTROL; }
+    if flags & 4 != 0 { modifiers |= MOD_ALT; }
+    unsafe { RegisterHotKey(root, TOGGLE_HOTKEY, modifiers, u32::from(shortcut.0 & 0xff)) }
 }
 
 fn modal<T>(root: HWND, dialog: impl FnOnce() -> T) -> T {
@@ -669,7 +678,6 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         (BN_CLICKED, ID_STOP) => Some(Intent::Stop),
         (BN_CLICKED, ID_PAUSE) => Some(Intent::Pause),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
-        (BN_CLICKED, ID_SAVE_AS) => Some(Intent::SaveAs),
         (BN_CLICKED, ID_SETTINGS) => Some(Intent::OpenSettings),
         (BN_CLICKED, ID_DISCARD) => Some(Intent::RequestDiscard),
         (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),

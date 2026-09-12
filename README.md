@@ -19,10 +19,10 @@ The V1 is a portable desktop app for Windows 10 and later, written in Rust with 
 ## Features
 
 - **Microphone + system audio.** Capture both sources together using Windows WASAPI loopback, without a meeting app integration.
-- **One window, one recording.** Device selectors, a prominent timer, separate audio meters, and clear recording and saving states. While a take is live the window shrinks to a HUD with the timer, Stop, Pause or Resume, and the shortcut.
-- **Global keyboard shortcut.** Start and stop with `Ctrl+Shift+R`, including when the app is in the background. Pause and Resume live on a separate button so the shortcut always ends the take.
+- **One window, one recording.** Device selectors, a prominent timer, separate audio meters, and clear recording and saving states. The full interface stays visible during recording, including both audio meters and Settings.
+- **Configurable global shortcut.** Start and stop with `Alt+Shift+R` by default, including when the app is in the background. Change the combination in Settings or clear it to disable the shortcut. Pause and Resume have a separate button.
 - **Five MP3 profiles.** Choose small files for speech or higher bitrates for fuller audio.
-- **Remembered preferences.** Restore your microphone, output device, quality, last save folder, and whether Save recording writes straight to that folder.
+- **Remembered preferences.** Restore your devices, quality, last successfully saved filename and folder, and keyboard shortcut.
 - **Responsive export.** Save with progress feedback while MP3 encoding runs in a background worker.
 - **Native Windows presentation.** System fonts, per-monitor DPI scaling, high-contrast support, and a multi-resolution app icon.
 
@@ -32,19 +32,25 @@ Run `onerec.exe` from a folder you can write to. No installer is required. To cr
 
 1. Select your **microphone** and the **output device** playing the meeting, such as your headphones or speakers.
 2. Choose an **MP3 quality** before recording. On the first launch, **Meeting** is selected.
-3. Click **Start recording** or press `Ctrl+Shift+R`. The window shrinks to a HUD with the timer, Stop, Pause, and the shortcut.
+3. Click **Record** or press your shortcut (`Alt+Shift+R` by default). Both microphone and system-audio meters remain visible while recording.
 4. Click **Pause** to freeze the timer and skip writing the take. Click **Resume** to continue on the same take.
-5. Click **Stop recording** or press `Ctrl+Shift+R` again. The shortcut never pauses. The window grows back for Save.
-6. Click **Save recording…**, choose a location, and wait for export to finish. While Idle, **Settings** can turn on Save directly to the last folder. Later saves then skip the dialog. **Save as…** still opens it.
+5. Click **Stop** or press the shortcut again. The shortcut never pauses, and the window keeps the same layout.
+6. Click **Save**. The save dialog always opens with the last successfully saved filename and folder. Edit the name or location as needed, then confirm and wait for export to finish.
 7. Click **Open folder** to find your MP3.
 
-The save dialog suggests a dated filename such as `2026-09-12 14-03 Meeting.mp3` and opens in your last save folder. The interface uses English labels; device names come from Windows.
+Before the first successful save, the suggested name is `Recording.mp3`. Later saves reuse your last filename exactly, without automatically adding dates or changing the name. Cancelling or a failed export does not update the remembered filename. If you keep an existing filename, Windows asks before replacing the file. The interface uses English labels; device names come from Windows.
 
 ### After stopping
 
 Stopping leaves the recording in **Awaiting save**; it does not open the save dialog automatically. Quality is locked for the current take, so choose it before pressing Start.
 
-If you cancel the dialog or an export fails, the take stays available for another save attempt. Use **Save recording…** to retry or **Discard…** to delete it after confirmation. Save or discard the current take before starting another recording.
+If you cancel the dialog or an export fails, the take stays available for another save attempt. Use **Save** to retry or **Discard** to delete it after confirmation. Save or discard the current take before starting another recording.
+
+### Settings and keyboard shortcut
+
+Open the gear at the top right, also available during recording. Under **Keyboard shortcut**, focus the field and press a combination, then click **Save**. The change applies immediately and is remembered next time. **Clear** followed by **Save** disables the global shortcut; **Cancel** keeps the previous settings. Unavailable combinations are rejected with an inline message.
+
+The shortcut is temporarily suspended while Settings is open so you can enter it without starting or stopping a take. An ongoing recording continues normally.
 
 ## MP3 quality
 
@@ -114,7 +120,7 @@ The probe lists audio devices, records two seconds from the default microphone a
 ## Troubleshooting
 
 - **Meeting audio is silent:** select the same output device your meeting app is using. Loopback captures audio playing through that device, including other apps using it.
-- **The shortcut is unavailable:** another app may already own `Ctrl+Shift+R`. Use the recording button; onerec displays a message when registration fails.
+- **The shortcut is unavailable:** another app or Windows may reserve that combination. Choose another one in Settings, or clear it and use Record / Stop instead.
 - **A device disconnects:** if one source drops out during recording, onerec reports it and continues recording the remaining source.
 - **A new recording cannot start:** save or discard the take that is awaiting save.
 - **Preferences are not remembered:** check that the folder containing `onerec.exe` is writable.

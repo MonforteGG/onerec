@@ -7,7 +7,7 @@ use ::windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPR
 use ::windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use ::windows::Win32::UI::Shell::{
     FOLDERID_Documents, FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
-    SHGetKnownFolderPath, KF_FLAG_DEFAULT, SIGDN_FILESYSPATH,
+    SHGetKnownFolderPath, FOS_OVERWRITEPROMPT, KF_FLAG_DEFAULT, SIGDN_FILESYSPATH,
 };
 
 use crate::recorder::SavePrompt;
@@ -22,6 +22,9 @@ pub(crate) fn ask_destination(owner: HWND, prompt: &SavePrompt) -> Option<PathBu
     unsafe {
         let dialog: IFileSaveDialog =
             CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        // Reusing the previous name must still require confirmation before
+        // replacing an existing recording.
+        dialog.SetOptions(dialog.GetOptions().ok()? | FOS_OVERWRITEPROMPT).ok()?;
         dialog
             .SetFileTypes(&[COMDLG_FILTERSPEC {
                 pszName: PCWSTR(label.as_ptr()),

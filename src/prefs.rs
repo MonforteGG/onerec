@@ -2,8 +2,6 @@ use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mp3::ExportQuality;
 
@@ -13,16 +11,36 @@ pub(crate) struct Prefs {
     pub output: Option<String>,
     pub quality: ExportQuality,
     pub folder: Option<PathBuf>,
-    pub save_direct: bool,
+    pub shortcut: Shortcut,
+    pub last_file_name: Option<String>,
 }
 
+/// Win32 hot-key control encoding: virtual key in the low byte, modifier flags
+/// (Shift, Ctrl, Alt, extended key) in the high byte. Zero disables registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CivilTime {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-    pub hour: u8,
-    pub minute: u8,
+pub(crate) struct Shortcut(pub u16);
+
+impl Default for Shortcut {
+    fn default() -> Self {
+        Self(0x0500 | u16::from(b'R')) // Alt + Shift + R
+    }
+}
+
+impl Shortcut {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self(0));
+        }
+        let raw = value.parse::<u16>().ok()?;
+        let key = raw & 0xff;
+        if raw == 0
+            || (raw & 0xf000 == 0 && key > 0 && ![0x10, 0x11, 0x12, 0x5b, 0x5c].contains(&key))
+        {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
 }
 
 impl Prefs {
@@ -42,7 +60,19 @@ impl Prefs {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
+            if key.trim() == "last_file_name" {
+                if valid_file_name(value) {
+                    prefs.last_file_name = Some(value.to_owned());
+                }
+                continue;
+            }
             let value = value.trim();
+            if key.trim() == "shortcut" {
+                if let Some(shortcut) = Shortcut::parse(value) {
+                    prefs.shortcut = shortcut;
+                }
+                continue;
+            }
             if value.is_empty() {
                 continue;
             }
@@ -55,7 +85,6 @@ impl Prefs {
                     }
                 }
                 "folder" => prefs.folder = Some(PathBuf::from(value)),
-                "save_direct" => prefs.save_direct = value == "1",
                 _ => {}
             }
         }
@@ -74,11 +103,14 @@ impl Prefs {
         if let Some(folder) = &self.folder {
             let _ = writeln!(&mut text, "folder={}", folder.display());
         }
-        let _ = writeln!(
-            &mut text,
-            "save_direct={}",
-            if self.save_direct { 1 } else { 0 }
-        );
+        if self.shortcut.0 == 0 {
+            let _ = writeln!(&mut text, "shortcut=");
+        } else {
+            let _ = writeln!(&mut text, "shortcut={}", self.shortcut.0);
+        }
+        if let Some(name) = &self.last_file_name {
+            let _ = writeln!(&mut text, "last_file_name={name}");
+        }
         text
     }
 
@@ -94,55 +126,14 @@ impl Prefs {
     }
 }
 
-impl CivilTime {
-    pub(crate) fn local() -> Self {
-        #[cfg(windows)]
-        {
-            let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-            return Self {
-                year: now.wYear,
-                month: now.wMonth as u8,
-                day: now.wDay as u8,
-                hour: now.wHour as u8,
-                minute: now.wMinute as u8,
-            };
-        }
-        #[cfg(not(windows))]
-        {
-            utc_from_unix(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            )
-        }
-    }
-}
-
-pub(crate) fn unique_mp3_path(folder: &Path, stem: &str) -> Option<PathBuf> {
-    let first = folder.join(format!("{stem}.mp3"));
-    if !first.exists() {
-        return Some(first);
-    }
-    for n in 2..100 {
-        let candidate = folder.join(format!("{stem} ({n}).mp3"));
-        if !candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-pub(crate) fn dated_file_name(quality: ExportQuality, when: CivilTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02} {:02}-{:02} {}",
-        when.year,
-        when.month,
-        when.day,
-        when.hour,
-        when.minute,
-        quality.short_name()
-    )
+fn valid_file_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.encode_utf16().count() <= 255
+        && !value.ends_with('.')
+        && !value.ends_with(' ')
+        && !value
+            .chars()
+            .any(|c| c.is_control() || ['<', '>', ':', '"', '/', '\\', '|', '?', '*'].contains(&c))
 }
 
 #[cfg(windows)]
@@ -153,48 +144,52 @@ pub(crate) fn prefs_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("onerec.ini"))
 }
 
-#[cfg(not(windows))]
-fn utc_from_unix(secs: i64) -> CivilTime {
-    let days = secs.div_euclid(86400);
-    let tod = secs.rem_euclid(86400) as u32;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8;
-    let year = (y + i64::from(month <= 2)) as u16;
-    CivilTime {
-        year,
-        month,
-        day,
-        hour: (tod / 3600) as u8,
-        minute: ((tod % 3600) / 60) as u8,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dated_name_matches_the_meeting_example() {
+    fn shortcut_defaults_and_explicit_disable_survive_round_trip() {
+        assert_eq!(Prefs::default().shortcut, Shortcut(0x0552));
         assert_eq!(
-            dated_file_name(
-                ExportQuality::Meeting,
-                CivilTime {
-                    year: 2026,
-                    month: 9,
-                    day: 12,
-                    hour: 14,
-                    minute: 3,
-                }
-            ),
-            "2026-09-12 14-03 Meeting"
+            Prefs::parse("quality=Voice\n").shortcut,
+            Shortcut::default()
         );
+        for (value, expected) in [
+            ("", Shortcut(0)),
+            ("0", Shortcut(0)),
+            ("838", Shortcut(838)),
+        ] {
+            let prefs = Prefs::parse(&format!("shortcut={value}\n"));
+            assert_eq!(prefs.shortcut, expected);
+            assert_eq!(Prefs::parse(&prefs.render()).shortcut, expected);
+        }
+        for invalid in ["nope", "65536", "65535", "1280", "16", "17", "18"] {
+            assert_eq!(
+                Prefs::parse(&format!("shortcut={invalid}")).shortcut,
+                Shortcut::default()
+            );
+        }
+    }
+
+    #[test]
+    fn last_file_name_is_exact() {
+        for name in ["Reunión del equipo.mp3", "  Meeting.mp3", "name=part 2.mp3"] {
+            let prefs = Prefs {
+                last_file_name: Some(name.into()),
+                ..Prefs::default()
+            };
+            assert_eq!(
+                Prefs::parse(&prefs.render()).last_file_name.as_deref(),
+                Some(name)
+            );
+        }
+        for invalid in ["../escape.mp3", "C:\\escape.mp3", "bad:name.mp3", "", ".."] {
+            assert_eq!(
+                Prefs::parse(&format!("last_file_name={invalid}\n")).last_file_name,
+                None
+            );
+        }
     }
 
     #[test]
@@ -220,25 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_round_trips_save_direct() {
-        let prefs = Prefs::parse("quality=Meeting\nsave_direct=1\n");
-        assert!(prefs.save_direct);
-        assert!(Prefs::parse(&prefs.render()).save_direct);
-        let off = Prefs::parse("save_direct=0\n");
-        assert!(!off.save_direct);
-        assert!(Prefs::parse(&off.render()).render().contains("save_direct=0"));
-    }
-
-    #[test]
-    fn unique_mp3_path_skips_an_existing_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = unique_mp3_path(dir.path(), "take").unwrap();
-        fs::write(&first, b"x").unwrap();
-        let second = unique_mp3_path(dir.path(), "take").unwrap();
-        assert_eq!(second.file_name().unwrap(), "take (2).mp3");
-    }
-
-    #[test]
     fn write_then_read_restores_folder() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("onerec.ini");
@@ -247,7 +223,8 @@ mod tests {
             output: Some("out-b".into()),
             quality: ExportQuality::High,
             folder: Some(dir.path().to_path_buf()),
-            save_direct: false,
+            shortcut: Shortcut::default(),
+            last_file_name: Some("Reunión del equipo.mp3".into()),
         };
         prefs.write(&path).unwrap();
         let loaded = Prefs::read(&path);

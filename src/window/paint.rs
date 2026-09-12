@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub(crate) const CLIENT_WIDTH: i32 = 480;
 pub(crate) const CLIENT_HEIGHT: i32 = 372;
-pub(crate) const CLIENT_HUD_HEIGHT: i32 = 164;
+const TRANSPORT_DIVIDER_Y: i32 = 164;
 pub(crate) const ID_MICROPHONE: u16 = 101;
 pub(crate) const ID_OUTPUT: u16 = 102;
 pub(crate) const ID_TOGGLE: u16 = 103;
@@ -31,7 +31,6 @@ pub(crate) const ID_FOLDER: u16 = 107;
 pub(crate) const ID_REFRESH: u16 = 108;
 pub(crate) const ID_PAUSE: u16 = 110;
 pub(crate) const ID_SETTINGS: u16 = 111;
-pub(crate) const ID_SAVE_AS: u16 = 112;
 pub(crate) const ID_STOP: u16 = 113;
 const MICROPHONE_Y: i32 = 176;
 
@@ -48,7 +47,6 @@ pub(crate) struct Controls {
     discard: HWND,
     pause: HWND,
     settings: HWND,
-    save_as: HWND,
     folder: HWND,
     refresh: HWND,
     elapsed: HWND,
@@ -70,7 +68,6 @@ pub(crate) struct Controls {
 #[derive(Default)]
 struct Painted {
     phase: Option<Phase>,
-    save_direct: bool,
     elapsed: String,
     heading: String,
     status: Option<Status>,
@@ -78,7 +75,6 @@ struct Painted {
     percent: Option<u32>,
     saved_file: bool,
     missing_devices: bool,
-    hud: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -121,7 +117,6 @@ impl Controls {
         let settings = button(root, instance, ID_SETTINGS, w!("Settin&gs"))?;
         control_tooltip(root, instance, settings, w!("Settings (Alt+G)"))?;
         control_tooltip(root, instance, discard, w!("Discard recording (Alt+D)"))?;
-        let save_as = button(root, instance, ID_SAVE_AS, w!("Save &as…"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
         let mut controls = Self {
@@ -137,7 +132,6 @@ impl Controls {
             discard,
             pause,
             settings,
-            save_as,
             folder,
             refresh,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
@@ -168,7 +162,6 @@ impl Controls {
             meter_top: [0; 2],
         };
         for control in [
-            save_as,
             folder,
             refresh,
             controls.progress,
@@ -185,7 +178,7 @@ impl Controls {
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 20] {
+    fn all(&self) -> [HWND; 19] {
         [
             self.microphones,
             self.outputs,
@@ -199,7 +192,6 @@ impl Controls {
             self.discard,
             self.pause,
             self.settings,
-            self.save_as,
             self.folder,
             self.refresh,
             self.elapsed,
@@ -266,7 +258,7 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
         };
-        // Transport geometry is identical in the full and compact views.
+        // Keep transport and audio meters in place throughout the recording.
         place(self.heading, 20, 12, 392, 20);
         place(self.elapsed, 20, 36, 392, 44);
         place(self.settings, 428, 12, 32, 32);
@@ -275,20 +267,14 @@ impl Controls {
         place(self.stop, 228, 108, 88, 40);
         place(self.save, 324, 108, 88, 40);
         place(self.discard, 420, 108, 40, 40);
-        if self.painted.hud {
-            self.fit_client(root, CLIENT_WIDTH, CLIENT_HUD_HEIGHT);
-            return;
-        }
         place_combo(self.microphones, 20, MICROPHONE_Y, 440, 220);
         place_combo(self.outputs, 20, 230, 440, 220);
         place(self.quality_label, 20, 287, 136, 20);
         place_combo(self.quality, 178, 282, 282, 220);
         place(self.progress_label, 20, 282, 440, 20);
         place(self.progress, 20, 306, 440, 10);
-        place(self.save_as, 320, 326, 140, 32);
         let text_width = if self.painted.saved_file
             || self.painted.missing_devices
-            || (self.painted.phase == Some(Phase::AwaitingSave) && self.painted.save_direct)
         {
             288
         } else {
@@ -361,15 +347,6 @@ impl Controls {
         );
     }
 
-    fn fit_client(&self, root: HWND, client_w: i32, client_h: i32) {
-        let frame = RECT {
-            right: self.s(client_w),
-            bottom: self.s(client_h),
-            ..Default::default()
-        };
-        self.apply_frame(root, frame);
-    }
-
     fn apply_frame(&self, root: HWND, mut frame: RECT) {
         unsafe {
             let style = WINDOW_STYLE(GetWindowLongW(root, GWL_STYLE) as u32);
@@ -433,7 +410,6 @@ impl Controls {
         let pending = view.phase == Phase::AwaitingSave;
         let saving = view.phase == Phase::Saving;
         let live = matches!(view.phase, Phase::Recording | Phase::Paused);
-        let hud = live;
         let phase_changed = self.painted.phase != Some(view.phase);
         if phase_changed && !matches!(view.phase, Phase::Idle | Phase::Failed) {
             for list in [self.microphones, self.outputs, self.quality] {
@@ -463,19 +439,15 @@ impl Controls {
             choose(self.quality, view.quality);
         }
         let previous_focus = unsafe { GetFocus() };
-        let preference_changed = self.painted.save_direct != view.save_direct;
-        self.painted.save_direct = view.save_direct;
-        visible(self.save_as, pending && view.save_direct);
         if phase_changed {
             self.painted.phase = Some(view.phase);
-            self.painted.hud = hud;
-            visible(self.quality, !hud && !saving);
-            visible(self.quality_label, !hud && !saving);
-            visible(self.microphones, !hud);
-            visible(self.microphone_level, !hud);
-            visible(self.outputs, !hud);
-            visible(self.output_level, !hud);
-            visible(self.status, !hud);
+            visible(self.quality, !saving);
+            visible(self.quality_label, !saving);
+            visible(self.microphones, true);
+            visible(self.microphone_level, true);
+            visible(self.outputs, true);
+            visible(self.output_level, true);
+            visible(self.status, true);
             visible(self.progress, saving);
             visible(self.progress_label, saving);
             set_text(
@@ -487,7 +459,7 @@ impl Controls {
                 },
             );
         }
-        if phase_changed || preference_changed {
+        if phase_changed {
             self.layout(root);
         }
         enable(
@@ -531,10 +503,8 @@ impl Controls {
             }
             Phase::Idle if view.saved_path.is_some() => "Recording saved",
             Phase::Idle => "Ready to record",
-            Phase::Recording if hud => "REC",
             Phase::Recording if view.status.tone == Tone::Warning => "Recording · check audio",
             Phase::Recording => "Recording",
-            Phase::Paused if hud => "PAUSED",
             Phase::Paused => "Recording paused",
             Phase::AwaitingSave => "Recording not saved",
             Phase::Saving => "Saving MP3",
@@ -549,9 +519,6 @@ impl Controls {
             && (view.microphone.selected.is_none() || view.output.selected.is_none());
         let mut status = view.status.clone();
         status.text = match (view.phase, status.text.as_str()) {
-            (Phase::Idle, "Ready. Ctrl+Shift+R starts recording.") => {
-                String::new()
-            }
             (Phase::Recording, "Recording.") => "Recording microphone and system audio.".into(),
             (Phase::Paused, "Recording paused.") => {
                 "Recording paused. Stop still ends the take.".into()
@@ -593,9 +560,6 @@ impl Controls {
                 }
                 set_text(self.progress_label, &format!("Exporting MP3 · {percent}%"));
             }
-        }
-        if self.painted.hud {
-            return;
         }
         for (index, level) in [view.levels.microphone, view.levels.system]
             .into_iter()
@@ -661,17 +625,14 @@ impl Controls {
         self.theme.background
     }
     pub(crate) fn draw_meters(&self, hdc: HDC) {
-        if self.painted.hud {
-            return;
-        }
         unsafe {
             FillRect(
                 hdc,
                 &RECT {
                     left: self.s(20),
-                    top: self.s(CLIENT_HUD_HEIGHT),
+                    top: self.s(TRANSPORT_DIVIDER_Y),
                     right: self.s(460),
-                    bottom: self.s(CLIENT_HUD_HEIGHT) + 1,
+                    bottom: self.s(TRANSPORT_DIVIDER_Y) + 1,
                 },
                 self.theme.divider,
             );
@@ -732,7 +693,7 @@ impl Controls {
         self.theme.background
     }
 
-    pub(crate) fn command_buttons(&self) -> [HWND; 9] {
+    pub(crate) fn command_buttons(&self) -> [HWND; 8] {
         [
             self.toggle,
             self.stop,
@@ -740,7 +701,6 @@ impl Controls {
             self.pause,
             self.discard,
             self.settings,
-            self.save_as,
             self.folder,
             self.refresh,
         ]

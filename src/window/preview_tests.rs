@@ -51,6 +51,10 @@ fn render_native_states() {
         let _ = ShowWindow(root, SW_SHOWNA);
         let directory = std::path::Path::new("target/ui-preview");
         std::fs::create_dir_all(directory).unwrap();
+        super::super::settings::with_preview(root, |dialog| {
+            settle(dialog);
+            snapshot(dialog, &directory.join("Settings.bmp"));
+        });
         for dpi in [96, 120, 144, 192] {
             shell.borrow_mut().controls.refresh_theme(root, dpi);
             for phase in [
@@ -83,13 +87,7 @@ fn render_native_states() {
                 settle(root);
                 snapshot(root, &directory.join(format!("{name}-{dpi}.bmp")));
             }
-            // Exercise the shared painter with the native pressed/disabled state
-            // and the direct-save variant, without recording or moving the cursor.
-            let mut pending = fixture(Phase::AwaitingSave);
-            pending.save_direct = true;
-            shell.borrow_mut().controls.show(root, &pending);
-            settle(root);
-            snapshot(root, &directory.join(format!("DirectSave-{dpi}.bmp")));
+            // Exercise the native pressed state without recording or moving the cursor.
             let pause = GetDlgItem(root, i32::from(ID_PAUSE)).unwrap();
             shell.borrow_mut().controls.show(root, &fixture(Phase::Paused));
             SendMessageW(pause, BM_SETSTATE, WPARAM(1), LPARAM(0));
@@ -208,7 +206,7 @@ fn fixture(phase: Phase) -> View {
         progress: saving.then_some(crate::mp3::SaveProgress { done: 42, total: 100 }),
         status: Status {
             text: match phase {
-                Phase::Idle => "Ready. Ctrl+Shift+R starts recording.",
+                Phase::Idle => "",
                 Phase::Recording => "Recording.",
                 Phase::Paused => "Recording paused.",
                 Phase::AwaitingSave => "Save cancelled. The take is kept.",
@@ -217,7 +215,7 @@ fn fixture(phase: Phase) -> View {
             }.into(),
             tone: if phase == Phase::Failed { Tone::Failure } else if recording { Tone::Recording } else { Tone::Neutral },
         },
-        ask: None, saved_path: None, save_direct: false,
+        ask: None, saved_path: None,
     }
 }
 

@@ -11,12 +11,13 @@ use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::{ExportQuality, SaveProgress};
 #[cfg(windows)]
 use crate::prefs::prefs_path;
-use crate::prefs::{dated_file_name, unique_mp3_path, CivilTime, Prefs};
+use crate::prefs::{Prefs, Shortcut};
 use crate::session::{SaveError, Session};
 use crate::staging::StagingArea;
 
 pub(crate) use self::level::Level;
 use self::level::Vu;
+const HOTKEY_UNAVAILABLE: &str = "The recording shortcut is unavailable. Change it in Settings or use Record / Stop.";
 
 pub(crate) trait Devices: 'static {
     fn survey(&self) -> Result<Endpoints, AudioError>;
@@ -35,13 +36,12 @@ pub(crate) enum Intent {
     Stop,
     Pause,
     Save,
-    SaveAs,
     SaveTo(PathBuf),
     CancelSave,
     RequestDiscard,
     Discard,
     OpenSettings,
-    SetSaveDirect(bool),
+    SetSettings { shortcut: Shortcut },
     Closing,
     DiscardAndClose,
     HotkeyUnavailable,
@@ -61,7 +61,6 @@ pub(crate) struct View {
     pub status: Status,
     pub ask: Option<Ask>,
     pub saved_path: Option<PathBuf>,
-    pub save_direct: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +129,7 @@ pub(crate) enum Ask {
     ConfirmClose,
     ConfirmDiscard,
     Close,
-    Settings { save_direct: bool },
+    Settings { shortcut: Shortcut },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,7 +240,6 @@ impl Recorder {
             }
             Intent::Pause => self.pause(),
             Intent::Save => self.request_destination(),
-            Intent::SaveAs => self.request_save_as(),
             Intent::SaveTo(path) => self.save_to(&path),
             Intent::CancelSave => self.cancel_save(),
             Intent::RequestDiscard => {
@@ -251,13 +249,19 @@ impl Recorder {
             }
             Intent::Discard => self.discard(),
             Intent::OpenSettings => self.open_settings(),
-            Intent::SetSaveDirect(on) => self.set_save_direct(on),
+            Intent::SetSettings { shortcut } => {
+                self.prefs.shortcut = shortcut;
+                if self.notice.as_ref().is_some_and(|notice| notice.text == HOTKEY_UNAVAILABLE) {
+                    self.notice = None;
+                }
+                if !self.persist() {
+                    self.notice = Some(warn("Settings apply for this session, but could not be saved. Check that the onerec folder is writable."));
+                }
+            }
             Intent::Closing => self.consider_closing(),
             Intent::DiscardAndClose => self.abandon_and_close(),
             Intent::HotkeyUnavailable => {
-                self.notice = Some(warn(
-                    "Another app holds Ctrl+Shift+R. Use the Start recording button.",
-                ))
+                self.notice = Some(warn(HOTKEY_UNAVAILABLE))
             }
         }
         self.view()
@@ -364,30 +368,12 @@ impl Recorder {
         if !matches!(self.session, Session::AwaitingSave(_)) {
             return;
         }
-        if self.prefs.save_direct {
-            if let Some(path) = self.direct_save_path() {
-                self.save_to(&path);
-                return;
-            }
-        }
         self.ask_save_dialog();
-    }
-
-    fn request_save_as(&mut self) {
-        if !matches!(self.session, Session::AwaitingSave(_)) {
-            return;
-        }
-        self.ask_save_dialog();
-    }
-
-    fn direct_save_path(&self) -> Option<PathBuf> {
-        let folder = self.prefs.folder.as_ref().filter(|path| path.is_dir())?;
-        unique_mp3_path(folder, &dated_file_name(self.quality, CivilTime::local()))
     }
 
     fn ask_save_dialog(&mut self) {
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
-            file_name: dated_file_name(self.quality, CivilTime::local()),
+            file_name: self.prefs.last_file_name.clone().unwrap_or_else(|| "Recording.mp3".into()),
             folder: self.prefs.folder.clone().filter(|path| path.is_dir()),
             filter_label: "MP3 audio",
             extension: "mp3",
@@ -396,13 +382,12 @@ impl Recorder {
 
     fn open_settings(&mut self) {
         self.pending_ask = Some(Ask::Settings {
-            save_direct: self.prefs.save_direct,
+            shortcut: self.prefs.shortcut,
         });
     }
 
-    fn set_save_direct(&mut self, on: bool) {
-        self.prefs.save_direct = on;
-        self.persist();
+    pub(crate) fn shortcut(&self) -> Shortcut {
+        self.prefs.shortcut
     }
 
     fn save_to(&mut self, destination: &std::path::Path) {
@@ -514,10 +499,11 @@ impl Recorder {
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
                 self.notice = Some(neutral(format!("Saved: {name}")));
+                self.prefs.last_file_name = path.file_name().map(|name| name.to_string_lossy().into_owned());
                 if let Some(folder) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
                     self.prefs.folder = Some(folder.to_path_buf());
-                    self.persist();
                 }
+                self.persist();
                 self.saved_path = Some(path);
                 self.microphone_vu.reset();
                 self.system_vu.reset();
@@ -604,7 +590,6 @@ impl Recorder {
             },
             ask: self.pending_ask.take(),
             saved_path: self.saved_path.clone(),
-            save_direct: self.prefs.save_direct,
         }
     }
 
@@ -647,7 +632,7 @@ impl Recorder {
         match &self.session {
             Session::Idle if self.microphone.is_none() => warn("Connect a microphone to record."),
             Session::Idle if self.output.is_none() => warn("No output device found."),
-            Session::Idle => neutral("Ready. Ctrl+Shift+R starts recording."),
+            Session::Idle => neutral(""),
             Session::Recording(_) if self.session.is_degraded() => {
                 warn("Recording. One device dropped out; the other is still being recorded.")
             }
@@ -709,16 +694,16 @@ impl Recorder {
             .map(|endpoint| endpoint.id().clone())
     }
 
-    fn persist(&mut self) {
+    fn persist(&mut self) -> bool {
         self.prefs.microphone = self
             .selected_microphone_id()
             .map(|id| id.as_str().to_owned());
         self.prefs.output = self.selected_output_id().map(|id| id.as_str().to_owned());
         self.prefs.quality = self.quality;
         let Some(path) = &self.store else {
-            return;
+            return true;
         };
-        let _ = self.prefs.write(path);
+        self.prefs.write(path).is_ok()
     }
 }
 
@@ -1017,7 +1002,7 @@ mod tests {
             panic!("expected a save prompt");
         };
         assert!(
-            prompt.file_name.ends_with(" Meeting"),
+            prompt.file_name.ends_with("Recording.mp3"),
             "{}",
             prompt.file_name
         );
@@ -1087,7 +1072,8 @@ mod tests {
                 output: Some("out-b".into()),
                 quality: ExportQuality::Voice,
                 folder: None,
-                save_direct: false,
+                shortcut: Shortcut::default(),
+                last_file_name: None,
             },
             None,
         );
@@ -1105,7 +1091,8 @@ mod tests {
                 output: None,
                 quality: ExportQuality::Meeting,
                 folder: None,
-                save_direct: false,
+                shortcut: Shortcut::default(),
+                last_file_name: None,
             },
             None,
         );
@@ -1129,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn save_prompt_uses_quality_name_and_last_folder() {
+    fn save_prompt_uses_recording_name_and_last_folder() {
         let folder = tempfile::tempdir().unwrap();
         let mut recorder = recorder_with_prefs(
             Prefs {
@@ -1137,7 +1124,8 @@ mod tests {
                 output: None,
                 quality: ExportQuality::High,
                 folder: Some(folder.path().to_path_buf()),
-                save_direct: false,
+                shortcut: Shortcut::default(),
+                last_file_name: None,
             },
             None,
         );
@@ -1146,7 +1134,7 @@ mod tests {
         let Ask::SaveDestination(prompt) = asked.ask.expect("save prompt") else {
             panic!("expected a save prompt");
         };
-        assert!(prompt.file_name.ends_with(" High"), "{}", prompt.file_name);
+        assert!(prompt.file_name.ends_with("Recording.mp3"), "{}", prompt.file_name);
         assert_eq!(prompt.folder.as_deref(), Some(folder.path()));
     }
 
@@ -1312,6 +1300,35 @@ mod tests {
     }
 
     #[test]
+    fn settings_report_persistence_failure_and_clear_stale_hotkey_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(dir.path().to_path_buf()));
+        recorder.apply(Intent::HotkeyUnavailable);
+        let view = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
+        assert!(view.status.text.contains("could not be saved"));
+        assert_eq!(recorder.shortcut(), Shortcut(0));
+        recorder.store = None;
+        recorder.apply(Intent::HotkeyUnavailable);
+        let view = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
+        assert!(view.status.text.is_empty());
+    }
+
+    #[test]
+    fn settings_persist_shortcut_changes_and_disabled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        for shortcut in [Shortcut(0x0346), Shortcut(0)] {
+            recorder.apply(Intent::SetSettings { shortcut });
+            let loaded = Prefs::read(&path);
+            assert_eq!(loaded.shortcut, shortcut);
+            assert_eq!(recorder.shortcut(), shortcut);
+            assert_eq!(recorder.apply(Intent::OpenSettings).ask,
+                Some(Ask::Settings { shortcut }));
+        }
+    }
+
+    #[test]
     fn settings_can_be_opened_and_changed_without_interrupting_a_take() {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         recorder.apply(Intent::Start);
@@ -1322,9 +1339,9 @@ mod tests {
             let view = recorder.apply(Intent::OpenSettings);
             assert_eq!(view.phase, expected);
             assert!(matches!(view.ask, Some(Ask::Settings { .. })));
-            let updated = recorder.apply(Intent::SetSaveDirect(true));
+            let updated = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
             assert_eq!(updated.phase, expected);
-            assert!(updated.save_direct);
+            assert_eq!(recorder.shortcut(), Shortcut(0));
         }
         recorder.apply(Intent::Discard);
     }
@@ -1379,7 +1396,7 @@ mod tests {
         let view = recorder.apply(Intent::HotkeyUnavailable);
         assert_eq!(
             view.status.text,
-            "Another app holds Ctrl+Shift+R. Use the Start recording button."
+            "The recording shortcut is unavailable. Change it in Settings or use Record / Stop."
         );
         assert_eq!(view.status.tone, Tone::Warning);
         assert!(view.transport.toggle_enabled);
@@ -1426,48 +1443,44 @@ mod tests {
     }
 
     #[test]
-    fn save_direct_skips_ask_when_folder_known() {
+    fn successful_save_remembers_exact_name_and_folder_across_restart() {
         let folder = tempfile::tempdir().unwrap();
-        let mut recorder = recorder_with_prefs(
-            Prefs {
-                microphone: None,
-                output: None,
-                quality: ExportQuality::Meeting,
-                folder: Some(folder.path().to_path_buf()),
-                save_direct: true,
-            },
-            None,
-        );
+        let store = folder.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(store.clone()));
         stop_take(&mut recorder);
-        let started = recorder.apply(Intent::Save);
-        assert!(started.ask.is_none());
-        assert_eq!(started.phase, Phase::Saving);
-        let saved = finish_save(&mut recorder);
-        assert_eq!(saved.phase, Phase::Idle);
-        let written: Vec<_> = std::fs::read_dir(folder.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("mp3"))
-            .collect();
-        assert_eq!(written.len(), 1);
+        let path = folder.path().join("Reunión de equipo 01.mp3");
+        recorder.apply(Intent::SaveTo(path.clone()));
+        finish_save(&mut recorder);
+        let loaded = Prefs::read(&store);
+        assert_eq!(loaded.last_file_name.as_deref(), Some("Reunión de equipo 01.mp3"));
+        assert_eq!(loaded.folder.as_deref(), Some(folder.path()));
+        let mut recorder = recorder_with_prefs(loaded, Some(store));
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::Save);
+        let Some(Ask::SaveDestination(prompt)) = asked.ask else { panic!("Save must ask"); };
+        assert_eq!(prompt.file_name, "Reunión de equipo 01.mp3");
+        assert_eq!(prompt.folder.as_deref(), Some(folder.path()));
+        assert_eq!(asked.phase, Phase::AwaitingSave);
+        let original = std::fs::read(&path).unwrap();
+        recorder.apply(Intent::CancelSave);
+        assert_eq!(recorder.prefs.last_file_name.as_deref(), Some("Reunión de equipo 01.mp3"));
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]
-    fn save_direct_asks_when_folder_missing() {
-        let mut recorder = recorder_with_prefs(
-            Prefs {
-                microphone: None,
-                output: None,
-                quality: ExportQuality::Meeting,
-                folder: None,
-                save_direct: true,
-            },
-            None,
-        );
+    fn failed_save_does_not_replace_the_remembered_name() {
+        let folder = tempfile::tempdir().unwrap();
+        let prefs = Prefs { last_file_name: Some("Successful.mp3".into()), ..Prefs::default() };
+        let mut recorder = recorder_with_prefs(prefs, None);
         stop_take(&mut recorder);
-        let asked = recorder.apply(Intent::Save);
-        assert!(matches!(asked.ask, Some(Ask::SaveDestination(_))));
-        assert_eq!(asked.phase, Phase::AwaitingSave);
+        recorder.apply(Intent::SaveTo(folder.path().join("missing").join("Failed.mp3")));
+        for _ in 0..100 {
+            let view = recorder.apply(Intent::Tick);
+            if view.phase != Phase::Saving { break; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(recorder.prefs.last_file_name.as_deref(), Some("Successful.mp3"));
+        let Some(Ask::SaveDestination(prompt)) = recorder.apply(Intent::Save).ask else { panic!("retry dialog"); };
+        assert_eq!(prompt.file_name, "Successful.mp3");
     }
 }
