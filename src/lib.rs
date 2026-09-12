@@ -2,6 +2,7 @@ mod audio;
 mod capture;
 mod ids;
 mod mp3;
+mod prefs;
 mod recorder;
 mod session;
 mod staging;

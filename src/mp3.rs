@@ -55,6 +55,13 @@ impl ExportQuality {
         Self::ALL.get(index).copied()
     }
 
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|quality| quality.short_name() == name)
+    }
+
     pub const fn short_name(self) -> &'static str {
         match self {
             Self::Meeting => "Meeting",
