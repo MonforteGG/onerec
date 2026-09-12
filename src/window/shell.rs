@@ -361,7 +361,11 @@ fn with_shell_read<T>(root: HWND, body: impl FnOnce(&Shell) -> T) -> Option<T> {
 fn install_command_button_subclasses(controls: &Controls) {
     unsafe {
         for hwnd in controls.command_buttons() {
-            let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, command_button_proc as isize);
+            let previous = SetWindowLongPtrW(
+                hwnd,
+                GWLP_WNDPROC,
+                command_button_proc as *const () as isize,
+            );
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, previous);
         }
     }
