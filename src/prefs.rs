@@ -13,6 +13,7 @@ pub(crate) struct Prefs {
     pub output: Option<String>,
     pub quality: ExportQuality,
     pub folder: Option<PathBuf>,
+    pub save_direct: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +55,7 @@ impl Prefs {
                     }
                 }
                 "folder" => prefs.folder = Some(PathBuf::from(value)),
+                "save_direct" => prefs.save_direct = value == "1",
                 _ => {}
             }
         }
@@ -72,6 +74,11 @@ impl Prefs {
         if let Some(folder) = &self.folder {
             let _ = writeln!(&mut text, "folder={}", folder.display());
         }
+        let _ = writeln!(
+            &mut text,
+            "save_direct={}",
+            if self.save_direct { 1 } else { 0 }
+        );
         text
     }
 
@@ -110,6 +117,20 @@ impl CivilTime {
             )
         }
     }
+}
+
+pub(crate) fn unique_mp3_path(folder: &Path, stem: &str) -> Option<PathBuf> {
+    let first = folder.join(format!("{stem}.mp3"));
+    if !first.exists() {
+        return Some(first);
+    }
+    for n in 2..100 {
+        let candidate = folder.join(format!("{stem} ({n}).mp3"));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(crate) fn dated_file_name(quality: ExportQuality, when: CivilTime) -> String {
@@ -199,6 +220,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_round_trips_save_direct() {
+        let prefs = Prefs::parse("quality=Meeting\nsave_direct=1\n");
+        assert!(prefs.save_direct);
+        assert!(Prefs::parse(&prefs.render()).save_direct);
+        let off = Prefs::parse("save_direct=0\n");
+        assert!(!off.save_direct);
+        assert!(Prefs::parse(&off.render()).render().contains("save_direct=0"));
+    }
+
+    #[test]
+    fn unique_mp3_path_skips_an_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = unique_mp3_path(dir.path(), "take").unwrap();
+        fs::write(&first, b"x").unwrap();
+        let second = unique_mp3_path(dir.path(), "take").unwrap();
+        assert_eq!(second.file_name().unwrap(), "take (2).mp3");
+    }
+
+    #[test]
     fn write_then_read_restores_folder() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("onerec.ini");
@@ -207,6 +247,7 @@ mod tests {
             output: Some("out-b".into()),
             quality: ExportQuality::High,
             folder: Some(dir.path().to_path_buf()),
+            save_direct: false,
         };
         prefs.write(&path).unwrap();
         let loaded = Prefs::read(&path);

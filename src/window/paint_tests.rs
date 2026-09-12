@@ -131,6 +131,7 @@ mod tests {
                 tone: Tone::Neutral,
             },
             ask: None,
+            save_direct: false,
         }
     }
 
@@ -249,6 +250,33 @@ mod tests {
         controls.show(ui.root, &view);
         assert!(!unsafe { IsWindowVisible(controls.pause).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.discard).as_bool() });
+    }
+
+    #[test]
+    fn settings_shows_only_while_idle() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.settings).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.save_as).as_bool() });
+        view.phase = Phase::Recording;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
+        view.transport.toggle_label = "Stop recording";
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.settings).as_bool() });
+        view.phase = Phase::AwaitingSave;
+        view.save_direct = true;
+        view.transport.toggle_enabled = false;
+        view.transport.save_enabled = true;
+        view.transport.discard_enabled = true;
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.settings).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.save_as).as_bool() });
+        assert_eq!(caption(controls.save), "&Save recording");
     }
 
     fn client_h(root: HWND) -> i32 {

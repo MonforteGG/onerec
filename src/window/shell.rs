@@ -32,7 +32,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 
 use super::paint::{
     Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
-    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_TOGGLE,
+    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SAVE_AS, ID_SETTINGS, ID_TOGGLE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
@@ -181,6 +181,11 @@ fn dispatch(root: HWND, intent: Intent) {
                 None => Intent::CancelSave,
             };
             dispatch(root, next);
+        }
+        Some(Ask::Settings { save_direct }) => {
+            if let Some(next) = modal(root, || super::settings::ask(root, save_direct)) {
+                dispatch(root, Intent::SetSaveDirect(next));
+            }
         }
     }
 }
@@ -626,6 +631,8 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         (BN_CLICKED, ID_TOGGLE) => Some(Intent::Toggle),
         (BN_CLICKED, ID_PAUSE) => Some(Intent::Pause),
         (BN_CLICKED, ID_SAVE) => Some(Intent::Save),
+        (BN_CLICKED, ID_SAVE_AS) => Some(Intent::SaveAs),
+        (BN_CLICKED, ID_SETTINGS) => Some(Intent::OpenSettings),
         (BN_CLICKED, ID_DISCARD) => Some(Intent::RequestDiscard),
         (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),
         _ => None,

@@ -149,7 +149,7 @@ fn fixture(phase: Phase) -> View {
             }.into(),
             tone: if phase == Phase::Failed { Tone::Failure } else if recording { Tone::Recording } else { Tone::Neutral },
         },
-        ask: None, saved_path: None,
+        ask: None, saved_path: None, save_direct: false,
     }
 }
 

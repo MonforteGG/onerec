@@ -22,7 +22,7 @@ The V1 is a portable desktop app for Windows 10 and later, written in Rust with 
 - **One window, one recording.** Device selectors, a prominent timer, separate audio meters, and clear recording and saving states. While a take is live the window shrinks to a HUD with the timer, Stop, Pause or Resume, and the shortcut.
 - **Global keyboard shortcut.** Start and stop with `Ctrl+Shift+R`, including when the app is in the background. Pause and Resume live on a separate button so the shortcut always ends the take.
 - **Five MP3 profiles.** Choose small files for speech or higher bitrates for fuller audio.
-- **Remembered preferences.** Restore your microphone, output device, quality, and last save folder on the next launch.
+- **Remembered preferences.** Restore your microphone, output device, quality, last save folder, and whether Save recording writes straight to that folder.
 - **Responsive export.** Save with progress feedback while MP3 encoding runs in a background worker.
 - **Native Windows presentation.** System fonts, per-monitor DPI scaling, high-contrast support, and a multi-resolution app icon.
 
@@ -35,7 +35,7 @@ Run `onerec.exe` from a folder you can write to. No installer is required. To cr
 3. Click **Start recording** or press `Ctrl+Shift+R`. The window shrinks to a HUD with the timer, Stop, Pause, and the shortcut.
 4. Click **Pause** to freeze the timer and skip writing the take. Click **Resume** to continue on the same take.
 5. Click **Stop recording** or press `Ctrl+Shift+R` again. The shortcut never pauses. The window grows back for Save.
-6. Click **Save recording…**, choose a location, and wait for export to finish.
+6. Click **Save recording…**, choose a location, and wait for export to finish. While Idle, **Settings** can turn on Save directly to the last folder. Later saves then skip the dialog. **Save as…** still opens it.
 7. Click **Open folder** to find your MP3.
 
 The save dialog suggests a dated filename such as `2026-09-12 14-03 Meeting.mp3` and opens in your last save folder. The interface uses English labels; device names come from Windows.

@@ -33,9 +33,9 @@ fn main() {
     println!("cargo:rustc-link-arg-bins={}", resource.display());
     let manifest = out_dir.join("onerec.manifest");
     fs::write(&manifest, MANIFEST).expect("writing the application manifest");
-    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!(
-        "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
         manifest.display()
     );
 }

@@ -11,7 +11,7 @@ use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::{ExportQuality, SaveProgress};
 #[cfg(windows)]
 use crate::prefs::prefs_path;
-use crate::prefs::{dated_file_name, CivilTime, Prefs};
+use crate::prefs::{dated_file_name, unique_mp3_path, CivilTime, Prefs};
 use crate::session::{SaveError, Session};
 use crate::staging::StagingArea;
 
@@ -33,10 +33,13 @@ pub(crate) enum Intent {
     Toggle,
     Pause,
     Save,
+    SaveAs,
     SaveTo(PathBuf),
     CancelSave,
     RequestDiscard,
     Discard,
+    OpenSettings,
+    SetSaveDirect(bool),
     Closing,
     DiscardAndClose,
     HotkeyUnavailable,
@@ -56,6 +59,7 @@ pub(crate) struct View {
     pub status: Status,
     pub ask: Option<Ask>,
     pub saved_path: Option<PathBuf>,
+    pub save_direct: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +128,7 @@ pub(crate) enum Ask {
     ConfirmClose,
     ConfirmDiscard,
     Close,
+    Settings { save_direct: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +233,7 @@ impl Recorder {
             Intent::Toggle => self.toggle(),
             Intent::Pause => self.pause(),
             Intent::Save => self.request_destination(),
+            Intent::SaveAs => self.request_save_as(),
             Intent::SaveTo(path) => self.save_to(&path),
             Intent::CancelSave => self.cancel_save(),
             Intent::RequestDiscard => {
@@ -236,6 +242,8 @@ impl Recorder {
                 }
             }
             Intent::Discard => self.discard(),
+            Intent::OpenSettings => self.open_settings(),
+            Intent::SetSaveDirect(on) => self.set_save_direct(on),
             Intent::Closing => self.consider_closing(),
             Intent::DiscardAndClose => self.abandon_and_close(),
             Intent::HotkeyUnavailable => {
@@ -348,12 +356,48 @@ impl Recorder {
         if !matches!(self.session, Session::AwaitingSave(_)) {
             return;
         }
+        if self.prefs.save_direct {
+            if let Some(path) = self.direct_save_path() {
+                self.save_to(&path);
+                return;
+            }
+        }
+        self.ask_save_dialog();
+    }
+
+    fn request_save_as(&mut self) {
+        if !matches!(self.session, Session::AwaitingSave(_)) {
+            return;
+        }
+        self.ask_save_dialog();
+    }
+
+    fn direct_save_path(&self) -> Option<PathBuf> {
+        let folder = self.prefs.folder.as_ref().filter(|path| path.is_dir())?;
+        unique_mp3_path(folder, &dated_file_name(self.quality, CivilTime::local()))
+    }
+
+    fn ask_save_dialog(&mut self) {
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
             file_name: dated_file_name(self.quality, CivilTime::local()),
             folder: self.prefs.folder.clone().filter(|path| path.is_dir()),
             filter_label: "MP3 audio",
             extension: "mp3",
         }));
+    }
+
+    fn open_settings(&mut self) {
+        if !matches!(self.session, Session::Idle) {
+            return;
+        }
+        self.pending_ask = Some(Ask::Settings {
+            save_direct: self.prefs.save_direct,
+        });
+    }
+
+    fn set_save_direct(&mut self, on: bool) {
+        self.prefs.save_direct = on;
+        self.persist();
     }
 
     fn save_to(&mut self, destination: &std::path::Path) {
@@ -555,6 +599,7 @@ impl Recorder {
             },
             ask: self.pending_ask.take(),
             saved_path: self.saved_path.clone(),
+            save_direct: self.prefs.save_direct,
         }
     }
 
@@ -1037,6 +1082,7 @@ mod tests {
                 output: Some("out-b".into()),
                 quality: ExportQuality::Voice,
                 folder: None,
+                save_direct: false,
             },
             None,
         );
@@ -1054,6 +1100,7 @@ mod tests {
                 output: None,
                 quality: ExportQuality::Meeting,
                 folder: None,
+                save_direct: false,
             },
             None,
         );
@@ -1085,6 +1132,7 @@ mod tests {
                 output: None,
                 quality: ExportQuality::High,
                 folder: Some(folder.path().to_path_buf()),
+                save_direct: false,
             },
             None,
         );
@@ -1335,5 +1383,51 @@ mod tests {
         assert_eq!(Phase::Recording.timer_ms(false), Some(50));
         assert_eq!(Phase::Recording.timer_ms(true), Some(500));
         assert_eq!(Phase::Saving.timer_ms(true), Some(50));
+    }
+
+    #[test]
+    fn save_direct_skips_ask_when_folder_known() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                microphone: None,
+                output: None,
+                quality: ExportQuality::Meeting,
+                folder: Some(folder.path().to_path_buf()),
+                save_direct: true,
+            },
+            None,
+        );
+        stop_take(&mut recorder);
+        let started = recorder.apply(Intent::Save);
+        assert!(started.ask.is_none());
+        assert_eq!(started.phase, Phase::Saving);
+        let saved = finish_save(&mut recorder);
+        assert_eq!(saved.phase, Phase::Idle);
+        let written: Vec<_> = std::fs::read_dir(folder.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("mp3"))
+            .collect();
+        assert_eq!(written.len(), 1);
+    }
+
+    #[test]
+    fn save_direct_asks_when_folder_missing() {
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                microphone: None,
+                output: None,
+                quality: ExportQuality::Meeting,
+                folder: None,
+                save_direct: true,
+            },
+            None,
+        );
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::Save);
+        assert!(matches!(asked.ask, Some(Ask::SaveDestination(_))));
+        assert_eq!(asked.phase, Phase::AwaitingSave);
     }
 }
