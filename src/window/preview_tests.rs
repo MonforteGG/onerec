@@ -37,6 +37,7 @@ fn render_native_states() {
             refresh_after_picker: false,
         });
         SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize);
+        super::install_command_button_subclasses(&shell.borrow().controls);
         SetWindowPos(
             root,
             None,

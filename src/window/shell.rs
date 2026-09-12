@@ -4,7 +4,8 @@ use std::ffi::c_void;
 use ::windows::core::{w, HSTRING, PCWSTR};
 use ::windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use ::windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetSysColorBrush, UpdateWindow, COLOR_WINDOW, HDC, PAINTSTRUCT,
+    BeginPaint, EndPaint, FillRect, GetDC, GetSysColorBrush, ReleaseDC, UpdateWindow, COLOR_WINDOW,
+    HDC, PAINTSTRUCT,
 };
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::UI::Controls::{NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW};
@@ -16,15 +17,17 @@ use ::windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use ::windows::Win32::UI::Shell::ShellExecuteW;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, LoadImageW, MessageBoxW,
-    PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, BN_CLICKED, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE,
-    CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR,
-    HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR, MB_ICONWARNING, MB_YESNO, MSG,
-    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_HOTKEY, WM_PAINT,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    CreateWindowExW, CallWindowProcW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetParent, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, LoadImageW,
+    MessageBoxW, PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, CBN_CLOSEUP, CBN_DROPDOWN,
+    CBN_SELCHANGE, CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+    GWLP_WNDPROC, HCURSOR, HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON, LR_DEFAULTCOLOR,
+    MB_ICONWARNING, MB_YESNO, MSG, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DEVICECHANGE, WM_ERASEBKGND, WM_HOTKEY, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT,
+    WM_SETFOCUS, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_SYSMENU,
 };
 
 use super::paint::{
@@ -36,8 +39,8 @@ use crate::recorder::{Ask, Intent, Phase, Recorder};
 use crate::RunError;
 use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_ERASEBKGND, WM_NOTIFY, WM_PRINTCLIENT,
-    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WS_CLIPCHILDREN,
+    SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_NOTIFY, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOLORCHANGE, WM_THEMECHANGED, WS_CLIPCHILDREN,
 };
 
 const CLASS_NAME: PCWSTR = w!("onerec.window");
@@ -70,6 +73,7 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
         refresh_after_picker: false,
     });
     unsafe { SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize) };
+    install_command_button_subclasses(&shell.borrow().controls);
     let hotkey = unsafe {
         RegisterHotKey(
             root,
@@ -341,6 +345,104 @@ fn with_shell<T>(root: HWND, body: impl FnOnce(&mut Shell) -> T) -> Option<T> {
     let cell = unsafe { pointer.as_ref() }?;
     let mut shell = cell.try_borrow_mut().ok()?;
     Some(body(&mut shell))
+}
+
+fn with_shell_read<T>(root: HWND, body: impl FnOnce(&Shell) -> T) -> Option<T> {
+    let pointer = unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *const RefCell<Shell>;
+    let cell = unsafe { pointer.as_ref() }?;
+    if let Ok(shell) = cell.try_borrow() {
+        return Some(body(&shell));
+    }
+    // WM_PAINT can nest inside show()'s exclusive borrow. The shell is not
+    // moved; painting only reads the command-button brushes and caption.
+    Some(body(unsafe { &*cell.as_ptr() }))
+}
+
+fn install_command_button_subclasses(controls: &Controls) {
+    unsafe {
+        for hwnd in controls.command_buttons() {
+            let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, command_button_proc as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, previous);
+        }
+    }
+}
+
+unsafe fn original_button_proc(hwnd: HWND) -> WNDPROC {
+    std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA))
+}
+
+unsafe extern "system" fn command_button_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let original = original_button_proc(hwnd);
+    match message {
+        WM_PAINT => {
+            let paints = parent_of(hwnd)
+                .and_then(|root| {
+                    with_shell_read(root, |shell| shell.controls.paints_command_button(hwnd))
+                })
+                .unwrap_or(false);
+            if !paints {
+                return CallWindowProcW(original, hwnd, message, wparam, lparam);
+            }
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            parent_of(hwnd).and_then(|root| {
+                with_shell_read(root, |shell| shell.controls.paint_command_button(hwnd, hdc))
+            });
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT => {
+            let hdc = HDC(wparam.0 as *mut c_void);
+            if parent_of(hwnd)
+                .and_then(|root| {
+                    with_shell_read(root, |shell| shell.controls.paint_command_button(hwnd, hdc))
+                })
+                .unwrap_or(false)
+            {
+                LRESULT(0)
+            } else {
+                CallWindowProcW(original, hwnd, message, wparam, lparam)
+            }
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            let result = CallWindowProcW(original, hwnd, message, wparam, lparam);
+            cover_command_button(hwnd);
+            result
+        }
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            CallWindowProcW(original, hwnd, message, wparam, lparam)
+        }
+        _ => CallWindowProcW(original, hwnd, message, wparam, lparam),
+    }
+}
+
+fn parent_of(hwnd: HWND) -> Option<HWND> {
+    let parent = unsafe { GetParent(hwnd).ok()? };
+    if parent.0.is_null() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn cover_command_button(hwnd: HWND) {
+    let Some(root) = parent_of(hwnd) else {
+        return;
+    };
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if !hdc.0.is_null() {
+            with_shell_read(root, |shell| shell.controls.paint_command_button(hwnd, hdc));
+            let _ = ReleaseDC(hwnd, hdc);
+        }
+    }
 }
 
 unsafe extern "system" fn wnd_proc(

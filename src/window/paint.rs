@@ -158,6 +158,13 @@ impl Controls {
             &ExportQuality::ALL.map(|q| q.label().to_owned()),
         );
         controls.layout(root);
+        // Visual styles draw a focus halo after NM_CUSTOMDRAW. Strip them so
+        // the command buttons only show the rounded fill we paint.
+        for hwnd in [controls.toggle, controls.save] {
+            unsafe {
+                let _ = SetWindowTheme(hwnd, w!(""), w!(""));
+            }
+        }
         Ok(controls)
     }
 
@@ -613,25 +620,48 @@ impl Controls {
         self.theme.background
     }
 
+    pub(crate) fn command_buttons(&self) -> [HWND; 2] {
+        [self.toggle, self.save]
+    }
+
+    pub(crate) fn paints_command_button(&self, hwnd: HWND) -> bool {
+        [self.toggle, self.save].contains(&hwnd) && !self.theme.high_contrast
+    }
+
     // Native BUTTON keeps keyboard, accessibility and hover/pressed tracking.
     pub(crate) fn draw_button(&self, draw: &NMCUSTOMDRAW) -> Option<u32> {
-        if ![self.toggle, self.save].contains(&draw.hdr.hwndFrom) || self.theme.high_contrast {
+        if !self.paints_command_button(draw.hdr.hwndFrom) {
             return None;
         }
-        if draw.dwDrawStage != CDDS_PREPAINT {
-            return Some(CDRF_DODEFAULT);
+        match draw.dwDrawStage {
+            CDDS_PREPAINT => {
+                self.paint_command_button(draw.hdr.hwndFrom, draw.hdc);
+                Some(CDRF_SKIPDEFAULT | CDRF_NOTIFYPOSTPAINT)
+            }
+            CDDS_POSTPAINT => {
+                self.paint_command_button(draw.hdr.hwndFrom, draw.hdc);
+                Some(CDRF_SKIPDEFAULT)
+            }
+            _ => Some(CDRF_DODEFAULT),
         }
-        let disabled = draw.uItemState.contains(CDIS_DISABLED);
+    }
+
+    pub(crate) fn paint_command_button(&self, hwnd: HWND, hdc: HDC) -> bool {
+        if !self.paints_command_button(hwnd) {
+            return false;
+        }
+        let state = unsafe { SendMessageW(hwnd, BM_GETSTATE, WPARAM(0), LPARAM(0)) }.0 as u32;
+        let disabled = unsafe { !IsWindowEnabled(hwnd).as_bool() };
         let brush = if disabled {
             self.theme.disabled
-        } else if draw.uItemState.contains(CDIS_SELECTED) {
+        } else if state & BST_PUSHED != 0 {
             self.theme.pressed
-        } else if draw.uItemState.contains(CDIS_HOT) {
+        } else if state & BST_HOT != 0 {
             self.theme.hover
         } else {
             self.theme.primary
         };
-        let caption = if draw.hdr.hwndFrom == self.save {
+        let caption = if hwnd == self.save {
             if self.painted.phase == Some(Phase::Saving) {
                 "Saving MP3…"
             } else {
@@ -641,13 +671,15 @@ impl Controls {
             self.painted.toggle_label
         };
         let mut text: Vec<u16> = caption.encode_utf16().collect();
-        let rect = draw.rc;
+        let mut rect = RECT::default();
         unsafe {
-            FillRect(draw.hdc, &rect, self.theme.background);
-            let old_pen = SelectObject(draw.hdc, GetStockObject(NULL_PEN));
-            let old_brush = SelectObject(draw.hdc, HGDIOBJ(brush.0));
+            let _ = GetClientRect(hwnd, &mut rect);
+            let _ = SetROP2(hdc, R2_COPYPEN);
+            FillRect(hdc, &rect, self.theme.background);
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
             let _ = RoundRect(
-                draw.hdc,
+                hdc,
                 rect.left,
                 rect.top,
                 rect.right,
@@ -655,10 +687,10 @@ impl Controls {
                 self.s(10),
                 self.s(10),
             );
-            let old_font = SelectObject(draw.hdc, HGDIOBJ(self.fonts.strong.0));
-            SetBkMode(draw.hdc, TRANSPARENT);
+            let old_font = SelectObject(hdc, HGDIOBJ(self.fonts.strong.0));
+            SetBkMode(hdc, TRANSPARENT);
             SetTextColor(
-                draw.hdc,
+                hdc,
                 if disabled {
                     self.theme.muted
                 } else {
@@ -667,16 +699,16 @@ impl Controls {
             );
             let mut text_rect = rect;
             DrawTextW(
-                draw.hdc,
+                hdc,
                 &mut text,
                 &mut text_rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            SelectObject(draw.hdc, old_font);
-            SelectObject(draw.hdc, old_brush);
-            SelectObject(draw.hdc, old_pen);
+            SelectObject(hdc, old_font);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
         }
-        Some(CDRF_SKIPDEFAULT)
+        true
     }
 }
 
