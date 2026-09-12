@@ -353,7 +353,21 @@ impl Controls {
     }
 
     pub(crate) fn show(&mut self, root: HWND, view: &View) {
-        if self.list_dropped && matches!(view.phase, Phase::Idle | Phase::AwaitingSave) {
+        let pending = view.phase == Phase::AwaitingSave;
+        let saving = view.phase == Phase::Saving;
+        let phase_changed = self.painted.phase != Some(view.phase);
+        if phase_changed && !matches!(view.phase, Phase::Idle | Phase::Failed) {
+            for list in [self.microphones, self.outputs, self.quality] {
+                unsafe {
+                    SendMessageW(list, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+                }
+            }
+            self.list_dropped = false;
+        }
+        enable(self.microphones, view.microphone.enabled);
+        enable(self.outputs, view.output.enabled);
+        enable(self.quality, view.quality.enabled);
+        if self.list_dropped && view.phase == Phase::Idle {
             return;
         }
         // Preserve an open picker's hovered row without freezing status updates.
@@ -369,22 +383,8 @@ impl Controls {
             choose(self.outputs, view.output);
             choose(self.quality, view.quality);
         }
-        let phase_changed = self.painted.phase != Some(view.phase);
-        let pending = view.phase == Phase::AwaitingSave;
-        let saving = view.phase == Phase::Saving;
         let previous_focus = unsafe { GetFocus() };
         if phase_changed {
-            if view.phase == Phase::Recording || saving {
-                for list in [self.microphones, self.outputs, self.quality] {
-                    unsafe {
-                        SendMessageW(list, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
-                    }
-                }
-                self.list_dropped = false;
-                choose(self.microphones, view.microphone);
-                choose(self.outputs, view.output);
-                choose(self.quality, view.quality);
-            }
             self.painted.phase = Some(view.phase);
             visible(self.toggle, !pending && !saving);
             visible(self.save, pending || saving);

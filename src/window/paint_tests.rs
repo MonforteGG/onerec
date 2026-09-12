@@ -173,6 +173,9 @@ mod tests {
         assert!(!unsafe { IsWindowVisible(controls.save).as_bool() });
         unsafe { SetFocus(controls.toggle).unwrap(); }
         view.phase = Phase::AwaitingSave;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
         view.transport.toggle_enabled = false;
         view.transport.save_enabled = true;
         view.transport.discard_enabled = true;
@@ -181,6 +184,7 @@ mod tests {
         assert!(unsafe { IsWindowVisible(controls.save).as_bool() });
         assert!(unsafe { IsWindowEnabled(controls.save).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.discard).as_bool() });
+        assert!(!unsafe { IsWindowEnabled(controls.quality).as_bool() });
         assert_eq!(unsafe { GetFocus() }, controls.save);
         view.phase = Phase::Saving;
         view.transport.save_enabled = false;
@@ -190,6 +194,29 @@ mod tests {
         assert!(!unsafe { IsWindowVisible(controls.discard).as_bool() });
         assert!(!unsafe { IsWindowVisible(controls.quality).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.progress).as_bool() });
+    }
+
+    #[test]
+    fn awaiting_save_closes_and_disables_quality_if_the_list_was_open() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        controls.show(ui.root, &view);
+        unsafe {
+            SendMessageW(controls.quality, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+        }
+        controls.set_list_dropped(true);
+        view.phase = Phase::AwaitingSave;
+        view.microphone.enabled = false;
+        view.output.enabled = false;
+        view.quality.enabled = false;
+        view.transport.toggle_enabled = false;
+        view.transport.save_enabled = true;
+        view.transport.discard_enabled = true;
+        controls.show(ui.root, &view);
+        assert!(!dropped(controls.quality));
+        assert!(!unsafe { IsWindowEnabled(controls.quality).as_bool() });
     }
 
     #[test]
