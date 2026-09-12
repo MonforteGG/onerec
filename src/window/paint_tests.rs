@@ -288,6 +288,41 @@ mod tests {
     }
 
     #[test]
+    fn closed_device_combos_sit_above_their_vu_row() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        view.saved_path = Some(r"C:\Meetings\2026-09-12 15-52 Meeting.mp3".into());
+        view.status.text = "Saved: 2026-09-12 15-52 Meeting.mp3".into();
+        controls.show(ui.root, &view);
+
+        let mic = window_rect_in_parent(ui.root, controls.microphones);
+        let mic_level = window_rect_in_parent(ui.root, controls.microphone_level);
+        let mic_meter = controls.meter_rect(0);
+        assert!(
+            mic.bottom <= mic_level.top,
+            "mic combo {mic:?} overlaps level {mic_level:?}"
+        );
+        assert!(
+            mic.bottom <= mic_meter.top,
+            "mic combo {mic:?} overlaps meter {mic_meter:?}"
+        );
+
+        let output = window_rect_in_parent(ui.root, controls.outputs);
+        let output_level = window_rect_in_parent(ui.root, controls.output_level);
+        let output_meter = controls.meter_rect(1);
+        assert!(
+            output.bottom <= output_level.top,
+            "output combo {output:?} overlaps level {output_level:?}"
+        );
+        assert!(
+            output.bottom <= output_meter.top,
+            "output combo {output:?} overlaps meter {output_meter:?}"
+        );
+    }
+
+    #[test]
     fn recording_hud_hides_device_combos() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();

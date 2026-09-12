@@ -4,7 +4,7 @@ use crate::recorder::{Phase, Selector, Status, Tone, View};
 use crate::RunError;
 use std::ffi::c_void;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{
@@ -60,6 +60,7 @@ pub(crate) struct Controls {
     units: u32,
     painted: Painted,
     list_dropped: bool,
+    meter_top: [i32; 2],
 }
 
 #[derive(Default)]
@@ -114,7 +115,7 @@ impl Controls {
         let save_as = button(root, instance, ID_SAVE_AS, w!("Save &as…"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
-        let controls = Self {
+        let mut controls = Self {
             microphones,
             outputs,
             quality,
@@ -155,6 +156,7 @@ impl Controls {
             dpi,
             painted: Painted::default(),
             list_dropped: false,
+            meter_top: [0; 2],
         };
         for control in [
             save,
@@ -245,7 +247,7 @@ impl Controls {
         scale(value, self.units)
     }
 
-    fn layout(&self, root: HWND) {
+    fn layout(&mut self, root: HWND) {
         let place = |control, x, y, width, height| unsafe {
             let _ = SetWindowPos(
                 control,
@@ -255,6 +257,17 @@ impl Controls {
                 self.s(width),
                 self.s(height),
                 SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        };
+        let place_combo = |control, x, y, width, height| unsafe {
+            let _ = SetWindowPos(
+                control,
+                None,
+                self.s(x),
+                self.s(y),
+                self.s(width),
+                self.s(height),
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
         };
         if self.painted.hud {
@@ -278,13 +291,11 @@ impl Controls {
         place(self.pause, 356, 80, 104, 24);
         place(self.settings, 356, 80, 104, 24);
         place(self.microphone_label, 20, 110, 440, 18);
-        place(self.microphones, 20, 130, 440, 220);
-        place(self.microphone_level, 364, 155, 96, 20);
+        place_combo(self.microphones, 20, 130, 440, 220);
         place(self.output_label, 20, 182, 440, 18);
-        place(self.outputs, 20, 202, 440, 220);
-        place(self.output_level, 364, 227, 96, 20);
+        place_combo(self.outputs, 20, 202, 440, 220);
         place(self.quality_label, 20, 259, 136, 20);
-        place(self.quality, 178, 254, 282, 220);
+        place_combo(self.quality, 178, 254, 282, 220);
         place(self.progress_label, 20, 254, 440, 20);
         place(self.progress, 20, 278, 440, 10);
         let text_width = if self.painted.saved_file || self.painted.missing_devices {
@@ -322,6 +333,32 @@ impl Controls {
                 );
             }
             dropdown_width(list, self.fonts.body, self.s(440), self.s(32));
+        }
+        let mic_bottom = window_rect_in_parent(root, self.microphones).bottom;
+        let out_bottom = window_rect_in_parent(root, self.outputs).bottom;
+        unsafe {
+            let _ = SetWindowPos(
+                self.microphone_level,
+                None,
+                self.s(364),
+                mic_bottom,
+                self.s(96),
+                self.s(20),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                self.output_level,
+                None,
+                self.s(364),
+                out_bottom,
+                self.s(96),
+                self.s(20),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        self.meter_top = [mic_bottom + self.s(2), out_bottom + self.s(2)];
+        for list in [self.microphones, self.outputs, self.quality] {
+            paint_combo_chrome(list);
         }
         self.apply_frame(
             root,
@@ -597,6 +634,11 @@ impl Controls {
                     unsafe {
                         let _ = InvalidateRect(root, Some(&self.meter_rect(index)), false);
                     }
+                    paint_combo_chrome(if index == 0 {
+                        self.microphones
+                    } else {
+                        self.outputs
+                    });
                 }
                 if old.clipping != next.clipping || old.db != next.db || phase_changed {
                     let label = if next.clipping {
@@ -622,12 +664,12 @@ impl Controls {
     }
 
     fn meter_rect(&self, index: usize) -> RECT {
-        let y = if index == 0 { 160 } else { 232 };
+        let y = self.meter_top[index];
         RECT {
             left: self.s(20),
-            top: self.s(y),
+            top: y,
             right: self.s(352),
-            bottom: self.s(y + 8),
+            bottom: y + self.s(8),
         }
     }
     pub(crate) fn background(&self) -> HBRUSH {
@@ -867,6 +909,52 @@ fn bar_fraction(peak: f32) -> f32 {
         ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
     }
 }
+fn window_rect_in_parent(parent: HWND, window: HWND) -> RECT {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(window, &mut rect);
+    }
+    let mut points = [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+    ];
+    unsafe {
+        MapWindowPoints(HWND::default(), parent, &mut points);
+    }
+    RECT {
+        left: points[0].x,
+        top: points[0].y,
+        right: points[1].x,
+        bottom: points[1].y,
+    }
+}
+
+fn paint_combo_chrome(list: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            list,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = RedrawWindow(
+            list,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_FRAME | RDW_NOCHILDREN,
+        );
+    }
+}
+
 fn refill(list: HWND, names: &[String]) {
     unsafe {
         SendMessageW(list, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
