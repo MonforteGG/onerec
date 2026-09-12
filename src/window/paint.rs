@@ -27,6 +27,8 @@ pub(crate) const ID_QUALITY: u16 = 106;
 pub(crate) const ID_FOLDER: u16 = 107;
 pub(crate) const ID_REFRESH: u16 = 108;
 pub(crate) const ID_PAUSE: u16 = 110;
+pub(crate) const ID_SETTINGS: u16 = 111;
+pub(crate) const ID_SAVE_AS: u16 = 112;
 const MICROPHONE_Y: i32 = 130;
 
 pub(crate) struct Controls {
@@ -42,6 +44,8 @@ pub(crate) struct Controls {
     save: HWND,
     discard: HWND,
     pause: HWND,
+    settings: HWND,
+    save_as: HWND,
     folder: HWND,
     refresh: HWND,
     elapsed: HWND,
@@ -106,6 +110,8 @@ impl Controls {
         let save = button(root, instance, ID_SAVE, w!("&Save recording…"))?;
         let discard = button(root, instance, ID_DISCARD, w!("&Discard…"))?;
         let pause = button(root, instance, ID_PAUSE, w!("&Pause"))?;
+        let settings = button(root, instance, ID_SETTINGS, w!("&Settings"))?;
+        let save_as = button(root, instance, ID_SAVE_AS, w!("Save &as…"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
         let controls = Self {
@@ -121,6 +127,8 @@ impl Controls {
             save,
             discard,
             pause,
+            settings,
+            save_as,
             folder,
             refresh,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
@@ -152,6 +160,8 @@ impl Controls {
             save,
             discard,
             pause,
+            settings,
+            save_as,
             folder,
             refresh,
             controls.progress,
@@ -175,7 +185,7 @@ impl Controls {
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 20] {
+    fn all(&self) -> [HWND; 22] {
         [
             self.microphone_label,
             self.microphones,
@@ -189,6 +199,8 @@ impl Controls {
             self.save,
             self.discard,
             self.pause,
+            self.settings,
+            self.save_as,
             self.folder,
             self.refresh,
             self.elapsed,
@@ -259,9 +271,12 @@ impl Controls {
         place(self.elapsed, 20, 36, 220, 44);
         place(self.toggle, 256, 36, 204, 40);
         place(self.save, 256, 36, 204, 40);
-        place(self.shortcut, 256, 80, 204, 18);
+        let idle = self.painted.phase == Some(Phase::Idle);
+        place(self.shortcut, 256, 80, if idle { 92 } else { 204 }, 18);
+        place(self.save_as, 256, 80, 92, 24);
         place(self.discard, 356, 80, 104, 24);
         place(self.pause, 356, 80, 104, 24);
+        place(self.settings, 356, 80, 104, 24);
         place(self.microphone_label, 20, 110, 440, 18);
         place(self.microphones, 20, 130, 440, 220);
         place(self.microphone_level, 364, 155, 96, 20);
@@ -427,6 +442,8 @@ impl Controls {
             visible(self.save, pending || saving);
             visible(self.discard, pending);
             visible(self.pause, live);
+            visible(self.settings, view.phase == Phase::Idle);
+            visible(self.save_as, pending && view.save_direct);
             visible(self.shortcut, hud || (!pending && !saving && !live));
             visible(self.quality, !hud && !saving);
             visible(self.quality_label, !hud && !saving);
@@ -451,6 +468,8 @@ impl Controls {
                 self.save,
                 if saving {
                     "Saving MP3…"
+                } else if view.save_direct {
+                    "&Save recording"
                 } else {
                     "&Save recording…"
                 },

@@ -1,5 +1,6 @@
 mod paint;
 mod save_dialog;
+mod settings;
 mod shell;
 mod theme;
 
