@@ -832,7 +832,16 @@ mod tests {
 
     #[test]
     fn save_as_writes_mp3_then_goes_idle() {
-        let (mut session, path) = record_silence();
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let path = staging.path().to_path_buf();
+        let mut session = Session::Idle;
+        start_quality(
+            &mut session,
+            PcmSource::silence(),
+            NoPacketSource,
+            staging,
+            ExportQuality::Standard,
+        );
         thread::sleep(Duration::from_millis(40));
         session.stop();
         assert!(path.exists());
