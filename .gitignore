@@ -40,3 +40,7 @@ Thumbs.db
 # Native UI preview output
 *.bmp
 /target/ui-preview/
+
+# Last-session prefs written next to a local build
+/onerec.ini
+
