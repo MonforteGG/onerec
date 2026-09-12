@@ -129,7 +129,7 @@ struct Shell {
 // loop must still be able to paint the window and observe the export worker.
 fn dispatch(root: HWND, intent: Intent) {
     let Some(Some(view)) = with_shell(root, |shell| {
-        if shell.modal && !matches!(intent, Intent::Tick) {
+        if shell.modal && !matches!(intent, Intent::Tick | Intent::Minimized(_)) {
             return None;
         }
         let blocking = matches!(
@@ -627,6 +627,10 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SIZE => {
             with_shell(root, |shell| shell.sync_timer(root));
+            dispatch(
+                root,
+                Intent::Minimized(unsafe { IsIconic(root) }.as_bool()),
+            );
             DefWindowProcW(root, message, wparam, lparam)
         }
         WM_CTLCOLORSTATIC => {

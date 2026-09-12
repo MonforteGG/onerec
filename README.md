@@ -19,7 +19,7 @@ The V1 is a portable desktop app for Windows 10 and later, written in Rust with 
 ## Features
 
 - **Microphone + system audio.** Capture both sources together using Windows WASAPI loopback, without a meeting app integration.
-- **One window, one recording.** Device selectors, a prominent timer, separate audio meters, and clear recording and saving states. The full interface stays visible during recording, including both audio meters and Settings.
+- **One window, one recording.** Device selectors, a prominent timer, separate audio meters, and clear recording and saving states. The meters move as soon as you pick a microphone and output device, so you can check the sources before pressing Record. The full interface stays visible during recording, including both audio meters and Settings.
 - **Configurable global shortcut.** Start and stop with `Alt+Shift+R` by default, including when the app is in the background. Change the combination in Settings or clear it to disable the shortcut. Pause and Resume have a separate button.
 - **Five MP3 profiles.** Choose small files for speech or higher bitrates for fuller audio.
 - **Remembered preferences.** Restore your devices, quality, last successfully saved filename and folder, and keyboard shortcut.
@@ -30,7 +30,7 @@ The V1 is a portable desktop app for Windows 10 and later, written in Rust with 
 
 Run `onerec.exe` from a folder you can write to. No installer is required. To create the executable from source, see [Build from source](#build-from-source).
 
-1. Select your **microphone** and the **output device** playing the meeting, such as your headphones or speakers.
+1. Select your **microphone** and the **output device** playing the meeting, such as your headphones or speakers. Speak and play audio: the meters should move if the right devices are selected.
 2. Choose an **MP3 quality** before recording. On the first launch, **Meeting** is selected.
 3. Click **Record** or press your shortcut (`Alt+Shift+R` by default). Both microphone and system-audio meters remain visible while recording.
 4. Click **Pause** to freeze the timer and skip writing the take. Click **Resume** to continue on the same take.
@@ -80,7 +80,7 @@ Capture and mixing run at 48 kHz stereo. During recording, onerec writes a tempo
 
 MP3 compression happens when you save. The temporary take is removed after a successful save or discard, and unsaved takes are not restored on the next launch. Since the temporary audio already reflects your selected profile, a Meeting take cannot later be exported as High.
 
-The interface has no periodic refresh timer while idle or awaiting save. During recording, meters update at up to 20 Hz, dropping to 2 Hz when minimized. Buffered PCM writes and MP3 export in bounded chunks keep disk and memory use controlled; export runs on a temporary worker thread.
+The interface has no periodic refresh timer while awaiting save, or while minimized except during MP3 export. While visible and idle or recording, meters update at up to 20 Hz. Minimizing releases idle device monitoring and pauses meter redraws; recording itself continues. Buffered PCM writes and MP3 export in bounded chunks keep disk and memory use controlled; export runs on a temporary worker thread.
 
 ## Build from source
 

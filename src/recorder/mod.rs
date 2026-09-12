@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioError, Endpoint, Endpoints};
-use crate::capture::CaptureSource;
+use crate::capture::{CaptureRead, CaptureSource};
 use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::{ExportQuality, SaveProgress};
 #[cfg(windows)]
@@ -45,6 +45,7 @@ pub(crate) enum Intent {
     Closing,
     DiscardAndClose,
     HotkeyUnavailable,
+    Minimized(bool),
 }
 
 #[derive(Debug)]
@@ -76,10 +77,18 @@ pub(crate) enum Phase {
 impl Phase {
     pub(crate) fn timer_ms(self, minimized: bool) -> Option<u32> {
         match self {
-            Self::Recording => Some(if minimized { 500 } else { 50 }),
             Self::Saving => Some(50),
-            _ => None,
+            Self::AwaitingSave => None,
+            _ if minimized => None,
+            Self::Idle | Self::Recording | Self::Paused | Self::Failed => Some(50),
         }
+    }
+
+    pub(crate) fn meters_live(self) -> bool {
+        matches!(
+            self,
+            Self::Idle | Self::Recording | Self::Paused | Self::Failed
+        )
     }
 }
 
@@ -151,12 +160,17 @@ pub(crate) struct Recorder {
     session: Session,
     microphone_vu: Vu,
     system_vu: Vu,
+    mic_monitor: Option<Box<dyn CaptureSource>>,
+    sys_monitor: Option<Box<dyn CaptureSource>>,
+    mic_monitor_id: Option<MicrophoneId>,
+    sys_monitor_id: Option<OutputDeviceId>,
     notice: Option<Status>,
     last_tick: Instant,
     pending_ask: Option<Ask>,
     saved_path: Option<PathBuf>,
     prefs: Prefs,
     store: Option<PathBuf>,
+    minimized: bool,
 }
 
 impl Recorder {
@@ -204,7 +218,7 @@ impl Recorder {
             remembered_out.as_ref(),
             endpoints.default_output(),
         );
-        Self {
+        let mut recorder = Self {
             devices,
             staging,
             endpoints,
@@ -215,13 +229,20 @@ impl Recorder {
             session: Session::Idle,
             microphone_vu: Vu::new(),
             system_vu: Vu::new(),
+            mic_monitor: None,
+            sys_monitor: None,
+            mic_monitor_id: None,
+            sys_monitor_id: None,
             notice,
             last_tick: Instant::now(),
             pending_ask: None,
             saved_path: None,
             prefs,
             store,
-        }
+            minimized: false,
+        };
+        recorder.ensure_monitors();
+        recorder
     }
 
     pub(crate) fn apply(&mut self, intent: Intent) -> View {
@@ -263,6 +284,7 @@ impl Recorder {
             Intent::HotkeyUnavailable => {
                 self.notice = Some(warn(HOTKEY_UNAVAILABLE))
             }
+            Intent::Minimized(minimized) => self.set_minimized(minimized),
         }
         self.view()
     }
@@ -274,6 +296,7 @@ impl Recorder {
             self.session.stop();
             self.microphone_vu.reset();
             self.system_vu.reset();
+            self.ensure_monitors();
         } else if matches!(self.session, Session::AwaitingSave(_)) {
             self.notice = Some(warn("Save or discard this take before starting another."));
         } else if matches!(self.session, Session::Failed(_)) {
@@ -300,24 +323,37 @@ impl Recorder {
         };
         let mic_id = microphone.id().clone();
         let out_id = output.id().clone();
-        let mic = match self.devices.open_microphone(&mic_id) {
-            Ok(source) => source,
-            Err(error) => {
-                self.notice = Some(warn(error.to_string()));
-                return;
-            }
+        let (mon_mic, mon_sys) = self.take_monitors();
+        let mic = match mon_mic {
+            Some(source) => source,
+            None => match self.devices.open_microphone(&mic_id) {
+                Ok(source) => Box::new(self.microphone_vu.tap(source)),
+                Err(error) => {
+                    self.notice = Some(warn(error.to_string()));
+                    self.ensure_monitors();
+                    return;
+                }
+            },
         };
-        let sys = match self.devices.open_loopback(&out_id) {
-            Ok(source) => source,
-            Err(error) => {
-                self.notice = Some(warn(error.to_string()));
-                return;
-            }
+        let sys = match mon_sys {
+            Some(source) => source,
+            None => match self.devices.open_loopback(&out_id) {
+                Ok(source) => Box::new(self.system_vu.tap(source)),
+                Err(error) => {
+                    self.notice = Some(warn(error.to_string()));
+                    drop(mic);
+                    self.ensure_monitors();
+                    return;
+                }
+            },
         };
         let staging = match self.staging.next_take() {
             Ok(file) => file,
             Err(error) => {
                 self.notice = Some(warn(error.to_string()));
+                drop(mic);
+                drop(sys);
+                self.ensure_monitors();
                 return;
             }
         };
@@ -329,8 +365,8 @@ impl Recorder {
         self.session.start(
             mic_id,
             out_id,
-            self.microphone_vu.tap(mic),
-            self.system_vu.tap(sys),
+            mic,
+            sys,
             staging,
             self.quality,
         );
@@ -359,6 +395,7 @@ impl Recorder {
                     text: detail,
                     tone: Tone::Failure,
                 });
+                self.ensure_monitors();
             }
             Err(error) => self.notice = Some(warn(error.to_string())),
         }
@@ -416,6 +453,7 @@ impl Recorder {
                 self.microphone_vu.reset();
                 self.system_vu.reset();
                 self.notice = None;
+                self.ensure_monitors();
             }
             Err(error) => self.notice = Some(warn(error.to_string())),
         }
@@ -441,6 +479,7 @@ impl Recorder {
                     self.endpoints.default_output(),
                 );
                 self.endpoints_dirty = true;
+                self.ensure_monitors();
             }
             Err(error) => self.notice = Some(warn(error.to_string())),
         }
@@ -455,6 +494,7 @@ impl Recorder {
         }
         self.microphone = Some(index);
         self.persist();
+        self.ensure_monitors();
     }
 
     fn select_output(&mut self, index: usize) {
@@ -466,6 +506,7 @@ impl Recorder {
         }
         self.output = Some(index);
         self.persist();
+        self.ensure_monitors();
     }
 
     fn select_quality(&mut self, index: usize) {
@@ -483,7 +524,11 @@ impl Recorder {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
-        if matches!(self.session, Session::Recording(_)) {
+        if matches!(self.session, Session::Idle | Session::Failed(_)) {
+            self.drain_monitors();
+            self.microphone_vu.advance(dt);
+            self.system_vu.advance(dt);
+        } else if matches!(self.session, Session::Recording(_) | Session::Paused(_)) {
             self.microphone_vu.advance(dt);
             self.system_vu.advance(dt);
         }
@@ -507,6 +552,7 @@ impl Recorder {
                 self.saved_path = Some(path);
                 self.microphone_vu.reset();
                 self.system_vu.reset();
+                self.ensure_monitors();
             }
             Some(Err(SaveError::NoTake)) => {}
             Some(Err(SaveError::Write(detail))) => {
@@ -543,16 +589,9 @@ impl Recorder {
             None
         };
         let pickers_enabled = matches!(self.session, Session::Idle | Session::Failed(_));
-        let recording = matches!(self.session, Session::Recording(_));
+        let phase = self.phase();
         View {
-            phase: match self.session {
-                Session::Idle => Phase::Idle,
-                Session::Recording(_) => Phase::Recording,
-                Session::Paused(_) => Phase::Paused,
-                Session::AwaitingSave(_) => Phase::AwaitingSave,
-                Session::Saving(_) => Phase::Saving,
-                Session::Failed(_) => Phase::Failed,
-            },
+            phase,
             endpoints,
             microphone: Selector {
                 selected: self.microphone,
@@ -568,7 +607,7 @@ impl Recorder {
             },
             transport: self.transport(),
             elapsed: format_elapsed(self.session.elapsed().unwrap_or_default()),
-            levels: if recording {
+            levels: if phase.meters_live() {
                 Levels {
                     microphone: self.microphone_vu.snapshot(),
                     system: self.system_vu.snapshot(),
@@ -704,6 +743,99 @@ impl Recorder {
             return true;
         };
         self.prefs.write(path).is_ok()
+    }
+
+    fn phase(&self) -> Phase {
+        match self.session {
+            Session::Idle => Phase::Idle,
+            Session::Recording(_) => Phase::Recording,
+            Session::Paused(_) => Phase::Paused,
+            Session::AwaitingSave(_) => Phase::AwaitingSave,
+            Session::Saving(_) => Phase::Saving,
+            Session::Failed(_) => Phase::Failed,
+        }
+    }
+
+    fn ensure_monitors(&mut self) {
+        if self.minimized || !matches!(self.session, Session::Idle | Session::Failed(_)) {
+            self.drop_monitors();
+            return;
+        }
+        let mic_id = self.selected_microphone_id();
+        if self.mic_monitor_id != mic_id {
+            self.mic_monitor = None;
+            self.mic_monitor_id = None;
+            self.microphone_vu.reset();
+            if let Some(id) = &mic_id {
+                if let Ok(source) = self.devices.open_microphone(id) {
+                    self.mic_monitor = Some(Box::new(self.microphone_vu.tap(source)));
+                    self.mic_monitor_id = Some(id.clone());
+                }
+            }
+        }
+        let out_id = self.selected_output_id();
+        if self.sys_monitor_id != out_id {
+            self.sys_monitor = None;
+            self.sys_monitor_id = None;
+            self.system_vu.reset();
+            if let Some(id) = &out_id {
+                if let Ok(source) = self.devices.open_loopback(id) {
+                    self.sys_monitor = Some(Box::new(self.system_vu.tap(source)));
+                    self.sys_monitor_id = Some(id.clone());
+                }
+            }
+        }
+    }
+
+    fn take_monitors(
+        &mut self,
+    ) -> (
+        Option<Box<dyn CaptureSource>>,
+        Option<Box<dyn CaptureSource>>,
+    ) {
+        self.mic_monitor_id = None;
+        self.sys_monitor_id = None;
+        (self.mic_monitor.take(), self.sys_monitor.take())
+    }
+
+    fn drop_monitors(&mut self) {
+        self.mic_monitor = None;
+        self.sys_monitor = None;
+        self.mic_monitor_id = None;
+        self.sys_monitor_id = None;
+    }
+
+    fn drain_monitors(&mut self) {
+        drain_source(&mut self.mic_monitor, &mut self.mic_monitor_id);
+        drain_source(&mut self.sys_monitor, &mut self.sys_monitor_id);
+    }
+
+    fn set_minimized(&mut self, minimized: bool) {
+        let restored = self.minimized && !minimized;
+        self.minimized = minimized;
+        if minimized {
+            if matches!(self.session, Session::Idle | Session::Failed(_)) {
+                self.drop_monitors();
+                self.microphone_vu.reset();
+                self.system_vu.reset();
+            }
+        } else if restored {
+            self.ensure_monitors();
+            self.advance_meters();
+        }
+    }
+}
+
+fn drain_source<Id>(source: &mut Option<Box<dyn CaptureSource>>, id: &mut Option<Id>) {
+    let Some(capture) = source else {
+        return;
+    };
+    match capture.read(Duration::ZERO) {
+        Ok(CaptureRead::Frames(_) | CaptureRead::NoPacket) => {}
+        Err(_) => {
+            *source = None;
+            *id = None;
+        }
     }
 }
 
@@ -883,15 +1015,63 @@ mod tests {
     }
 
     #[test]
-    fn picker_change_opens_nothing() {
+    fn idle_meters_follow_the_selected_microphone_without_starting() {
+        let (mut recorder, opens) = recorder(MicKind::Tone(0.25), false);
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        let view = recorder.apply(Intent::Tick);
+        assert_eq!(view.phase, Phase::Idle);
+        assert_eq!(view.transport.toggle_label, "Start recording");
+        assert!(
+            view.levels.microphone.peak >= 0.2,
+            "idle mic peak was {}",
+            view.levels.microphone.peak
+        );
+        assert_eq!(view.levels.system.peak, 0.0);
+        recorder.apply(Intent::ChooseMicrophone(1));
+        assert_eq!(opens.load(Ordering::SeqCst), 3);
+        recorder.apply(Intent::ChooseOutput(1));
+        assert_eq!(opens.load(Ordering::SeqCst), 4);
+        assert_eq!(recorder.apply(Intent::Tick).phase, Phase::Idle);
+        stop_take(&mut recorder);
+        let stopped = recorder.apply(Intent::Tick);
+        assert_eq!(stopped.phase, Phase::AwaitingSave);
+        assert_eq!(stopped.levels.microphone.peak, 0.0);
+        recorder.apply(Intent::Discard);
+        let idle = recorder.apply(Intent::Tick);
+        assert_eq!(idle.phase, Phase::Idle);
+        assert!(
+            idle.levels.microphone.peak >= 0.2,
+            "meters should return after discard, peak was {}",
+            idle.levels.microphone.peak
+        );
+        let parked = recorder.apply(Intent::Minimized(true));
+        assert_eq!(parked.levels.microphone.peak, 0.0);
+        assert_eq!(parked.levels.system.peak, 0.0);
+        assert_eq!(recorder.apply(Intent::Tick).levels.microphone.peak, 0.0);
+        let opens_while_hidden = opens.load(Ordering::SeqCst);
+        recorder.apply(Intent::Tick);
+        assert_eq!(opens.load(Ordering::SeqCst), opens_while_hidden);
+        let restored = recorder.apply(Intent::Minimized(false));
+        assert_eq!(restored.phase, Phase::Idle);
+        assert!(
+            restored.levels.microphone.peak >= 0.2,
+            "meters should resume after restore, peak was {}",
+            restored.levels.microphone.peak
+        );
+        assert!(opens.load(Ordering::SeqCst) > opens_while_hidden);
+    }
+
+    #[test]
+    fn picker_change_does_not_start_recording() {
         let (mut recorder, opens) = recorder(MicKind::Tone(0.25), false);
         let view = recorder.apply(Intent::ChooseMicrophone(1));
         assert_eq!(view.microphone.selected, Some(1));
         assert_eq!(view.transport.toggle_label, "Start recording");
-        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(view.phase, Phase::Idle);
+        assert!(opens.load(Ordering::SeqCst) >= 2);
         let view = recorder.apply(Intent::ChooseOutput(1));
         assert_eq!(view.output.selected, Some(1));
-        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(opens.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -967,7 +1147,8 @@ mod tests {
         assert!(!view.transport.save_enabled);
         assert_eq!(view.status.text, "microphone open failed");
         assert_eq!(view.status.tone, Tone::Warning);
-        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(opens.load(Ordering::SeqCst) >= 1);
+        assert_eq!(view.phase, Phase::Idle);
     }
 
     #[test]
@@ -1286,7 +1467,7 @@ mod tests {
     fn explicit_record_and_stop_never_toggle_the_opposite_action() {
         let (mut recorder, opens) = recorder(MicKind::Tone(0.25), false);
         assert_eq!(recorder.apply(Intent::Stop).phase, Phase::Idle);
-        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
         assert_eq!(recorder.apply(Intent::Start).phase, Phase::Recording);
         assert_eq!(recorder.apply(Intent::Start).phase, Phase::Recording);
         assert_eq!(opens.load(Ordering::SeqCst), 2);
@@ -1432,13 +1613,13 @@ mod tests {
     }
 
     #[test]
-    fn timer_sleeps_when_idle_without_stalling_export_when_minimized() {
-        for phase in [Phase::Idle, Phase::Paused, Phase::AwaitingSave, Phase::Failed] {
-            assert_eq!(phase.timer_ms(false), None);
+    fn timer_stops_meters_when_minimized_but_keeps_export_polling() {
+        for phase in [Phase::Idle, Phase::Recording, Phase::Paused, Phase::Failed] {
+            assert_eq!(phase.timer_ms(false), Some(50));
             assert_eq!(phase.timer_ms(true), None);
         }
-        assert_eq!(Phase::Recording.timer_ms(false), Some(50));
-        assert_eq!(Phase::Recording.timer_ms(true), Some(500));
+        assert_eq!(Phase::AwaitingSave.timer_ms(false), None);
+        assert_eq!(Phase::AwaitingSave.timer_ms(true), None);
         assert_eq!(Phase::Saving.timer_ms(true), Some(50));
     }
 

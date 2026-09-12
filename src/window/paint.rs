@@ -568,7 +568,7 @@ impl Controls {
             let next = Meter {
                 width: (bar_fraction(level.peak) * self.s(332) as f32).round() as i32,
                 clipping: level.clipping,
-                db: (view.phase == Phase::Recording).then(|| {
+                db: view.phase.meters_live().then(|| {
                     if level.peak > 0.001 {
                         (20.0 * level.peak.log10()).round().min(0.0) as i32
                     } else {

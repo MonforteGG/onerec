@@ -200,8 +200,12 @@ fn fixture(phase: Phase) -> View {
         },
         elapsed: if phase == Phase::Idle { "00:00" } else { "1:23:45" }.into(),
         levels: Levels {
-            microphone: if recording { Level { peak: 0.16, clipping: false } } else { Level::ZERO },
-            system: if recording { Level { peak: 1.0, clipping: true } } else { Level::ZERO },
+            microphone: if recording || phase == Phase::Idle || phase == Phase::Paused {
+                Level { peak: 0.16, clipping: false }
+            } else { Level::ZERO },
+            system: if recording || phase == Phase::Idle || phase == Phase::Paused {
+                Level { peak: if recording { 1.0 } else { 0.35 }, clipping: recording }
+            } else { Level::ZERO },
         },
         progress: saving.then_some(crate::mp3::SaveProgress { done: 42, total: 100 }),
         status: Status {

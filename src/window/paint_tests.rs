@@ -410,6 +410,32 @@ mod tests {
     }
 
     #[test]
+    fn idle_meters_show_live_levels_instead_of_inactive() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        controls.show(ui.root, &view);
+        assert_eq!(caption(controls.microphone_level), "Silence");
+        view.levels.microphone = Level {
+            peak: 0.5,
+            clipping: false,
+        };
+        view.levels.system = Level {
+            peak: 0.1,
+            clipping: false,
+        };
+        controls.show(ui.root, &view);
+        assert!(controls.painted.meters[0].width > 0);
+        assert!(controls.painted.meters[1].width > 0);
+        assert_eq!(caption(controls.microphone_level), "-6 dBFS");
+        view.phase = Phase::AwaitingSave;
+        view.levels.microphone.peak = 0.5;
+        controls.show(ui.root, &view);
+        assert_eq!(caption(controls.microphone_level), "Inactive");
+    }
+
+    #[test]
     fn transport_and_settings_keep_their_positions_and_valid_actions_in_every_state() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
