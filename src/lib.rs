@@ -4,9 +4,12 @@ mod ids;
 mod mp3;
 mod prefs;
 mod recorder;
+mod save_path;
+mod sidecar;
 mod session;
 mod staging;
 mod timeline;
+mod vault;
 #[cfg(windows)]
 mod window;
 

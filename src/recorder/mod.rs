@@ -3,6 +3,7 @@ mod level;
 mod wasapi;
 
 use std::path::PathBuf;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioError, Endpoint, Endpoints};
@@ -11,13 +12,17 @@ use crate::ids::{MicrophoneId, OutputDeviceId};
 use crate::mp3::{ExportQuality, SaveProgress};
 #[cfg(windows)]
 use crate::prefs::prefs_path;
-use crate::prefs::{Prefs, Shortcut};
+use crate::prefs::{optional_text, optional_url, Prefs, Shortcut};
+use crate::save_path::{save_plan, SavePlan};
 use crate::session::{SaveError, Session};
+use crate::sidecar::{self, Job, JobKind, StartError};
 use crate::staging::StagingArea;
+use crate::vault::{self, SecretStore};
 
 pub(crate) use self::level::Level;
 use self::level::Vu;
-const HOTKEY_UNAVAILABLE: &str = "The recording shortcut is unavailable. Change it in Settings or use Record / Stop.";
+const HOTKEY_UNAVAILABLE: &str =
+    "The recording shortcut is unavailable. Change it in Settings or use Record / Stop.";
 
 pub(crate) trait Devices: 'static {
     fn survey(&self) -> Result<Endpoints, AudioError>;
@@ -41,7 +46,9 @@ pub(crate) enum Intent {
     RequestDiscard,
     Discard,
     OpenSettings,
-    SetSettings { shortcut: Shortcut },
+    SetSettings(SettingsValues),
+    ConfirmNestedSave,
+    Sidecar(JobKind),
     Closing,
     DiscardAndClose,
     HotkeyUnavailable,
@@ -62,6 +69,7 @@ pub(crate) struct View {
     pub status: Status,
     pub ask: Option<Ask>,
     pub saved_path: Option<PathBuf>,
+    pub job_busy: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +83,10 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    pub(crate) fn timer_ms(self, minimized: bool) -> Option<u32> {
+    pub(crate) fn timer_ms(self, minimized: bool, job_busy: bool) -> Option<u32> {
+        if job_busy {
+            return Some(50);
+        }
         match self {
             Self::Saving => Some(50),
             Self::AwaitingSave => None,
@@ -132,13 +143,82 @@ pub(crate) enum Tone {
     Failure,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) enum Ask {
     SaveDestination(SavePrompt),
     ConfirmClose,
     ConfirmDiscard,
     Close,
-    Settings { shortcut: Shortcut },
+    Settings(SettingsValues),
+    OverwriteNested { path: PathBuf },
+}
+
+impl std::fmt::Debug for Ask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SaveDestination(prompt) => f.debug_tuple("SaveDestination").field(prompt).finish(),
+            Self::ConfirmClose => f.debug_tuple("ConfirmClose").finish(),
+            Self::ConfirmDiscard => f.debug_tuple("ConfirmDiscard").finish(),
+            Self::Close => f.debug_tuple("Close").finish(),
+            Self::Settings(values) => f.debug_tuple("Settings").field(values).finish(),
+            Self::OverwriteNested { path } => {
+                f.debug_struct("OverwriteNested").field("path", path).finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SettingsValues {
+    pub shortcut: Shortcut,
+    pub api_key: String,
+    pub transcribe_url: String,
+    pub transcribe_model: String,
+    pub notes_model: String,
+    pub nest: bool,
+    pub notes_prompt: String,
+}
+
+impl Default for SettingsValues {
+    fn default() -> Self {
+        Self {
+            shortcut: Shortcut::default(),
+            api_key: String::new(),
+            transcribe_url: String::new(),
+            transcribe_model: String::new(),
+            notes_model: String::new(),
+            nest: false,
+            notes_prompt: String::new(),
+        }
+    }
+}
+
+impl SettingsValues {
+    pub(crate) fn from_prefs_and_vault(prefs: &Prefs, vault: &dyn SecretStore) -> Self {
+        Self {
+            shortcut: prefs.shortcut,
+            api_key: vault.load().ok().flatten().unwrap_or_default(),
+            transcribe_url: prefs.transcribe_url.clone().unwrap_or_default(),
+            transcribe_model: prefs.transcribe_model.clone().unwrap_or_default(),
+            notes_model: prefs.notes_model.clone().unwrap_or_default(),
+            nest: prefs.nest,
+            notes_prompt: prefs.notes_prompt.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SettingsValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsValues")
+            .field("shortcut", &self.shortcut)
+            .field("api_key", &if self.api_key.is_empty() { "" } else { "****" })
+            .field("transcribe_url", &self.transcribe_url)
+            .field("transcribe_model", &self.transcribe_model)
+            .field("notes_model", &self.notes_model)
+            .field("nest", &self.nest)
+            .field("notes_prompt", &self.notes_prompt)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +227,7 @@ pub(crate) struct SavePrompt {
     pub folder: Option<PathBuf>,
     pub filter_label: &'static str,
     pub extension: &'static str,
+    pub warn_if_exists: bool,
 }
 
 pub(crate) struct Recorder {
@@ -170,20 +251,31 @@ pub(crate) struct Recorder {
     saved_path: Option<PathBuf>,
     prefs: Prefs,
     store: Option<PathBuf>,
+    vault: Box<dyn SecretStore>,
     minimized: bool,
+    sidecar_job: Option<(JobKind, JoinHandle<Result<PathBuf, String>>)>,
+    pub(crate) sidecar: fn(&Job) -> Result<PathBuf, String>,
+    save_plan: Option<SavePlan>,
 }
 
 impl Recorder {
     #[cfg(windows)]
     pub(crate) fn new(staging: StagingArea) -> Self {
         let path = prefs_path();
-        let prefs = Prefs::read(&path);
-        Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path))
+        let vault: Box<dyn SecretStore> = Box::new(vault::CredentialManager);
+        let prefs = load_stored_prefs(&path, &*vault);
+        Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path), vault)
     }
 
     #[cfg(test)]
     pub(crate) fn with_devices(devices: Box<dyn Devices>, staging: StagingArea) -> Self {
-        Self::with_prefs(devices, staging, Prefs::default(), None)
+        Self::with_prefs(
+            devices,
+            staging,
+            Prefs::default(),
+            None,
+            Box::new(vault::MemoryVault::default()),
+        )
     }
 
     pub(crate) fn with_prefs(
@@ -191,6 +283,7 @@ impl Recorder {
         staging: StagingArea,
         prefs: Prefs,
         store: Option<PathBuf>,
+        vault: Box<dyn SecretStore>,
     ) -> Self {
         let mut notice = None;
         let endpoints = match devices.survey() {
@@ -239,7 +332,11 @@ impl Recorder {
             saved_path: None,
             prefs,
             store,
+            vault,
             minimized: false,
+            sidecar_job: None,
+            sidecar: sidecar::run,
+            save_plan: None,
         };
         recorder.ensure_monitors();
         recorder
@@ -254,10 +351,14 @@ impl Recorder {
             Intent::ChooseQuality(index) => self.select_quality(index),
             Intent::Toggle => self.toggle(),
             Intent::Start => {
-                if matches!(self.session, Session::Idle | Session::Failed(_)) { self.toggle(); }
+                if matches!(self.session, Session::Idle | Session::Failed(_)) {
+                    self.toggle();
+                }
             }
             Intent::Stop => {
-                if matches!(self.session, Session::Recording(_) | Session::Paused(_)) { self.toggle(); }
+                if matches!(self.session, Session::Recording(_) | Session::Paused(_)) {
+                    self.toggle();
+                }
             }
             Intent::Pause => self.pause(),
             Intent::Save => self.request_destination(),
@@ -270,20 +371,32 @@ impl Recorder {
             }
             Intent::Discard => self.discard(),
             Intent::OpenSettings => self.open_settings(),
-            Intent::SetSettings { shortcut } => {
-                self.prefs.shortcut = shortcut;
-                if self.notice.as_ref().is_some_and(|notice| notice.text == HOTKEY_UNAVAILABLE) {
+            Intent::SetSettings(next) => {
+                self.prefs.shortcut = next.shortcut;
+                if let Err(detail) = self.store_secret(&next.api_key) {
+                    self.notice = Some(warn(detail));
+                }
+                self.prefs.transcribe_url = optional_url(&next.transcribe_url);
+                self.prefs.transcribe_model = optional_text(&next.transcribe_model);
+                self.prefs.notes_model = optional_text(&next.notes_model);
+                self.prefs.nest = next.nest;
+                self.prefs.notes_prompt = optional_text(&next.notes_prompt);
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.text == HOTKEY_UNAVAILABLE)
+                {
                     self.notice = None;
                 }
                 if !self.persist() {
                     self.notice = Some(warn("Settings apply for this session, but could not be saved. Check that the onerec folder is writable."));
                 }
             }
+            Intent::ConfirmNestedSave => self.begin_encode(),
+            Intent::Sidecar(kind) => self.request_sidecar(kind),
             Intent::Closing => self.consider_closing(),
             Intent::DiscardAndClose => self.abandon_and_close(),
-            Intent::HotkeyUnavailable => {
-                self.notice = Some(warn(HOTKEY_UNAVAILABLE))
-            }
+            Intent::HotkeyUnavailable => self.notice = Some(warn(HOTKEY_UNAVAILABLE)),
             Intent::Minimized(minimized) => self.set_minimized(minimized),
         }
         self.view()
@@ -362,14 +475,8 @@ impl Recorder {
         self.notice = None;
         self.saved_path = None;
         self.last_tick = Instant::now();
-        self.session.start(
-            mic_id,
-            out_id,
-            mic,
-            sys,
-            staging,
-            self.quality,
-        );
+        self.session
+            .start(mic_id, out_id, mic, sys, staging, self.quality);
         self.dismiss_failed_start();
     }
 
@@ -410,32 +517,119 @@ impl Recorder {
 
     fn ask_save_dialog(&mut self) {
         self.pending_ask = Some(Ask::SaveDestination(SavePrompt {
-            file_name: self.prefs.last_file_name.clone().unwrap_or_else(|| "Recording.mp3".into()),
+            file_name: self
+                .prefs
+                .last_file_name
+                .clone()
+                .unwrap_or_else(|| "Recording.mp3".into()),
             folder: self.prefs.folder.clone().filter(|path| path.is_dir()),
             filter_label: "MP3 audio",
             extension: "mp3",
+            warn_if_exists: !self.prefs.nest,
         }));
     }
 
     fn open_settings(&mut self) {
-        self.pending_ask = Some(Ask::Settings {
-            shortcut: self.prefs.shortcut,
-        });
+        self.pending_ask = Some(Ask::Settings(SettingsValues::from_prefs_and_vault(
+            &self.prefs,
+            &*self.vault,
+        )));
+    }
+
+    fn store_secret(&mut self, api_key: &str) -> Result<(), String> {
+        let key = api_key.trim();
+        if key.is_empty() {
+            self.vault.delete()
+        } else {
+            self.vault.save(key)
+        }
+    }
+
+    fn request_sidecar(&mut self, kind: JobKind) {
+        self.poll_sidecar();
+        if self.sidecar_job.is_some() {
+            return;
+        }
+        let Some(audio) = self.saved_path.clone() else {
+            return;
+        };
+        match sidecar::prepare_job(&*self.vault, &self.prefs, kind, &audio) {
+            Ok(job) => {
+                self.notice = Some(neutral(kind.progress_message()));
+                let run = self.sidecar;
+                self.sidecar_job = Some((kind, std::thread::spawn(move || run(&job))));
+            }
+            Err(StartError::Gap(gap)) => {
+                self.notice = Some(warn(gap.status()));
+                self.open_settings();
+            }
+            Err(StartError::Vault(detail)) => {
+                self.notice = Some(warn(detail));
+            }
+        }
+    }
+
+    fn poll_sidecar(&mut self) {
+        let Some((kind, job)) = self.sidecar_job.take() else {
+            return;
+        };
+        if !job.is_finished() {
+            self.sidecar_job = Some((kind, job));
+            return;
+        }
+        match job.join() {
+            Ok(Ok(path)) => {
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                self.notice = Some(neutral(format!("{}: {name}", kind.success_prefix())));
+            }
+            Ok(Err(detail)) => self.notice = Some(warn(detail)),
+            Err(_) => self.notice = Some(warn("The request stopped unexpectedly.")),
+        }
     }
 
     pub(crate) fn shortcut(&self) -> Shortcut {
         self.prefs.shortcut
     }
 
-    fn save_to(&mut self, destination: &std::path::Path) {
-        match self.session.save_as(destination) {
+    fn save_to(&mut self, dialog: &std::path::Path) {
+        let plan = save_plan(dialog, self.prefs.nest);
+        self.save_plan = Some(plan.clone());
+        if plan.needs_overwrite_confirm(dialog) {
+            self.pending_ask = Some(Ask::OverwriteNested {
+                path: plan.encode.clone(),
+            });
+            return;
+        }
+        self.begin_encode();
+    }
+
+    fn begin_encode(&mut self) {
+        let Some(plan) = self.save_plan.clone() else {
+            return;
+        };
+        if let Some(parent) = plan.encode.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.notice = Some(warn(error.to_string()));
+                self.save_plan = None;
+                return;
+            }
+        }
+        match self.session.save_as(&plan.encode) {
             Ok(()) => {
                 if matches!(self.session, Session::Saving(_)) {
                     self.notice = None;
                 }
             }
-            Err(SaveError::NoTake) => {}
-            Err(SaveError::Write(detail)) => self.notice = Some(warn(detail)),
+            Err(SaveError::NoTake) => {
+                self.save_plan = None;
+            }
+            Err(SaveError::Write(detail)) => {
+                self.notice = Some(warn(detail));
+                self.save_plan = None;
+            }
         }
     }
 
@@ -443,6 +637,7 @@ impl Recorder {
         if !matches!(self.session, Session::AwaitingSave(_)) {
             return;
         }
+        self.save_plan = None;
         self.session.cancel_save();
         self.notice = Some(neutral("Save cancelled. The take is kept."));
     }
@@ -532,6 +727,7 @@ impl Recorder {
             self.microphone_vu.advance(dt);
             self.system_vu.advance(dt);
         }
+        self.poll_sidecar();
         self.drive_save();
     }
 
@@ -544,9 +740,11 @@ impl Recorder {
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
                 self.notice = Some(neutral(format!("Saved: {name}")));
-                self.prefs.last_file_name = path.file_name().map(|name| name.to_string_lossy().into_owned());
-                if let Some(folder) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-                    self.prefs.folder = Some(folder.to_path_buf());
+                self.prefs.last_file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned());
+                if let Some(plan) = self.save_plan.take() {
+                    self.prefs.folder = Some(plan.folder);
                 }
                 self.persist();
                 self.saved_path = Some(path);
@@ -554,8 +752,11 @@ impl Recorder {
                 self.system_vu.reset();
                 self.ensure_monitors();
             }
-            Some(Err(SaveError::NoTake)) => {}
+            Some(Err(SaveError::NoTake)) => {
+                self.save_plan = None;
+            }
             Some(Err(SaveError::Write(detail))) => {
+                self.save_plan = None;
                 self.notice = Some(warn(detail));
             }
         }
@@ -629,6 +830,7 @@ impl Recorder {
             },
             ask: self.pending_ask.take(),
             saved_path: self.saved_path.clone(),
+            job_busy: self.sidecar_job.is_some(),
         }
     }
 
@@ -826,6 +1028,15 @@ impl Recorder {
     }
 }
 
+fn load_stored_prefs(path: &std::path::Path, vault: &dyn SecretStore) -> Prefs {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let prefs = Prefs::parse(&text);
+    if vault::adopt_plaintext(vault, Prefs::legacy_api_key(&text).as_deref()).unwrap_or(false) {
+        let _ = prefs.write(path);
+    }
+    prefs
+}
+
 fn drain_source<Id>(source: &mut Option<Box<dyn CaptureSource>>, id: &mut Option<Id>) {
     let Some(capture) = source else {
         return;
@@ -979,6 +1190,14 @@ mod tests {
     }
 
     fn recorder_with_prefs(prefs: Prefs, store: Option<PathBuf>) -> Recorder {
+        recorder_with_vault(prefs, store, Box::new(crate::vault::MemoryVault::default()))
+    }
+
+    fn recorder_with_vault(
+        prefs: Prefs,
+        store: Option<PathBuf>,
+        vault: Box<dyn SecretStore>,
+    ) -> Recorder {
         Recorder::with_prefs(
             Box::new(FakeDevices {
                 opens: Arc::new(AtomicUsize::new(0)),
@@ -989,6 +1208,7 @@ mod tests {
             StagingArea::open().unwrap(),
             prefs,
             store,
+            vault,
         )
     }
 
@@ -1012,6 +1232,22 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("save did not reach Idle")
+    }
+
+    fn set_settings(shortcut: Shortcut) -> Intent {
+        Intent::SetSettings(SettingsValues {
+            shortcut,
+            ..SettingsValues::default()
+        })
+    }
+
+    fn ready_prefs() -> Prefs {
+        Prefs {
+            transcribe_url: Some("https://api.example.com/v1".into()),
+            transcribe_model: Some("whisper-1".into()),
+            notes_model: Some("notes-1".into()),
+            ..Prefs::default()
+        }
     }
 
     #[test]
@@ -1190,6 +1426,7 @@ mod tests {
         assert_eq!(prompt.filter_label, "MP3 audio");
         assert_eq!(prompt.extension, "mp3");
         assert_eq!(prompt.folder, None);
+        assert!(prompt.warn_if_exists);
         assert_eq!(recorder.apply(Intent::Tick).ask, None);
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("take.mp3");
@@ -1255,6 +1492,7 @@ mod tests {
                 folder: None,
                 shortcut: Shortcut::default(),
                 last_file_name: None,
+                ..Prefs::default()
             },
             None,
         );
@@ -1274,6 +1512,7 @@ mod tests {
                 folder: None,
                 shortcut: Shortcut::default(),
                 last_file_name: None,
+                ..Prefs::default()
             },
             None,
         );
@@ -1307,6 +1546,7 @@ mod tests {
                 folder: Some(folder.path().to_path_buf()),
                 shortcut: Shortcut::default(),
                 last_file_name: None,
+                ..Prefs::default()
             },
             None,
         );
@@ -1315,7 +1555,11 @@ mod tests {
         let Ask::SaveDestination(prompt) = asked.ask.expect("save prompt") else {
             panic!("expected a save prompt");
         };
-        assert!(prompt.file_name.ends_with("Recording.mp3"), "{}", prompt.file_name);
+        assert!(
+            prompt.file_name.ends_with("Recording.mp3"),
+            "{}",
+            prompt.file_name
+        );
         assert_eq!(prompt.folder.as_deref(), Some(folder.path()));
     }
 
@@ -1485,12 +1729,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut recorder = recorder_with_prefs(Prefs::default(), Some(dir.path().to_path_buf()));
         recorder.apply(Intent::HotkeyUnavailable);
-        let view = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
+        let view = recorder.apply(set_settings(Shortcut(0)));
         assert!(view.status.text.contains("could not be saved"));
         assert_eq!(recorder.shortcut(), Shortcut(0));
         recorder.store = None;
         recorder.apply(Intent::HotkeyUnavailable);
-        let view = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
+        let view = recorder.apply(set_settings(Shortcut(0)));
         assert!(view.status.text.is_empty());
     }
 
@@ -1500,12 +1744,16 @@ mod tests {
         let path = dir.path().join("onerec.ini");
         let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
         for shortcut in [Shortcut(0x0346), Shortcut(0)] {
-            recorder.apply(Intent::SetSettings { shortcut });
+            recorder.apply(set_settings(shortcut));
             let loaded = Prefs::read(&path);
             assert_eq!(loaded.shortcut, shortcut);
             assert_eq!(recorder.shortcut(), shortcut);
-            assert_eq!(recorder.apply(Intent::OpenSettings).ask,
-                Some(Ask::Settings { shortcut }));
+            let Ask::Settings(asked) = recorder.apply(Intent::OpenSettings).ask.expect("settings")
+            else {
+                panic!("expected settings");
+            };
+            assert_eq!(asked.shortcut, shortcut);
+            assert!(asked.api_key.is_empty());
         }
     }
 
@@ -1514,13 +1762,16 @@ mod tests {
         let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
         recorder.apply(Intent::Start);
         wait_mix();
-        for (intent, expected) in [(Intent::Tick, Phase::Recording),
-            (Intent::Pause, Phase::Paused), (Intent::Stop, Phase::AwaitingSave)] {
+        for (intent, expected) in [
+            (Intent::Tick, Phase::Recording),
+            (Intent::Pause, Phase::Paused),
+            (Intent::Stop, Phase::AwaitingSave),
+        ] {
             recorder.apply(intent);
             let view = recorder.apply(Intent::OpenSettings);
             assert_eq!(view.phase, expected);
-            assert!(matches!(view.ask, Some(Ask::Settings { .. })));
-            let updated = recorder.apply(Intent::SetSettings { shortcut: Shortcut(0) });
+            assert!(matches!(view.ask, Some(Ask::Settings(_))));
+            let updated = recorder.apply(set_settings(Shortcut(0)));
             assert_eq!(updated.phase, expected);
             assert_eq!(recorder.shortcut(), Shortcut(0));
         }
@@ -1615,12 +1866,14 @@ mod tests {
     #[test]
     fn timer_stops_meters_when_minimized_but_keeps_export_polling() {
         for phase in [Phase::Idle, Phase::Recording, Phase::Paused, Phase::Failed] {
-            assert_eq!(phase.timer_ms(false), Some(50));
-            assert_eq!(phase.timer_ms(true), None);
+            assert_eq!(phase.timer_ms(false, false), Some(50));
+            assert_eq!(phase.timer_ms(true, false), None);
+            assert_eq!(phase.timer_ms(true, true), Some(50));
         }
-        assert_eq!(Phase::AwaitingSave.timer_ms(false), None);
-        assert_eq!(Phase::AwaitingSave.timer_ms(true), None);
-        assert_eq!(Phase::Saving.timer_ms(true), Some(50));
+        assert_eq!(Phase::AwaitingSave.timer_ms(false, false), None);
+        assert_eq!(Phase::AwaitingSave.timer_ms(true, false), None);
+        assert_eq!(Phase::Saving.timer_ms(true, false), Some(50));
+        assert_eq!(Phase::AwaitingSave.timer_ms(true, true), Some(50));
     }
 
     #[test]
@@ -1633,35 +1886,317 @@ mod tests {
         recorder.apply(Intent::SaveTo(path.clone()));
         finish_save(&mut recorder);
         let loaded = Prefs::read(&store);
-        assert_eq!(loaded.last_file_name.as_deref(), Some("Reunión de equipo 01.mp3"));
+        assert_eq!(
+            loaded.last_file_name.as_deref(),
+            Some("Reunión de equipo 01.mp3")
+        );
         assert_eq!(loaded.folder.as_deref(), Some(folder.path()));
         let mut recorder = recorder_with_prefs(loaded, Some(store));
         stop_take(&mut recorder);
         let asked = recorder.apply(Intent::Save);
-        let Some(Ask::SaveDestination(prompt)) = asked.ask else { panic!("Save must ask"); };
+        let Some(Ask::SaveDestination(prompt)) = asked.ask else {
+            panic!("Save must ask");
+        };
         assert_eq!(prompt.file_name, "Reunión de equipo 01.mp3");
         assert_eq!(prompt.folder.as_deref(), Some(folder.path()));
         assert_eq!(asked.phase, Phase::AwaitingSave);
         let original = std::fs::read(&path).unwrap();
         recorder.apply(Intent::CancelSave);
-        assert_eq!(recorder.prefs.last_file_name.as_deref(), Some("Reunión de equipo 01.mp3"));
+        assert_eq!(
+            recorder.prefs.last_file_name.as_deref(),
+            Some("Reunión de equipo 01.mp3")
+        );
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]
     fn failed_save_does_not_replace_the_remembered_name() {
         let folder = tempfile::tempdir().unwrap();
-        let prefs = Prefs { last_file_name: Some("Successful.mp3".into()), ..Prefs::default() };
+        let prefs = Prefs {
+            last_file_name: Some("Successful.mp3".into()),
+            ..Prefs::default()
+        };
         let mut recorder = recorder_with_prefs(prefs, None);
         stop_take(&mut recorder);
-        recorder.apply(Intent::SaveTo(folder.path().join("missing").join("Failed.mp3")));
+        let blocker = folder.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        recorder.apply(Intent::SaveTo(blocker.join("Failed.mp3")));
         for _ in 0..100 {
             let view = recorder.apply(Intent::Tick);
-            if view.phase != Phase::Saving { break; }
+            if view.phase != Phase::Saving {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(recorder.prefs.last_file_name.as_deref(), Some("Successful.mp3"));
-        let Some(Ask::SaveDestination(prompt)) = recorder.apply(Intent::Save).ask else { panic!("retry dialog"); };
+        assert_eq!(
+            recorder.prefs.last_file_name.as_deref(),
+            Some("Successful.mp3")
+        );
+        let Some(Ask::SaveDestination(prompt)) = recorder.apply(Intent::Save).ask else {
+            panic!("retry dialog");
+        };
         assert_eq!(prompt.file_name, "Successful.mp3");
+    }
+
+    #[test]
+    fn transcribe_without_a_key_opens_settings_after_save() {
+        let (mut recorder, _) = recorder(MicKind::Tone(0.25), false);
+        stop_take(&mut recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("take.mp3");
+        recorder.apply(Intent::SaveTo(dest));
+        let saved = finish_save(&mut recorder);
+        assert!(!saved.job_busy);
+        let asked = recorder.apply(Intent::Sidecar(JobKind::Transcript));
+        assert!(matches!(asked.ask, Some(Ask::Settings(_))));
+        assert_eq!(asked.status.text, "No API key");
+        assert!(!asked.job_busy);
+    }
+
+    #[test]
+    fn transcribe_writes_a_markdown_sidecar_from_the_saved_mp3() {
+        let folder = tempfile::tempdir().unwrap();
+        let vault = crate::vault::MemoryVault::from_key("gsk_test");
+        let mut recorder = recorder_with_vault(ready_prefs(), None, Box::new(vault));
+        recorder.sidecar = |job| {
+            assert_eq!(job.kind, JobKind::Transcript);
+            let dest = sidecar::path(&job.audio, sidecar::SidecarKind::Transcript);
+            std::fs::write(&dest, "# Reunión\n\nhola reunión\n").unwrap();
+            Ok(dest)
+        };
+        stop_take(&mut recorder);
+        let path = folder.path().join("Reunión.mp3");
+        recorder.apply(Intent::SaveTo(path.clone()));
+        finish_save(&mut recorder);
+        let started = recorder.apply(Intent::Sidecar(JobKind::Transcript));
+        assert!(started.job_busy);
+        assert!(started.status.text.contains("Transcribing"));
+        let mut view = started;
+        for _ in 0..100 {
+            if !view.job_busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        assert!(!view.job_busy);
+        assert_eq!(view.status.text, "Transcribed: Reunión.md");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("md")).unwrap(),
+            "# Reunión\n\nhola reunión\n"
+        );
+    }
+
+    #[test]
+    fn notes_write_a_sidecar_next_to_the_mp3() {
+        let folder = tempfile::tempdir().unwrap();
+        let vault = crate::vault::MemoryVault::from_key("gsk_test");
+        let mut recorder = recorder_with_vault(ready_prefs(), None, Box::new(vault));
+        recorder.sidecar = |job| {
+            assert_eq!(job.kind, JobKind::Notes);
+            let dest = sidecar::path(&job.audio, sidecar::SidecarKind::Notes);
+            std::fs::write(&dest, "## Summary\n\nDone.\n").unwrap();
+            Ok(dest)
+        };
+        stop_take(&mut recorder);
+        let path = folder.path().join("Meeting.mp3");
+        recorder.apply(Intent::SaveTo(path.clone()));
+        finish_save(&mut recorder);
+        let started = recorder.apply(Intent::Sidecar(JobKind::Notes));
+        assert!(started.job_busy);
+        assert_eq!(started.status.text, "Writing notes…");
+        let mut view = started;
+        for _ in 0..100 {
+            if !view.job_busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        assert!(!view.job_busy);
+        assert_eq!(view.status.text, "Notes: Meeting.notes.md");
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("Meeting.notes.md")).unwrap(),
+            "## Summary\n\nDone.\n"
+        );
+    }
+
+    #[test]
+    fn settings_persist_transcription_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let vault = crate::vault::MemoryVault::default();
+        let inspect = vault.clone();
+        let mut recorder = recorder_with_vault(Prefs::default(), Some(path.clone()), Box::new(vault));
+        recorder.apply(Intent::SetSettings(SettingsValues {
+            shortcut: Shortcut::default(),
+            api_key: " gsk_live ".into(),
+            transcribe_url: "https://api.openai.com/v1/".into(),
+            transcribe_model: "whisper-1".into(),
+            notes_model: "llama-3.1-8b-instant".into(),
+            nest: false,
+            notes_prompt: String::new(),
+        }));
+        let loaded = Prefs::read(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("api_key="));
+        assert_eq!(inspect.load().unwrap().as_deref(), Some("gsk_live"));
+        assert_eq!(
+            loaded.transcribe_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(loaded.transcribe_model.as_deref(), Some("whisper-1"));
+        assert_eq!(loaded.notes_model.as_deref(), Some("llama-3.1-8b-instant"));
+        recorder.apply(Intent::SetSettings(SettingsValues {
+            shortcut: Shortcut::default(),
+            api_key: String::new(),
+            transcribe_url: "https://api.openai.com/v1".into(),
+            transcribe_model: "whisper-1".into(),
+            notes_model: "llama-3.1-8b-instant".into(),
+            nest: false,
+            notes_prompt: String::new(),
+        }));
+        assert_eq!(inspect.load().unwrap(), None);
+    }
+
+    #[test]
+    fn empty_settings_save_omits_endpoint_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        recorder.apply(Intent::SetSettings(SettingsValues {
+            shortcut: Shortcut::default(),
+            api_key: "gsk_live".into(),
+            transcribe_url: String::new(),
+            transcribe_model: String::new(),
+            notes_model: String::new(),
+            nest: false,
+            notes_prompt: String::new(),
+        }));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("api_key="));
+        assert!(!text.contains("transcribe_url="));
+        assert!(!text.contains("transcribe_model="));
+        assert!(!text.contains("notes_model="));
+        assert!(!text.contains("chat_model="));
+        assert!(text.lines().any(|line| line == "nest=0"));
+    }
+
+    #[test]
+    fn typed_groq_url_is_written_as_that_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        recorder.apply(Intent::SetSettings(SettingsValues {
+            shortcut: Shortcut::default(),
+            api_key: String::new(),
+            transcribe_url: "https://api.groq.com/openai/v1".into(),
+            transcribe_model: String::new(),
+            notes_model: String::new(),
+            nest: false,
+            notes_prompt: String::new(),
+        }));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("transcribe_url=https://api.groq.com/openai/v1"));
+        assert!(!text.contains("transcribe_model="));
+        assert!(!text.contains("notes_model="));
+        assert_eq!(
+            Prefs::read(&path).transcribe_url.as_deref(),
+            Some("https://api.groq.com/openai/v1")
+        );
+    }
+
+    #[test]
+    fn leftover_ini_key_migrates_into_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        std::fs::write(&path, "quality=Voice\napi_key=gsk_legacy\n").unwrap();
+        let vault = crate::vault::MemoryVault::default();
+        let inspect = vault.clone();
+        let prefs = load_stored_prefs(&path, &vault);
+        let _recorder = recorder_with_vault(prefs, Some(path.clone()), Box::new(vault));
+        assert_eq!(inspect.load().unwrap().as_deref(), Some("gsk_legacy"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("api_key="));
+        assert!(!Prefs::read(&path).render().contains("api_key="));
+    }
+
+    #[test]
+    fn busy_sidecar_click_is_a_silent_noop() {
+        let folder = tempfile::tempdir().unwrap();
+        let vault = crate::vault::MemoryVault::from_key("gsk_test");
+        let mut recorder = recorder_with_vault(ready_prefs(), None, Box::new(vault));
+        recorder.sidecar = |_| {
+            thread::sleep(Duration::from_millis(80));
+            Err("should not run twice".into())
+        };
+        stop_take(&mut recorder);
+        recorder.apply(Intent::SaveTo(folder.path().join("take.mp3")));
+        finish_save(&mut recorder);
+        let started = recorder.apply(Intent::Sidecar(JobKind::Transcript));
+        assert!(started.job_busy);
+        let ignored = recorder.apply(Intent::Sidecar(JobKind::Notes));
+        assert!(ignored.job_busy);
+        assert_eq!(ignored.status.text, started.status.text);
+        for _ in 0..40 {
+            if !recorder.apply(Intent::Tick).job_busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn nest_save_writes_the_take_folder_and_remembers_the_dialog_parent() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dialog = dest_dir.path().join("stem.mp3");
+        let nested = dest_dir.path().join("stem").join("stem.mp3");
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                nest: true,
+                ..Prefs::default()
+            },
+            None,
+        );
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::Save);
+        let Ask::SaveDestination(prompt) = asked.ask.expect("save prompt") else {
+            panic!("expected a save prompt");
+        };
+        assert!(!prompt.warn_if_exists);
+        recorder.apply(Intent::SaveTo(dialog.clone()));
+        let saved = finish_save(&mut recorder);
+        assert!(nested.exists());
+        assert!(!dialog.exists());
+        assert_eq!(saved.saved_path.as_deref(), Some(nested.as_path()));
+        assert_eq!(recorder.prefs.folder.as_deref(), Some(dest_dir.path()));
+        assert_eq!(recorder.prefs.last_file_name.as_deref(), Some("stem.mp3"));
+    }
+
+    #[test]
+    fn nest_overwrite_asks_then_confirm_does_not_replan() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dialog = dest_dir.path().join("stem.mp3");
+        let nested = dest_dir.path().join("stem").join("stem.mp3");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"old").unwrap();
+        let mut recorder = recorder_with_prefs(
+            Prefs {
+                nest: true,
+                ..Prefs::default()
+            },
+            None,
+        );
+        stop_take(&mut recorder);
+        let asked = recorder.apply(Intent::SaveTo(dialog));
+        match asked.ask {
+            Some(Ask::OverwriteNested { path }) => assert_eq!(path, nested),
+            other => panic!("expected nested overwrite, got {other:?}"),
+        }
+        recorder.apply(Intent::ConfirmNestedSave);
+        let saved = finish_save(&mut recorder);
+        assert_eq!(saved.saved_path.as_deref(), Some(nested.as_path()));
+        assert_eq!(recorder.prefs.folder.as_deref(), Some(dest_dir.path()));
+        assert_ne!(std::fs::read(&nested).unwrap(), b"old");
     }
 }

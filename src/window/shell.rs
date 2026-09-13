@@ -13,8 +13,8 @@ use ::windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
 };
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-    IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT,
+    IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use ::windows::Win32::UI::Shell::ShellExecuteW;
 use ::windows::Win32::UI::WindowsAndMessaging::{
@@ -33,11 +33,13 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::paint::{
-    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_OUTPUT,
-    ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SETTINGS, ID_STOP, ID_TOGGLE,
+    Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_NOTES,
+    ID_OUTPUT, ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SETTINGS, ID_STOP, ID_TOGGLE,
+    ID_TRANSCRIBE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
+use crate::sidecar::JobKind;
 use crate::RunError;
 use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
@@ -71,6 +73,7 @@ pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
         timer_ms: None,
         phase: Phase::Idle,
         saved_path: None,
+        job_busy: false,
         modal: false,
         refresh_after_picker: false,
     });
@@ -121,6 +124,7 @@ struct Shell {
     timer_ms: Option<u32>,
     phase: Phase,
     saved_path: Option<std::path::PathBuf>,
+    job_busy: bool,
     modal: bool,
     refresh_after_picker: bool,
 }
@@ -140,6 +144,7 @@ fn dispatch(root: HWND, intent: Intent) {
         let view = shell.recorder.apply(intent);
         shell.phase = view.phase;
         shell.saved_path.clone_from(&view.saved_path);
+        shell.job_busy = view.job_busy;
         shell.controls.show(root, &view);
         shell.sync_timer(root);
         Some(view)
@@ -180,27 +185,59 @@ fn dispatch(root: HWND, intent: Intent) {
             };
             dispatch(root, next);
         }
-        Some(Ask::Settings { shortcut }) => {
+        Some(Ask::Settings(initial)) => {
             // Release the current shortcut so the field can capture that same
             // combination. Save registers the new one; Cancel restores this one.
-            unsafe { let _ = UnregisterHotKey(root, TOGGLE_HOTKEY); }
-            let initial = super::settings::Settings { shortcut };
+            unsafe {
+                let _ = UnregisterHotKey(root, TOGGLE_HOTKEY);
+            }
+            let shortcut = initial.shortcut;
             if let Some(next) = modal(root, || super::settings::ask(root, initial)) {
-                dispatch(root, Intent::SetSettings { shortcut: next.shortcut });
+                dispatch(root, Intent::SetSettings(next));
             } else if register_shortcut(root, shortcut).is_err() {
                 dispatch(root, Intent::HotkeyUnavailable);
+            }
+        }
+        Some(Ask::OverwriteNested { path }) => {
+            let question = HSTRING::from(format!(
+                "Replace existing file?\n{}",
+                path.display()
+            ));
+            if modal(root, || unsafe {
+                MessageBoxW(
+                    root,
+                    &question,
+                    TITLE,
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                )
+            }) == IDYES
+            {
+                dispatch(root, Intent::ConfirmNestedSave);
+            } else {
+                dispatch(root, Intent::CancelSave);
             }
         }
     }
 }
 
-pub(super) fn register_shortcut(root: HWND, shortcut: crate::prefs::Shortcut) -> ::windows::core::Result<()> {
-    if shortcut.0 == 0 { return Ok(()); }
+pub(super) fn register_shortcut(
+    root: HWND,
+    shortcut: crate::prefs::Shortcut,
+) -> ::windows::core::Result<()> {
+    if shortcut.0 == 0 {
+        return Ok(());
+    }
     let flags = shortcut.0 >> 8;
     let mut modifiers = MOD_NOREPEAT;
-    if flags & 1 != 0 { modifiers |= MOD_SHIFT; }
-    if flags & 2 != 0 { modifiers |= MOD_CONTROL; }
-    if flags & 4 != 0 { modifiers |= MOD_ALT; }
+    if flags & 1 != 0 {
+        modifiers |= MOD_SHIFT;
+    }
+    if flags & 2 != 0 {
+        modifiers |= MOD_CONTROL;
+    }
+    if flags & 4 != 0 {
+        modifiers |= MOD_ALT;
+    }
     unsafe { RegisterHotKey(root, TOGGLE_HOTKEY, modifiers, u32::from(shortcut.0 & 0xff)) }
 }
 
@@ -213,7 +250,9 @@ fn modal<T>(root: HWND, dialog: impl FnOnce() -> T) -> T {
 
 impl Shell {
     fn sync_timer(&mut self, root: HWND) {
-        let wanted = self.phase.timer_ms(unsafe { IsIconic(root) }.as_bool());
+        let wanted = self
+            .phase
+            .timer_ms(unsafe { IsIconic(root) }.as_bool(), self.job_busy);
         if wanted == self.timer_ms {
             return;
         }
@@ -221,7 +260,6 @@ impl Shell {
             let _ = KillTimer(root, TICK_TIMER);
             if let Some(interval) = wanted {
                 if SetTimer(root, TICK_TIMER, interval, None) == 0 {
-                    // Keep the window usable so the take can still be stopped/saved.
                     MessageBoxW(root, w!("The display timer could not start. Close other applications and try again."), TITLE, MB_ICONWARNING);
                     self.timer_ms = None;
                     return;
@@ -372,8 +410,6 @@ fn with_shell_read<T>(root: HWND, body: impl FnOnce(&Shell) -> T) -> Option<T> {
     if let Ok(shell) = cell.try_borrow() {
         return Some(body(&shell));
     }
-    // WM_PAINT can nest inside show()'s exclusive borrow. The shell is not
-    // moved; painting only reads the command-button brushes and caption.
     Some(body(unsafe { &*cell.as_ptr() }))
 }
 
@@ -543,8 +579,6 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_TIMER | WM_HOTKEY | WM_DEVICECHANGE | WM_CLOSE => {
-            // Keep combo row indices tied to the currently displayed endpoint
-            // list until the user commits or cancels the open picker.
             if message == WM_DEVICECHANGE
                 && with_shell(root, |shell| {
                     if shell.controls.list_dropped() {
@@ -627,10 +661,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SIZE => {
             with_shell(root, |shell| shell.sync_timer(root));
-            dispatch(
-                root,
-                Intent::Minimized(unsafe { IsIconic(root) }.as_bool()),
-            );
+            dispatch(root, Intent::Minimized(unsafe { IsIconic(root) }.as_bool()));
             DefWindowProcW(root, message, wparam, lparam)
         }
         WM_CTLCOLORSTATIC => {
@@ -685,6 +716,8 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         (BN_CLICKED, ID_SETTINGS) => Some(Intent::OpenSettings),
         (BN_CLICKED, ID_DISCARD) => Some(Intent::RequestDiscard),
         (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),
+        (BN_CLICKED, ID_TRANSCRIBE) => Some(Intent::Sidecar(JobKind::Transcript)),
+        (BN_CLICKED, ID_NOTES) => Some(Intent::Sidecar(JobKind::Notes)),
         _ => None,
     }
 }
