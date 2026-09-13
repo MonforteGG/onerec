@@ -652,7 +652,38 @@ El padre inspecciona el reporte, rechaza escapes de scope, aplica fixes, y ofrec
 
 ### unslop
 
-Siempre aplica. Corta tells de AI. Números de regla estables. Frases -ing superficiales. Atribuciones vagas. Vocabulario AI (delve, pivotal, tapestry, underscore). Formas fancy de "is". "Not just X, but Y." Rule of three forzada. Ciclado de sinónimos. Rangos falsos. Raya larga. Dos puntos como muleta. Bold de más. Listas con header inline que restata la línea. Title case. Emojis decorativos. Curly quotes. Frases de chatbot. Sicofancia. Filler. Hedging excesivo. Conclusiones genéricas. Sustantivos metáfora abstractos (substrate, wedge, harness como metáfora, north star). Decir el mecanismo, no el feeling. Una idea por oración. Voz activa. Palabra llana. Sin prosa amanerada. Sin sobre-compresión. Sin artículos caídos ni symbol-speak.
+Siempre aplica. Corta tells de AI. Los números de regla son ids estables. Una regla borrada deja un hueco. El proceso es escanear, reescribir conservando sentido y tono, y auto-auditar "¿qué hace esto obviamente generado por AI?".
+
+| Id | Regla |
+|---|---|
+| 3 | Frases -ing superficiales. highlighting, ensuring, reflecting, showcasing, fostering. Borrar o expandir con fuentes reales. |
+| 5 | Atribuciones vagas. Experts believe, Industry reports suggest. Nombrar la fuente o borrar. |
+| 7 | Vocabulario AI. Additionally, crucial, delve, enduring, enhance, fostering, garner, interplay, intricate, landscape abstracto, pivotal, showcase, tapestry, testament, underscore, vibrant. Palabra llana. |
+| 8 | Formas fancy de "is". serves as, stands as, boasts, features. Decir is o has. |
+| 9 | "Not just X, but Y." Enunciar el punto directo. |
+| 10 | Rule of three forzada. Usar el número natural. |
+| 11 | Ciclado de sinónimos. Elegir una palabra y repetirla. |
+| 12 | Rangos falsos. from X to Y cuando X e Y no están en una escala. Listar temas. |
+| 13 | Raya larga. Evitarla por completo. Punto o coma. Sin paréntesis, sin en dash, sin hyphen como sustituto. |
+| 14 | Dos puntos como muleta a mitad de frase. Válidos solo antes de lista o ejemplo. |
+| 15 | Bold de más. No boldar cada proper noun. |
+| 16 | Listas con header inline que restata la línea. Un lead-in bold que termina en punto y aporta detalle nuevo sí vale. |
+| 17 | Title case en headings. Usar sentence case. |
+| 18 | Emojis decorativos. Fuera de headings y bullets. |
+| 19 | Curly quotes. Straight quotes. |
+| 20 | Frases de chatbot. I hope this helps, Let me know if, Of course, Certainly, Found the smoking gun. |
+| 22 | Sicofancia. Great question, You're absolutely right. Responder directo. |
+| 23 | Filler. In order to → To. Due to the fact that → Because. It is important to note that se borra. |
+| 24 | Hedging excesivo. could potentially possibly → may. |
+| 25 | Conclusiones genéricas. The future looks bright. Hechos o planes concretos. |
+| 26 | Sustantivos metáfora abstractos. substrate, wedge, vector, locus, vantage, nexus, primitive como noun, harness como metáfora, surface como API surface, bedrock, scaffolding como metáfora, modality, paradigm, gold-plating, ratchet como metáfora, evacuate para mover código, endgame, north star, flywheel. Palabra concreta. |
+| 27 | Decir el mecanismo o un número, no el feeling. Si la oración podría aparecer igual en docs de otro proyecto, no dice nada de este. Cortarla. |
+| 28 | Una idea por oración. Si el lector tiene que volver atrás, partir. |
+| 29 | Voz activa. Nombrar el actor. Pasiva solo si el actor es desconocido o no importa. |
+| 30 | Cortar adverbios o usar un verbo más fuerte. significantly improves → el delta medido. |
+| 31 | Palabra llana. utilize → use. leverage → use. facilitate → help. |
+| 32 | Prosa amanerada. Aforismos, fragmentos retóricos, código personificado, verbos figurativos. Decir lo que se quiere decir. |
+| 33 | Sobre-compresión. Artículos caídos, fragments sin verbo, symbol-speak, flechas. Oraciones enteras. |
 
 ### technical-writing
 
@@ -666,7 +697,26 @@ Reformular el último mensaje en lenguaje llano, sin jerga. Una sola acción.
 
 ### typescript-best-practices
 
-Se carga solo al tocar `.ts` o `.tsx`. Primero **type-system-discipline**. Luego la tabla. Uniones discriminadas. Branded types. Modelado constructivo. Tipo total más simple. `unknown` over `any`. Schemas del repo antes de guards a mano. Sin `as` salvo post-validación. Jerarquía de narrowing. Type guards que verifican el claim. Exhaustiveness con `never`. `satisfies` over `as`. Validación en el límite. Tipos derivados (`Pick`, `Omit`, `Parameters`, `ReturnType`). Object args excepto hot paths. Tests reales, no mockear lo que puedes correr. Telemetría estructurada. No `console.log` en código shipped.
+Se carga solo al tocar `.ts` o `.tsx`. Primero aplica **type-system-discipline**. Luego esta tabla.
+
+| Regla | Qué exige |
+|---|---|
+| Discriminated unions | Variantes con un `kind` literal. Sin bolsas de optionals. |
+| Branded types | Primitivos con `& { readonly __brand: "X" }`. Validar una vez en el límite. |
+| Constructive modeling | Construir la forma para que el valor ilegal no se pueda crear. `[T, ...T[]]` no vacío. `start` más `duration` para un rango. No un guard de runtime. |
+| Simplest total type | Dejar `T[]` mientras toda operación sea total. Fortalecer a `NonEmpty<T>` solo donde el tipo flojo fuerza `!`, un cast o un throw de "should never happen". |
+| `unknown` over `any` | Dato externo es `unknown`. |
+| Schemas before guards | Usar la librería de schemas del repo e inferir el tipo (`z.infer`) antes de un type guard a mano. |
+| No `as` | Cast solo después de validar. |
+| Narrowing hierarchy | Discriminant switch > `in` > `typeof`/`instanceof` > user-defined type guard > `as`. |
+| Type guards | Deben verificar el claim. Un guard que miente es peor que `as`. Nombres `isX` o `hasX`. |
+| Exhaustiveness | `const _exhaustive: never = x` en el default. |
+| `satisfies` over `as` | Valida el valor sin widening de literales. |
+| Boundary validation | Parsear al cruzar, a un tipo de dominio nombrado. `Record<string, unknown>` se acaba ahí. |
+| Schema-derived types | `Pick` / `Omit` / `Parameters` / `ReturnType` / `Awaited` / `typeof` antes de un interface nuevo. |
+| Object args | Objetos, no posicionales, salvo hot paths. |
+| Real tests | No mockear lo que puedes correr. UI en un build corriendo. |
+| Structured telemetry | Logger con contexto suficiente para debuggear desde un id. No `console.log` shipped. |
 
 ### figure-it-out
 
