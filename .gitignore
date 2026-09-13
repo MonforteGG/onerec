@@ -27,9 +27,10 @@ Thumbs.db
 *.pfx
 
 # Internal review notes and generated local documentation.
-# Keep only the public project README at the repository root.
+# Keep the public project README and the pstack reference at the repository root.
 *.md
 !/README.md
+!/pstack-flujo-y-buenas-practicas.md
 /docs/
 
 # Private prompts and large source renders used to regenerate production icons.
