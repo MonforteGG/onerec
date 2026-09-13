@@ -1,4 +1,4 @@
-﻿#[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::recorder::{Level, Levels, Status, Tone, Transport, View};
@@ -8,8 +8,8 @@ mod tests {
     use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO};
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, DestroyWindow, GetClientRect, RegisterClassExW, ShowWindow,
-        CB_GETDROPPEDSTATE, CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-        LB_GETCURSEL, SW_SHOW, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
+        CB_GETDROPPEDSTATE, CB_SHOWDROPDOWN, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, LB_GETCURSEL,
+        SW_SHOW, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU,
     };
 
     struct Harness {
@@ -139,7 +139,7 @@ mod tests {
     fn show_leaves_hover_highlight_while_the_list_is_dropped() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).expect("controls");
+        let controls = Controls::create(ui.root, instance).expect("controls");
         let combo = controls.microphone_combo();
         refill(
             combo,
@@ -167,13 +167,15 @@ mod tests {
     fn pending_take_enables_save_and_disables_record() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.toggle).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.save).as_bool() });
         assert!(!unsafe { IsWindowEnabled(controls.save).as_bool() });
-        unsafe { SetFocus(controls.toggle).unwrap(); }
+        unsafe {
+            SetFocus(controls.toggle).unwrap();
+        }
         view.phase = Phase::AwaitingSave;
         view.microphone.enabled = false;
         view.output.enabled = false;
@@ -204,7 +206,7 @@ mod tests {
     fn awaiting_save_closes_and_disables_quality_if_the_list_was_open() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         unsafe {
@@ -227,7 +229,7 @@ mod tests {
     fn pause_is_always_visible_and_enabled_only_while_live() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
@@ -261,11 +263,14 @@ mod tests {
     fn settings_remains_visible_while_recording_and_awaiting_save() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.settings).as_bool() });
-        assert!(controls.all().iter().all(|&control| caption(control) != "Save &as…"));
+        assert!(controls
+            .all()
+            .iter()
+            .all(|&control| caption(control) != "Save &as…"));
         view.phase = Phase::Recording;
         view.microphone.enabled = false;
         view.output.enabled = false;
@@ -281,7 +286,10 @@ mod tests {
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.settings).as_bool() });
         assert!(unsafe { IsWindowEnabled(controls.settings).as_bool() });
-        assert!(controls.all().iter().all(|&control| caption(control) != "Save &as…"));
+        assert!(controls
+            .all()
+            .iter()
+            .all(|&control| caption(control) != "Save &as…"));
         assert_eq!(caption(controls.save), "&Save");
     }
 
@@ -297,7 +305,7 @@ mod tests {
     fn closed_device_combos_sit_above_their_vu_row() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         view.saved_path = Some(r"C:\Meetings\2026-09-12 15-52 Meeting.mp3".into());
         view.status.text = "Saved: 2026-09-12 15-52 Meeting.mp3".into();
@@ -315,13 +323,22 @@ mod tests {
         assert_eq!(status.left, scale(20, controls.units));
         assert_eq!(status.right - status.left, scale(192, controls.units));
         assert_eq!(transcribe.left, scale(218, controls.units));
-        assert_eq!(transcribe.right - transcribe.left, scale(110, controls.units));
+        assert_eq!(
+            transcribe.right - transcribe.left,
+            scale(110, controls.units)
+        );
         assert_eq!(notes.left, scale(334, controls.units));
         assert_eq!(notes.right - notes.left, scale(80, controls.units));
         assert_eq!(folder.left, scale(420, controls.units));
         assert_eq!(folder.right - folder.left, scale(40, controls.units));
-        assert!(transcribe.right <= notes.left, "Transcribe {transcribe:?} overlaps Notes {notes:?}");
-        assert!(notes.right <= folder.left, "Notes {notes:?} overlaps Open folder {folder:?}");
+        assert!(
+            transcribe.right <= notes.left,
+            "Transcribe {transcribe:?} overlaps Notes {notes:?}"
+        );
+        assert!(
+            notes.right <= folder.left,
+            "Notes {notes:?} overlaps Open folder {folder:?}"
+        );
         view.job_busy = true;
         view.status.text = "Transcribing…".into();
         controls.show(ui.root, &view);
@@ -360,7 +377,7 @@ mod tests {
     fn recording_keeps_devices_visible_and_updates_both_meters() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         let idle_h = client_h(ui.root);
@@ -370,8 +387,14 @@ mod tests {
         view.output.enabled = false;
         view.quality.enabled = false;
         view.transport.toggle_label = "Stop recording";
-        view.levels.microphone = Level { peak: 0.5, clipping: false };
-        view.levels.system = Level { peak: 0.2, clipping: false };
+        view.levels.microphone = Level {
+            peak: 0.5,
+            clipping: false,
+        };
+        view.levels.system = Level {
+            peak: 0.2,
+            clipping: false,
+        };
         controls.show(ui.root, &view);
         assert!(unsafe { IsWindowVisible(controls.microphones).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.outputs).as_bool() });
@@ -379,14 +402,24 @@ mod tests {
         assert!(unsafe { IsWindowVisible(controls.pause).as_bool() });
         assert!(unsafe { IsWindowVisible(controls.stop).as_bool() });
         assert_eq!(client_h(ui.root), idle_h);
-        assert!(controls.painted.meters.iter().all(|meter| meter.width > 0 && meter.db.is_some()));
-        let initial = controls.painted.meters[0].width;
+        assert!(controls
+            .painted
+            .borrow()
+            .meters
+            .iter()
+            .all(|meter| meter.width > 0 && meter.db.is_some()));
+        let initial = controls.painted.borrow().meters[0].width;
         view.levels.microphone.peak = 0.9;
         controls.show(ui.root, &view);
-        assert!(controls.painted.meters[0].width > initial);
+        assert!(controls.painted.borrow().meters[0].width > initial);
         view.phase = Phase::Paused;
         controls.show(ui.root, &view);
-        for control in [controls.microphones, controls.outputs, controls.microphone_level, controls.output_level] {
+        for control in [
+            controls.microphones,
+            controls.outputs,
+            controls.microphone_level,
+            controls.output_level,
+        ] {
             assert!(unsafe { IsWindowVisible(control).as_bool() });
         }
         assert_eq!(client_h(ui.root), idle_h);
@@ -396,7 +429,7 @@ mod tests {
     fn stop_keeps_full_layout() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         view.phase = Phase::Recording;
         view.microphone.enabled = false;
@@ -428,7 +461,7 @@ mod tests {
     fn idle_hint_is_empty_but_actionable_status_is_preserved() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         assert_eq!(caption(controls.status), "");
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
@@ -442,7 +475,7 @@ mod tests {
     fn idle_meters_show_live_levels_instead_of_inactive() {
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
         let ui = harness();
-        let mut controls = Controls::create(ui.root, instance).unwrap();
+        let controls = Controls::create(ui.root, instance).unwrap();
         let mut view = idle_view(Some(0));
         controls.show(ui.root, &view);
         assert_eq!(caption(controls.microphone_level), "Silence");
@@ -455,8 +488,8 @@ mod tests {
             clipping: false,
         };
         controls.show(ui.root, &view);
-        assert!(controls.painted.meters[0].width > 0);
-        assert!(controls.painted.meters[1].width > 0);
+        assert!(controls.painted.borrow().meters[0].width > 0);
+        assert!(controls.painted.borrow().meters[1].width > 0);
         assert_eq!(caption(controls.microphone_level), "-6 dBFS");
         view.phase = Phase::AwaitingSave;
         view.levels.microphone.peak = 0.5;
@@ -473,15 +506,27 @@ mod tests {
             controls.refresh_theme(ui.root, dpi);
             let mut view = idle_view(Some(0));
             controls.show(ui.root, &view);
-            let buttons = [controls.toggle, controls.pause, controls.stop, controls.save,
-                controls.discard, controls.settings];
+            let buttons = [
+                controls.toggle,
+                controls.pause,
+                controls.stop,
+                controls.save,
+                controls.discard,
+                controls.settings,
+            ];
             let bounds = |button| {
                 let r = window_rect_in_parent(ui.root, button);
                 (r.left, r.top, r.right, r.bottom)
             };
             let positions = buttons.map(bounds);
-            for phase in [Phase::Idle, Phase::Recording, Phase::Paused, Phase::AwaitingSave,
-                Phase::Saving, Phase::Failed] {
+            for phase in [
+                Phase::Idle,
+                Phase::Recording,
+                Phase::Paused,
+                Phase::AwaitingSave,
+                Phase::Saving,
+                Phase::Failed,
+            ] {
                 let live = matches!(phase, Phase::Recording | Phase::Paused);
                 let ready = matches!(phase, Phase::Idle | Phase::Failed);
                 let pending = phase == Phase::AwaitingSave;
@@ -490,23 +535,34 @@ mod tests {
                 view.transport.save_enabled = pending;
                 view.transport.discard_enabled = pending;
                 controls.show(ui.root, &view);
-                assert_eq!(buttons.map(bounds), positions, "geometry changed for {phase:?} at {dpi}");
+                assert_eq!(
+                    buttons.map(bounds),
+                    positions,
+                    "geometry changed for {phase:?} at {dpi}"
+                );
                 let elapsed = window_rect_in_parent(ui.root, controls.elapsed);
                 let record = window_rect_in_parent(ui.root, controls.toggle);
-                assert!(record.top - elapsed.bottom >= controls.s(28) - 1,
-                    "timer needs breathing room above transport at {dpi} DPI");
+                assert!(
+                    record.top - elapsed.bottom >= controls.s(28) - 1,
+                    "timer needs breathing room above transport at {dpi} DPI"
+                );
                 assert!(client_h(ui.root) - record.bottom >= controls.s(16) - 1);
                 let enabled = [ready, live, live, pending, pending, true];
                 for (button, expected) in buttons.into_iter().zip(enabled) {
                     assert!(unsafe { IsWindowVisible(button).as_bool() });
-                    assert_eq!(unsafe { IsWindowEnabled(button).as_bool() }, expected,
-                        "invalid enabled state for {} in {phase:?}", caption(button));
+                    assert_eq!(
+                        unsafe { IsWindowEnabled(button).as_bool() },
+                        expected,
+                        "invalid enabled state for {} in {phase:?}",
+                        caption(button)
+                    );
                 }
                 assert_eq!(caption(controls.toggle), "&Record");
                 assert_eq!(caption(controls.stop), "S&top");
                 assert_eq!(caption(controls.save), "&Save");
                 for control in controls.all() {
-                    assert!(!["&Microphone", "System &audio", "Ctrl+Shift+R"].contains(&caption(control).as_str()));
+                    assert!(!["&Microphone", "System &audio", "Ctrl+Shift+R"]
+                        .contains(&caption(control).as_str()));
                 }
             }
         }
@@ -516,25 +572,46 @@ mod tests {
     fn embedded_lucide_font_resolves_every_button_icon_at_each_dpi() {
         for dpi in [96, 120, 144, 192] {
             let fonts = Fonts::new(dpi);
-            assert!(!fonts.icon_resource.is_invalid(), "private icon font did not load");
+            assert!(
+                !fonts.icon_resource.is_invalid(),
+                "private icon font did not load"
+            );
             unsafe {
                 let dc = CreateCompatibleDC(None);
                 let previous = SelectObject(dc, HGDIOBJ(fonts.icons.0));
                 let mut face = [0u16; 64];
                 let length = GetTextFaceW(dc, Some(&mut face));
                 let actual = String::from_utf16_lossy(&face[..length as usize]);
-                assert_eq!(actual.trim_end_matches('\0'), "lucide", "font fallback at {dpi} DPI");
-                let chars = [ButtonIcon::Record, ButtonIcon::Stop, ButtonIcon::Pause,
-                    ButtonIcon::Resume, ButtonIcon::Discard, ButtonIcon::Settings, ButtonIcon::Save]
-                    .map(ButtonIcon::glyph);
+                assert_eq!(
+                    actual.trim_end_matches('\0'),
+                    "lucide",
+                    "font fallback at {dpi} DPI"
+                );
+                let chars = [
+                    ButtonIcon::Record,
+                    ButtonIcon::Stop,
+                    ButtonIcon::Pause,
+                    ButtonIcon::Resume,
+                    ButtonIcon::Discard,
+                    ButtonIcon::Settings,
+                    ButtonIcon::Save,
+                ]
+                .map(ButtonIcon::glyph);
                 let mut indices = [0u16; 7];
-                let result = GetGlyphIndicesW(dc, PCWSTR(chars.as_ptr()), chars.len() as i32,
-                    indices.as_mut_ptr(), GGI_MARK_NONEXISTING_GLYPHS);
+                let result = GetGlyphIndicesW(
+                    dc,
+                    PCWSTR(chars.as_ptr()),
+                    chars.len() as i32,
+                    indices.as_mut_ptr(),
+                    GGI_MARK_NONEXISTING_GLYPHS,
+                );
                 SelectObject(dc, previous);
                 let _ = DeleteDC(dc);
                 assert_ne!(result, GDI_ERROR as u32);
-                assert!(indices.iter().all(|&index| index != 0 && index != u16::MAX),
-                    "missing icon at {dpi} DPI: {indices:?}");
+                assert!(
+                    indices.iter().all(|&index| index != 0 && index != u16::MAX),
+                    "missing icon at {dpi} DPI: {indices:?}"
+                );
             }
         }
     }
@@ -557,4 +634,3 @@ mod tests {
         assert_eq!(current(ui.combo), 0);
     }
 }
-

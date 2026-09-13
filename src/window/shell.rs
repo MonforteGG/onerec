@@ -1,23 +1,23 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 
-use ::windows::core::{w, HSTRING, PCWSTR};
-use ::windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use ::windows::Win32::Graphics::Gdi::{
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, UpdateWindow, COLOR_WINDOW,
     HDC, PAINTSTRUCT,
 };
-use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use ::windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
-use ::windows::Win32::UI::HiDpi::{
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
+use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
 };
-use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+use windows::Win32::UI::Input::KeyboardAndMouse::{
     IsWindowEnabled, RegisterHotKey, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
     MOD_NOREPEAT, MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use ::windows::Win32::UI::Shell::ShellExecuteW;
-use ::windows::Win32::UI::WindowsAndMessaging::{
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetParent, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW, LoadImageW,
     MessageBoxW, PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetTimer,
@@ -41,7 +41,7 @@ use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
 use crate::sidecar::JobKind;
 use crate::RunError;
-use ::windows::Win32::UI::WindowsAndMessaging::{
+use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_SHOWNORMAL, WM_DPICHANGED, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
     WM_SYSCOLORCHANGE, WM_THEMECHANGED, WS_CLIPCHILDREN,
@@ -129,8 +129,10 @@ struct Shell {
     refresh_after_picker: bool,
 }
 
-// Release the borrow before opening a native modal dialog: its nested message
-// loop must still be able to paint the window and observe the export worker.
+// Release the exclusive borrow before Win32 work that can re-enter the window
+// procedure. show() only needs a shared borrow plus interior mutability, so
+// nested WM_PAINT can also take a shared borrow. Modal dialogs drop the
+// borrow for the same reason.
 fn dispatch(root: HWND, intent: Intent) {
     let Some(Some(view)) = with_shell(root, |shell| {
         if shell.modal && !matches!(intent, Intent::Tick | Intent::Minimized(_)) {
@@ -145,12 +147,16 @@ fn dispatch(root: HWND, intent: Intent) {
         shell.phase = view.phase;
         shell.saved_path.clone_from(&view.saved_path);
         shell.job_busy = view.job_busy;
-        shell.controls.show(root, &view);
-        shell.sync_timer(root);
         Some(view)
     }) else {
         return;
     };
+    with_shell_read(root, |shell| {
+        shell.controls.show(root, &view);
+    });
+    with_shell(root, |shell| {
+        shell.sync_timer(root);
+    });
     match view.ask {
         None => {}
         Some(Ask::Close) => unsafe {
@@ -199,10 +205,7 @@ fn dispatch(root: HWND, intent: Intent) {
             }
         }
         Some(Ask::OverwriteNested { path }) => {
-            let question = HSTRING::from(format!(
-                "Replace existing file?\n{}",
-                path.display()
-            ));
+            let question = HSTRING::from(format!("Replace existing file?\n{}", path.display()));
             if modal(root, || unsafe {
                 MessageBoxW(
                     root,
@@ -407,10 +410,8 @@ fn with_shell<T>(root: HWND, body: impl FnOnce(&mut Shell) -> T) -> Option<T> {
 fn with_shell_read<T>(root: HWND, body: impl FnOnce(&Shell) -> T) -> Option<T> {
     let pointer = unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *const RefCell<Shell>;
     let cell = unsafe { pointer.as_ref() }?;
-    if let Ok(shell) = cell.try_borrow() {
-        return Some(body(&shell));
-    }
-    Some(body(unsafe { &*cell.as_ptr() }))
+    let shell = cell.try_borrow().ok()?;
+    Some(body(&shell))
 }
 
 fn install_command_button_subclasses(controls: &Controls) {
@@ -600,12 +601,12 @@ unsafe extern "system" fn wnd_proc(
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc = BeginPaint(root, &mut paint);
-            with_shell(root, |shell| shell.controls.draw_meters(hdc));
+            with_shell_read(root, |shell| shell.controls.draw_meters(hdc));
             let _ = EndPaint(root, &paint);
             LRESULT(0)
         }
         WM_PRINTCLIENT => {
-            with_shell(root, |shell| {
+            with_shell_read(root, |shell| {
                 shell.controls.draw_meters(HDC(wparam.0 as *mut c_void))
             });
             LRESULT(0)
@@ -613,7 +614,7 @@ unsafe extern "system" fn wnd_proc(
         WM_ERASEBKGND => {
             let mut rect = RECT::default();
             let _ = GetClientRect(root, &mut rect);
-            let brush = with_shell(root, |shell| shell.controls.background())
+            let brush = with_shell_read(root, |shell| shell.controls.background())
                 .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW));
             FillRect(HDC(wparam.0 as *mut c_void), &rect, brush);
             LRESULT(1)
@@ -667,7 +668,7 @@ unsafe extern "system" fn wnd_proc(
         WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut c_void);
             let control = HWND(lparam.0 as *mut c_void);
-            let brush = with_shell(root, |shell| shell.controls.color_static(control, hdc))
+            let brush = with_shell_read(root, |shell| shell.controls.color_static(control, hdc))
                 .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW));
             LRESULT(brush.0 as isize)
         }

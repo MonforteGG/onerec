@@ -4,10 +4,12 @@ use super::theme::Theme;
 use crate::mp3::ExportQuality;
 use crate::recorder::{Phase, Selector, Status, Tone, View};
 use crate::RunError;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{
@@ -64,9 +66,9 @@ pub(crate) struct Controls {
     hovered_button: Cell<Option<HWND>>,
     dpi: u32,
     units: u32,
-    painted: Painted,
-    list_dropped: bool,
-    meter_top: [i32; 2],
+    painted: RefCell<Painted>,
+    list_dropped: Cell<bool>,
+    meter_top: Cell<[i32; 2]>,
 }
 
 #[derive(Default)]
@@ -139,7 +141,7 @@ impl Controls {
             notes,
             w!("Write notes from the recording (Alt+N)"),
         )?;
-        let mut controls = Self {
+        let controls = Self {
             microphones,
             outputs,
             quality,
@@ -179,9 +181,9 @@ impl Controls {
             rounded: RoundedButtons::new(),
             hovered_button: Cell::new(None),
             dpi,
-            painted: Painted::default(),
-            list_dropped: false,
-            meter_top: [0; 2],
+            painted: RefCell::new(Painted::default()),
+            list_dropped: Cell::new(false),
+            meter_top: Cell::new([0; 2]),
         };
         for control in [
             folder,
@@ -250,7 +252,7 @@ impl Controls {
         self.theme = Theme::new();
         self.apply_fonts();
         drop(old_fonts);
-        self.painted.meters = [Meter::default(); 2];
+        self.painted.borrow_mut().meters = [Meter::default(); 2];
         self.layout(root);
         unsafe {
             let _ = InvalidateRect(root, None, true);
@@ -261,7 +263,7 @@ impl Controls {
         scale(value, self.units)
     }
 
-    fn layout(&mut self, root: HWND) {
+    fn layout(&self, root: HWND) {
         let place = |control, x, y, width, height| unsafe {
             let _ = SetWindowPos(
                 control,
@@ -298,12 +300,15 @@ impl Controls {
         place_combo(self.quality, 178, 282, 282, 220);
         place(self.progress_label, 20, 282, 440, 20);
         place(self.progress, 20, 306, 440, 10);
-        let text_width = if self.painted.saved_file {
-            192
-        } else if self.painted.missing_devices {
-            288
-        } else {
-            440
+        let text_width = {
+            let painted = self.painted.borrow();
+            if painted.saved_file {
+                192
+            } else if painted.missing_devices {
+                288
+            } else {
+                440
+            }
         };
         let height = self.status_height(root, self.s(text_width)).max(self.s(34));
         unsafe {
@@ -360,7 +365,8 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        self.meter_top = [mic_bottom + self.s(2), out_bottom + self.s(2)];
+        self.meter_top
+            .set([mic_bottom + self.s(2), out_bottom + self.s(2)]);
         for list in [self.microphones, self.outputs, self.quality] {
             paint_combo_chrome(list);
         }
@@ -398,7 +404,14 @@ impl Controls {
     }
 
     fn status_height(&self, root: HWND, width: i32) -> i32 {
-        let text = self.painted.status.as_ref().map_or("", |s| s.text.as_str());
+        let text = self
+            .painted
+            .borrow()
+            .status
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_default();
+        let text = text.as_str();
         if text.is_empty() {
             return 0;
         }
@@ -422,37 +435,37 @@ impl Controls {
         rect.bottom
     }
 
-    pub(crate) fn set_list_dropped(&mut self, dropped: bool) {
-        self.list_dropped = dropped;
+    pub(crate) fn set_list_dropped(&self, dropped: bool) {
+        self.list_dropped.set(dropped);
     }
     pub(crate) fn list_dropped(&self) -> bool {
-        self.list_dropped
+        self.list_dropped.get()
     }
     #[cfg(test)]
     fn microphone_combo(&self) -> HWND {
         self.microphones
     }
 
-    pub(crate) fn show(&mut self, root: HWND, view: &View) {
+    pub(crate) fn show(&self, root: HWND, view: &View) {
         let pending = view.phase == Phase::AwaitingSave;
         let saving = view.phase == Phase::Saving;
         let live = matches!(view.phase, Phase::Recording | Phase::Paused);
-        let phase_changed = self.painted.phase != Some(view.phase);
+        let phase_changed = self.painted.borrow().phase != Some(view.phase);
         if phase_changed && !matches!(view.phase, Phase::Idle | Phase::Failed) {
             for list in [self.microphones, self.outputs, self.quality] {
                 unsafe {
                     SendMessageW(list, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
                 }
             }
-            self.list_dropped = false;
+            self.list_dropped.set(false);
         }
         enable(self.microphones, view.microphone.enabled);
         enable(self.outputs, view.output.enabled);
         enable(self.quality, view.quality.enabled);
-        if self.list_dropped && view.phase == Phase::Idle {
+        if self.list_dropped.get() && view.phase == Phase::Idle {
             return;
         }
-        if !self.list_dropped {
+        if !self.list_dropped.get() {
             if let Some(lists) = &view.endpoints {
                 refill(self.microphones, &lists.microphones);
                 refill(self.outputs, &lists.outputs);
@@ -466,7 +479,7 @@ impl Controls {
         }
         let previous_focus = unsafe { GetFocus() };
         if phase_changed {
-            self.painted.phase = Some(view.phase);
+            self.painted.borrow_mut().phase = Some(view.phase);
             visible(self.quality, !saving);
             visible(self.quality_label, !saving);
             visible(self.microphones, true);
@@ -517,8 +530,16 @@ impl Controls {
                 });
             }
         }
-        if self.painted.elapsed != view.elapsed {
-            self.painted.elapsed.clone_from(&view.elapsed);
+        let elapsed_changed = {
+            let mut painted = self.painted.borrow_mut();
+            if painted.elapsed != view.elapsed {
+                painted.elapsed.clone_from(&view.elapsed);
+                true
+            } else {
+                false
+            }
+        };
+        if elapsed_changed {
             set_text(self.elapsed, &view.elapsed);
         }
         let heading = match view.phase {
@@ -535,8 +556,16 @@ impl Controls {
             Phase::Saving => "Saving MP3",
             Phase::Failed => "Needs attention",
         };
-        if self.painted.heading != heading {
-            self.painted.heading = heading.into();
+        let heading_changed = {
+            let mut painted = self.painted.borrow_mut();
+            if painted.heading != heading {
+                painted.heading = heading.into();
+                true
+            } else {
+                false
+            }
+        };
+        if heading_changed {
             set_text(self.heading, heading);
         }
         let saved_file = view.phase == Phase::Idle && view.saved_path.is_some();
@@ -553,14 +582,21 @@ impl Controls {
             }
             _ => status.text,
         };
-        if self.painted.status.as_ref() != Some(&status)
-            || saved_file != self.painted.saved_file
-            || missing != self.painted.missing_devices
-            || view.job_busy != self.painted.job_busy
-        {
-            self.painted.saved_file = saved_file;
-            self.painted.missing_devices = missing;
-            self.painted.job_busy = view.job_busy;
+        let status_changed = {
+            let painted = self.painted.borrow();
+            painted.status.as_ref() != Some(&status)
+                || saved_file != painted.saved_file
+                || missing != painted.missing_devices
+                || view.job_busy != painted.job_busy
+        };
+        if status_changed {
+            {
+                let mut painted = self.painted.borrow_mut();
+                painted.saved_file = saved_file;
+                painted.missing_devices = missing;
+                painted.job_busy = view.job_busy;
+                painted.status = Some(status.clone());
+            }
             visible(self.folder, saved_file);
             visible(self.transcribe, saved_file);
             visible(self.notes, saved_file);
@@ -568,7 +604,6 @@ impl Controls {
             enable(self.transcribe, saved_file && !view.job_busy);
             enable(self.notes, saved_file && !view.job_busy);
             set_text(self.status, &status.text);
-            self.painted.status = Some(status);
             self.layout(root);
         }
         let percent = view.progress.map(|p| {
@@ -578,8 +613,16 @@ impl Controls {
                 ((p.done.min(p.total) as f64 / p.total as f64) * 100.0).floor() as u32
             }
         });
-        if percent != self.painted.percent {
-            self.painted.percent = percent;
+        let percent_changed = {
+            let mut painted = self.painted.borrow_mut();
+            if percent != painted.percent {
+                painted.percent = percent;
+                true
+            } else {
+                false
+            }
+        };
+        if percent_changed {
             if let Some(percent) = percent {
                 unsafe {
                     SendMessageW(
@@ -607,9 +650,17 @@ impl Controls {
                     }
                 }),
             };
-            if next != self.painted.meters[index] || phase_changed {
-                let old = self.painted.meters[index];
-                self.painted.meters[index] = next;
+            let old = {
+                let mut painted = self.painted.borrow_mut();
+                if next != painted.meters[index] || phase_changed {
+                    let old = painted.meters[index];
+                    painted.meters[index] = next;
+                    Some(old)
+                } else {
+                    None
+                }
+            };
+            if let Some(old) = old {
                 if old.width != next.width || old.clipping != next.clipping || phase_changed {
                     unsafe {
                         let _ = InvalidateRect(root, Some(&self.meter_rect(index)), false);
@@ -644,7 +695,7 @@ impl Controls {
     }
 
     fn meter_rect(&self, index: usize) -> RECT {
-        let y = self.meter_top[index];
+        let y = self.meter_top.get()[index];
         RECT {
             left: self.s(20),
             top: y,
@@ -670,7 +721,7 @@ impl Controls {
         }
         for index in 0..2 {
             let rect = self.meter_rect(index);
-            let meter = self.painted.meters[index];
+            let meter = self.painted.borrow().meters[index];
             unsafe {
                 FillRect(hdc, &rect, self.theme.track);
                 if meter.width > 0 {
@@ -692,14 +743,15 @@ impl Controls {
     }
 
     pub(crate) fn color_static(&self, control: HWND, hdc: HDC) -> HBRUSH {
-        let tone = self.painted.status.as_ref().map(|s| s.tone);
-        let color = if control == self.heading && self.painted.phase == Some(Phase::Recording) {
+        let painted = self.painted.borrow();
+        let tone = painted.status.as_ref().map(|s| s.tone);
+        let color = if control == self.heading && painted.phase == Some(Phase::Recording) {
             if tone == Some(Tone::Warning) {
                 self.theme.warning
             } else {
                 self.theme.red
             }
-        } else if control == self.heading && self.painted.phase == Some(Phase::Paused) {
+        } else if control == self.heading && painted.phase == Some(Phase::Paused) {
             self.theme.warning
         } else if control == self.status {
             match tone {
@@ -709,7 +761,7 @@ impl Controls {
             }
         } else if control == self.microphone_level || control == self.output_level {
             let index = usize::from(control == self.output_level);
-            if self.painted.meters[index].clipping {
+            if painted.meters[index].clipping {
                 self.theme.red
             } else {
                 self.theme.muted
@@ -717,6 +769,7 @@ impl Controls {
         } else {
             self.theme.ink
         };
+        drop(painted);
         unsafe {
             SetTextColor(hdc, color);
             SetBkMode(hdc, TRANSPARENT);
@@ -839,7 +892,7 @@ impl Controls {
         } else if hwnd == self.stop {
             Some(ButtonIcon::Stop)
         } else if hwnd == self.pause {
-            Some(if self.painted.phase == Some(Phase::Paused) {
+            Some(if self.painted.borrow().phase == Some(Phase::Paused) {
                 ButtonIcon::Resume
             } else {
                 ButtonIcon::Pause

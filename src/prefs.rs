@@ -181,9 +181,21 @@ impl Prefs {
                 fs::create_dir_all(dir)?;
             }
         }
-        let tmp = path.with_extension("ini.tmp");
+        let tmp = write_tmp_path(path);
         fs::write(&tmp, self.render())?;
         fs::rename(&tmp, path)
+    }
+}
+
+fn write_tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    match path.file_name() {
+        Some(name) => {
+            let mut tmp = name.to_os_string();
+            tmp.push(format!(".{pid}.tmp"));
+            path.with_file_name(tmp)
+        }
+        None => path.with_extension(format!("{pid}.tmp")),
     }
 }
 
@@ -323,15 +335,23 @@ mod tests {
         assert_eq!(keyed.transcribe_model.as_deref(), Some("whisper-1"));
         assert_eq!(keyed.notes_model.as_deref(), Some("llama-3.1-8b-instant"));
         assert!(!keyed.render().contains("api_key="));
-        assert!(!Prefs::parse("api_key=gsk_live\n").render().contains("api_key="));
+        assert!(!Prefs::parse("api_key=gsk_live\n")
+            .render()
+            .contains("api_key="));
         assert_eq!(Prefs::legacy_api_key("api_key=\n"), None);
-        assert_eq!(Prefs::legacy_api_key("# api_key=secret\nquality=Voice\n"), None);
+        assert_eq!(
+            Prefs::legacy_api_key("# api_key=secret\nquality=Voice\n"),
+            None
+        );
     }
 
     #[test]
     fn chat_model_reads_as_notes_model_and_never_writes_chat_model() {
         let from_old = Prefs::parse("chat_model=llama-3.1-8b-instant\n");
-        assert_eq!(from_old.notes_model.as_deref(), Some("llama-3.1-8b-instant"));
+        assert_eq!(
+            from_old.notes_model.as_deref(),
+            Some("llama-3.1-8b-instant")
+        );
         let rendered = from_old.render();
         assert!(rendered.contains("notes_model=llama-3.1-8b-instant"));
         assert!(!rendered.contains("chat_model="));
@@ -352,7 +372,10 @@ mod tests {
             ..Prefs::default()
         };
         assert!(on.render().lines().any(|line| line == "nest=1"));
-        assert!(Prefs::default().render().lines().any(|line| line == "nest=0"));
+        assert!(Prefs::default()
+            .render()
+            .lines()
+            .any(|line| line == "nest=0"));
     }
 
     #[test]
@@ -370,10 +393,7 @@ mod tests {
             Some("line1\nline2\tend\\slash")
         );
         assert_eq!(Prefs::parse("notes_prompt=\n").notes_prompt, None);
-        assert_eq!(
-            unescape_ini_value(r"keep\xunknown"),
-            r"keep\xunknown"
-        );
+        assert_eq!(unescape_ini_value(r"keep\xunknown"), r"keep\xunknown");
     }
 
     #[test]
@@ -423,7 +443,9 @@ mod tests {
         assert!(text.contains("notes_model=llama-3.1-8b-instant"));
         assert!(!text.contains("chat_model="));
         assert!(text.lines().any(|line| line == "nest=1"));
-        assert!(text.lines().any(|line| line == "notes_prompt=hello\\nworld"));
+        assert!(text
+            .lines()
+            .any(|line| line == "notes_prompt=hello\\nworld"));
     }
 
     #[test]
@@ -435,5 +457,17 @@ mod tests {
         assert_eq!(optional_url("   "), None);
         assert_eq!(optional_text("  whisper-1  "), Some("whisper-1".into()));
         assert_eq!(optional_text("\n"), None);
+    }
+
+    #[test]
+    fn write_tmp_path_is_unique_per_process() {
+        let path = Path::new("onerec.ini");
+        let tmp = write_tmp_path(path);
+        assert_ne!(tmp, Path::new("onerec.ini.tmp"));
+        assert_eq!(
+            tmp.file_name().unwrap().to_string_lossy(),
+            format!("onerec.ini.{}.tmp", std::process::id())
+        );
+        assert_eq!(tmp.parent(), path.parent());
     }
 }

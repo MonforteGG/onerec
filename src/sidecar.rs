@@ -180,13 +180,27 @@ fn gap_for(kind: JobKind, prefs: &Prefs, audio: &Path) -> Option<IdleGap> {
 
 fn ready_url(prefs: &Prefs) -> Option<String> {
     let url = optional_url(prefs.transcribe_url.as_deref().unwrap_or(""))?;
-    if (url.starts_with("http://") || url.starts_with("https://"))
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        Some(url)
-    } else {
-        None
+    api_base_error(&url).is_none().then_some(url)
+}
+
+fn api_base_error(url: &str) -> Option<&'static str> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Some("The API URL must start with http:// or https://.");
     }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("The API URL cannot contain spaces.");
+    }
+    if url.contains(['?', '#']) {
+        return Some("The API URL cannot contain a query or fragment.");
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    if rest.is_empty() || rest.starts_with('/') {
+        return Some("The API URL must include a host.");
+    }
+    None
 }
 
 pub(crate) fn validate_fields(
@@ -196,11 +210,8 @@ pub(crate) fn validate_fields(
 ) -> Result<(), String> {
     let url = base_url.trim().trim_end_matches('/');
     if !url.is_empty() {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err("The API URL must start with http:// or https://.".into());
-        }
-        if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err("The API URL cannot contain spaces.".into());
+        if let Some(detail) = api_base_error(url) {
+            return Err(detail.into());
         }
     }
     for (label, model) in [
@@ -262,7 +273,10 @@ fn transcript_markdown(title: &str, body: &str) -> String {
 
 fn notes_markdown(model_text: &str) -> String {
     let trimmed = model_text.trim();
-    if NOTES_HEADINGS.iter().all(|heading| trimmed.contains(heading)) {
+    if NOTES_HEADINGS
+        .iter()
+        .all(|heading| trimmed.contains(heading))
+    {
         let mut body = trimmed.to_owned();
         if !body.ends_with('\n') {
             body.push('\n');
@@ -433,7 +447,7 @@ fn format_http_error(error: ureq::Error) -> String {
 
 fn parse_response(status: u16, body: &str) -> Result<String, String> {
     if (200..300).contains(&status) {
-        if let Some(text) = json_string_field(body, "text") {
+        if let Some(text) = json_string_pointer(body, "/text") {
             return Ok(text);
         }
         let trimmed = body.trim();
@@ -442,62 +456,30 @@ fn parse_response(status: u16, body: &str) -> Result<String, String> {
         }
         return Err("The transcription API returned an empty response.".into());
     }
-    Err(json_string_field(body, "message")
-        .or_else(|| json_string_field(body, "error"))
-        .unwrap_or_else(|| format!("Transcription failed (HTTP {status}).")))
+    Err(api_error_text(body).unwrap_or_else(|| format!("Transcription failed (HTTP {status}).")))
 }
 
 fn parse_chat_response(status: u16, body: &str) -> Result<String, String> {
     if (200..300).contains(&status) {
-        if let Some(text) = json_string_field(body, "content") {
+        if let Some(text) = json_string_pointer(body, "/choices/0/message/content") {
             if !text.trim().is_empty() {
                 return Ok(text);
             }
         }
         return Err("The chat API returned an empty response.".into());
     }
-    Err(json_string_field(body, "message")
-        .or_else(|| json_string_field(body, "error"))
-        .unwrap_or_else(|| format!("Notes failed (HTTP {status}).")))
+    Err(api_error_text(body).unwrap_or_else(|| format!("Notes failed (HTTP {status}).")))
 }
 
-fn json_string_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let after_key = body.split(&needle).nth(1)?;
-    let after_colon = after_key.split_once(':')?.1.trim_start();
-    if let Some(rest) = after_colon.strip_prefix('"') {
-        return Some(unescape_json_string(rest));
-    }
-    None
+fn json_string_pointer(body: &str, pointer: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.pointer(pointer)?.as_str().map(str::to_owned)
 }
 
-fn unescape_json_string(rest: &str) -> String {
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some('u') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
-                        }
-                    }
-                }
-                Some(other) => out.push(other),
-                None => {}
-            },
-            other => out.push(other),
-        }
-    }
-    out
+fn api_error_text(body: &str) -> Option<String> {
+    json_string_pointer(body, "/error/message")
+        .or_else(|| json_string_pointer(body, "/message"))
+        .or_else(|| json_string_pointer(body, "/error"))
 }
 
 #[cfg(test)]
@@ -579,41 +561,33 @@ mod tests {
             gap_status(&vault, &prefs, JobKind::Transcript, Path::new("take.mp3")),
             "No API URL"
         );
+        let prefs = Prefs {
+            transcribe_url: Some("https://api.groq.com/openai/v1?foo=1".into()),
+            transcribe_model: Some("whisper-1".into()),
+            notes_model: Some("notes-1".into()),
+            ..Prefs::default()
+        };
+        assert_eq!(
+            gap_status(&vault, &prefs, JobKind::Transcript, Path::new("take.mp3")),
+            "No API URL"
+        );
     }
 
     #[test]
     fn blank_prompt_uses_the_built_in_text_at_job_time() {
         let vault = MemoryVault::from_key("gsk_test");
         let mut prefs = endpoint_prefs();
-        let job = prepare_job(
-            &vault,
-            &prefs,
-            JobKind::Notes,
-            Path::new("take.mp3"),
-        )
-        .unwrap();
+        let job = prepare_job(&vault, &prefs, JobKind::Notes, Path::new("take.mp3")).unwrap();
         assert_eq!(job.notes_prompt, resolved_notes_prompt(None));
         assert!(job.notes_prompt.contains("## Summary"));
         assert!(job.notes_prompt.contains("## Decisions"));
         assert!(job.notes_prompt.contains("## Action items"));
         assert!(job.notes_prompt.contains("## Open questions"));
         prefs.notes_prompt = Some("Use bullets only.".into());
-        let custom = prepare_job(
-            &vault,
-            &prefs,
-            JobKind::Notes,
-            Path::new("take.mp3"),
-        )
-        .unwrap();
+        let custom = prepare_job(&vault, &prefs, JobKind::Notes, Path::new("take.mp3")).unwrap();
         assert_eq!(custom.notes_prompt, "Use bullets only.");
         prefs.notes_prompt = Some("   ".into());
-        let blank = prepare_job(
-            &vault,
-            &prefs,
-            JobKind::Notes,
-            Path::new("take.mp3"),
-        )
-        .unwrap();
+        let blank = prepare_job(&vault, &prefs, JobKind::Notes, Path::new("take.mp3")).unwrap();
         assert_eq!(blank.notes_prompt, resolved_notes_prompt(None));
     }
 
@@ -638,10 +612,21 @@ mod tests {
     fn validate_fields_allows_empty_url_and_models() {
         assert!(validate_fields("", "", "").is_ok());
         assert!(validate_fields("https://api.openai.com/v1", "whisper-1", "gpt-4o-mini").is_ok());
-        assert!(validate_fields("http://127.0.0.1:8080/v1", "whisper-1", "llama-3.3-70b-versatile").is_ok());
+        assert!(validate_fields(
+            "http://127.0.0.1:8080/v1",
+            "whisper-1",
+            "llama-3.3-70b-versatile"
+        )
+        .is_ok());
         assert!(validate_fields("https://api.groq.com/openai/v1", "", "").is_ok());
         assert!(validate_fields("not-a-url", "", "").is_err());
         assert!(validate_fields("https://ok", "bad model", "").is_err());
+        assert!(validate_fields("https://api.groq.com/openai/v1?foo=1", "", "").is_err());
+        assert!(validate_fields("https://api.groq.com/openai/v1#frag", "", "").is_err());
+        assert_eq!(
+            validate_fields("https://api.groq.com/openai/v1?foo=1", "", "").unwrap_err(),
+            "The API URL cannot contain a query or fragment."
+        );
     }
 
     #[test]
@@ -676,6 +661,26 @@ mod tests {
             )
             .unwrap(),
             "## Summary\nHi"
+        );
+        assert_eq!(
+            parse_response(
+                200,
+                r#"{"meta":{"text":"NOPE"},"text":"hello","segments":[{"text":" skip"}]}"#,
+            )
+            .unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            parse_response(200, r#"{"text":"hi \uD83D\uDE00"}"#).unwrap(),
+            "hi 😀"
+        );
+        assert_eq!(
+            parse_chat_response(
+                200,
+                r#"{"id":"content","choices":[{"logprobs":{"content":[]},"message":{"content":"Hi"}}]}"#,
+            )
+            .unwrap(),
+            "Hi"
         );
     }
 

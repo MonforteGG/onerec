@@ -23,6 +23,7 @@ pub(crate) use self::level::Level;
 use self::level::Vu;
 const HOTKEY_UNAVAILABLE: &str =
     "The recording shortcut is unavailable. Change it in Settings or use Record / Stop.";
+const PREFS_UNSAVED: &str = "This change applies for this session, but could not be saved. Check that the onerec folder is writable.";
 
 pub(crate) trait Devices: 'static {
     fn survey(&self) -> Result<Endpoints, AudioError>;
@@ -156,14 +157,17 @@ pub(crate) enum Ask {
 impl std::fmt::Debug for Ask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SaveDestination(prompt) => f.debug_tuple("SaveDestination").field(prompt).finish(),
+            Self::SaveDestination(prompt) => {
+                f.debug_tuple("SaveDestination").field(prompt).finish()
+            }
             Self::ConfirmClose => f.debug_tuple("ConfirmClose").finish(),
             Self::ConfirmDiscard => f.debug_tuple("ConfirmDiscard").finish(),
             Self::Close => f.debug_tuple("Close").finish(),
             Self::Settings(values) => f.debug_tuple("Settings").field(values).finish(),
-            Self::OverwriteNested { path } => {
-                f.debug_struct("OverwriteNested").field("path", path).finish()
-            }
+            Self::OverwriteNested { path } => f
+                .debug_struct("OverwriteNested")
+                .field("path", path)
+                .finish(),
         }
     }
 }
@@ -211,7 +215,10 @@ impl std::fmt::Debug for SettingsValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettingsValues")
             .field("shortcut", &self.shortcut)
-            .field("api_key", &if self.api_key.is_empty() { "" } else { "****" })
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() { "" } else { "****" },
+            )
             .field("transcribe_url", &self.transcribe_url)
             .field("transcribe_model", &self.transcribe_model)
             .field("notes_model", &self.notes_model)
@@ -388,9 +395,7 @@ impl Recorder {
                 {
                     self.notice = None;
                 }
-                if !self.persist() {
-                    self.notice = Some(warn("Settings apply for this session, but could not be saved. Check that the onerec folder is writable."));
-                }
+                self.persist_or_notice();
             }
             Intent::ConfirmNestedSave => self.begin_encode(),
             Intent::Sidecar(kind) => self.request_sidecar(kind),
@@ -610,7 +615,11 @@ impl Recorder {
         let Some(plan) = self.save_plan.clone() else {
             return;
         };
-        if let Some(parent) = plan.encode.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = plan
+            .encode
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 self.notice = Some(warn(error.to_string()));
                 self.save_plan = None;
@@ -688,7 +697,7 @@ impl Recorder {
             return;
         }
         self.microphone = Some(index);
-        self.persist();
+        self.persist_or_notice();
         self.ensure_monitors();
     }
 
@@ -700,7 +709,7 @@ impl Recorder {
             return;
         }
         self.output = Some(index);
-        self.persist();
+        self.persist_or_notice();
         self.ensure_monitors();
     }
 
@@ -712,7 +721,7 @@ impl Recorder {
             return;
         };
         self.quality = quality;
-        self.persist();
+        self.persist_or_notice();
     }
 
     fn advance_meters(&mut self) {
@@ -746,7 +755,9 @@ impl Recorder {
                 if let Some(plan) = self.save_plan.take() {
                     self.prefs.folder = Some(plan.folder);
                 }
-                self.persist();
+                if !self.persist() {
+                    self.notice = Some(warn(format!("Saved: {name}. {PREFS_UNSAVED}")));
+                }
                 self.saved_path = Some(path);
                 self.microphone_vu.reset();
                 self.system_vu.reset();
@@ -945,6 +956,12 @@ impl Recorder {
             return true;
         };
         self.prefs.write(path).is_ok()
+    }
+
+    fn persist_or_notice(&mut self) {
+        if !self.persist() {
+            self.notice = Some(warn(PREFS_UNSAVED));
+        }
     }
 
     fn phase(&self) -> Phase {
@@ -1739,6 +1756,37 @@ mod tests {
     }
 
     #[test]
+    fn choosing_quality_reports_persistence_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(dir.path().to_path_buf()));
+        let view = recorder.apply(Intent::ChooseQuality(ExportQuality::High.index()));
+        assert!(view.status.text.contains("could not be saved"));
+        assert_eq!(view.quality.selected, Some(ExportQuality::High.index()));
+    }
+
+    #[test]
+    fn successful_save_keeps_the_file_notice_when_prefs_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(dir.path().to_path_buf()));
+        stop_take(&mut recorder);
+        let path = dir.path().join("meeting.mp3");
+        recorder.apply(Intent::SaveTo(path.clone()));
+        let saved = finish_save(&mut recorder);
+        assert_eq!(saved.phase, Phase::Idle);
+        assert_eq!(saved.saved_path, Some(path));
+        assert!(
+            saved.status.text.starts_with("Saved: meeting.mp3"),
+            "{}",
+            saved.status.text
+        );
+        assert!(
+            saved.status.text.contains("could not be saved"),
+            "{}",
+            saved.status.text
+        );
+    }
+
+    #[test]
     fn settings_persist_shortcut_changes_and_disabled_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("onerec.ini");
@@ -2027,7 +2075,8 @@ mod tests {
         let path = dir.path().join("onerec.ini");
         let vault = crate::vault::MemoryVault::default();
         let inspect = vault.clone();
-        let mut recorder = recorder_with_vault(Prefs::default(), Some(path.clone()), Box::new(vault));
+        let mut recorder =
+            recorder_with_vault(Prefs::default(), Some(path.clone()), Box::new(vault));
         recorder.apply(Intent::SetSettings(SettingsValues {
             shortcut: Shortcut::default(),
             api_key: " gsk_live ".into(),

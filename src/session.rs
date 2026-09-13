@@ -486,6 +486,7 @@ impl ActiveRecording {
     }
 
     fn seal(mut self) -> Session {
+        let elapsed = self.elapsed();
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -494,7 +495,7 @@ impl ActiveRecording {
             Some(worker) => match worker.join() {
                 Ok(Ok(())) => Session::AwaitingSave(PendingRecording {
                     staging_file,
-                    elapsed: self.elapsed(),
+                    elapsed,
                     degraded: self.degraded.load(Ordering::SeqCst),
                     quality: self.quality,
                 }),
@@ -742,6 +743,28 @@ mod tests {
     }
 
     #[test]
+    fn stop_elapsed_matches_live_clock_not_mixer_join() {
+        let staging = StagingArea::open().unwrap().next_take().unwrap();
+        let mut session = Session::Idle;
+        start_with(&mut session, PcmSource::silence(), NoPacketSource, staging);
+        thread::sleep(Duration::from_millis(120));
+        let live = session.elapsed().expect("live elapsed");
+        session.stop();
+        let Session::AwaitingSave(pending) = &session else {
+            panic!("expected AwaitingSave, got {session:?}");
+        };
+        let sealed = pending.elapsed();
+        assert!(
+            sealed >= live,
+            "sealed {sealed:?} went backwards from live {live:?}"
+        );
+        assert!(
+            sealed.saturating_sub(live) <= MIX_TICK * 3,
+            "sealed {sealed:?} included mixer teardown after live {live:?}"
+        );
+    }
+
+    #[test]
     fn mixed_pcm_duration_tracks_elapsed() {
         let (mut session, _path) = record_silence();
         thread::sleep(Duration::from_millis(200));
@@ -836,7 +859,10 @@ mod tests {
         assert!(paused_at > 0, "need bytes on disk before pause");
         thread::sleep(Duration::from_millis(500));
         let still = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(still, paused_at, "paused mix wrote {still} after {paused_at}");
+        assert_eq!(
+            still, paused_at,
+            "paused mix wrote {still} after {paused_at}"
+        );
         session.resume();
         assert!(matches!(session, Session::Recording(_)));
         session.stop();
