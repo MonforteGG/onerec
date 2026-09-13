@@ -44,6 +44,7 @@ impl Shortcut {
 }
 
 impl Prefs {
+    #[cfg(test)]
     pub(crate) fn read(path: &Path) -> Self {
         fs::read_to_string(path)
             .map(|text| Self::parse(&text))
