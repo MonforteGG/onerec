@@ -131,6 +131,7 @@ mod tests {
                 tone: Tone::Neutral,
             },
             ask: None,
+            job_busy: false,
         }
     }
 
@@ -301,6 +302,34 @@ mod tests {
         view.saved_path = Some(r"C:\Meetings\2026-09-12 15-52 Meeting.mp3".into());
         view.status.text = "Saved: 2026-09-12 15-52 Meeting.mp3".into();
         controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.folder).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.transcribe).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.notes).as_bool() });
+        assert!(unsafe { IsWindowEnabled(controls.transcribe).as_bool() });
+        assert!(unsafe { IsWindowEnabled(controls.notes).as_bool() });
+        assert_eq!(caption(controls.folder), "Open &folder");
+        let status = window_rect_in_parent(ui.root, controls.status);
+        let transcribe = window_rect_in_parent(ui.root, controls.transcribe);
+        let notes = window_rect_in_parent(ui.root, controls.notes);
+        let folder = window_rect_in_parent(ui.root, controls.folder);
+        assert_eq!(status.left, scale(20, controls.units));
+        assert_eq!(status.right - status.left, scale(192, controls.units));
+        assert_eq!(transcribe.left, scale(218, controls.units));
+        assert_eq!(transcribe.right - transcribe.left, scale(110, controls.units));
+        assert_eq!(notes.left, scale(334, controls.units));
+        assert_eq!(notes.right - notes.left, scale(80, controls.units));
+        assert_eq!(folder.left, scale(420, controls.units));
+        assert_eq!(folder.right - folder.left, scale(40, controls.units));
+        assert!(transcribe.right <= notes.left, "Transcribe {transcribe:?} overlaps Notes {notes:?}");
+        assert!(notes.right <= folder.left, "Notes {notes:?} overlaps Open folder {folder:?}");
+        view.job_busy = true;
+        view.status.text = "Transcribing…".into();
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.transcribe).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.notes).as_bool() });
+        assert!(!unsafe { IsWindowEnabled(controls.transcribe).as_bool() });
+        assert!(!unsafe { IsWindowEnabled(controls.notes).as_bool() });
+        assert!(unsafe { IsWindowEnabled(controls.folder).as_bool() });
 
         let mic = window_rect_in_parent(ui.root, controls.microphones);
         let mic_level = window_rect_in_parent(ui.root, controls.microphone_level);

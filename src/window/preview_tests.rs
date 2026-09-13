@@ -1,5 +1,3 @@
-//! Render the real Win32 controls into bitmaps with synthetic states. No audio
-//! capture, foreground input, or changes to the user's running instance.
 use super::*;
 use crate::recorder::{EndpointLists, Level, Levels, Selector, Status, Tone, Transport, View};
 use windows::Win32::Graphics::Gdi::*;
@@ -33,6 +31,7 @@ fn render_native_states() {
             timer_ms: None,
             phase: Phase::Idle,
             saved_path: None,
+            job_busy: false,
             modal: false,
             refresh_after_picker: false,
         });
@@ -75,6 +74,7 @@ fn render_native_states() {
                 let name = if saved { "Saved" } else { "MissingDevice" };
                 if saved {
                     view.saved_path = Some("C:/Meetings/team meeting.mp3".into());
+                    view.job_busy = false;
                     view.status.text = "Saved: team meeting.mp3".into();
                 } else {
                     view.microphone.selected = None;
@@ -87,9 +87,11 @@ fn render_native_states() {
                 settle(root);
                 snapshot(root, &directory.join(format!("{name}-{dpi}.bmp")));
             }
-            // Exercise the native pressed state without recording or moving the cursor.
             let pause = GetDlgItem(root, i32::from(ID_PAUSE)).unwrap();
-            shell.borrow_mut().controls.show(root, &fixture(Phase::Paused));
+            shell
+                .borrow_mut()
+                .controls
+                .show(root, &fixture(Phase::Paused));
             SendMessageW(pause, BM_SETSTATE, WPARAM(1), LPARAM(0));
             snapshot(root, &directory.join(format!("ResumePressed-{dpi}.bmp")));
             SendMessageW(pause, BM_SETSTATE, WPARAM(0), LPARAM(0));
@@ -132,13 +134,20 @@ fn hover_frames_are_stable_and_only_transitions_invalidate_the_button() {
         let shell = RefCell::new(Shell {
             recorder: Recorder::new(crate::staging::StagingArea::open().unwrap()),
             controls: Controls::create(root, instance).unwrap(),
-            icons: Icons::load(root, instance), timer_ms: None, phase: Phase::Idle,
-            saved_path: None, modal: false, refresh_after_picker: false,
+            icons: Icons::load(root, instance),
+            timer_ms: None,
+            phase: Phase::Idle,
+            saved_path: None,
+            job_busy: false,
+            modal: false,
+            refresh_after_picker: false,
         });
         SetWindowLongPtrW(root, GWLP_USERDATA, &shell as *const _ as isize);
         install_command_button_subclasses(&shell.borrow().controls);
-        // All messages and rendering target a hidden test window, never the cursor.
-        shell.borrow_mut().controls.show(root, &fixture(Phase::Idle));
+        shell
+            .borrow_mut()
+            .controls
+            .show(root, &fixture(Phase::Idle));
         let button = GetDlgItem(root, i32::from(ID_TOGGLE)).unwrap();
         let original = sample_button(button);
         SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | 12));
@@ -147,7 +156,10 @@ fn hover_frames_are_stable_and_only_transitions_invalidate_the_button() {
         let _ = ValidateRect(button, None);
         for x in 12..80 {
             SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | x));
-            assert!(!GetUpdateRect(button, None, false).as_bool(), "mouse movement caused a redundant repaint");
+            assert!(
+                !GetUpdateRect(button, None, false).as_bool(),
+                "mouse movement caused a redundant repaint"
+            );
             assert_eq!(sample_button(button), hover);
         }
         SendMessageW(button, BM_SETSTATE, WPARAM(1), LPARAM(0));
@@ -155,11 +167,19 @@ fn hover_frames_are_stable_and_only_transitions_invalidate_the_button() {
         SendMessageW(button, BM_SETSTATE, WPARAM(0), LPARAM(0));
         assert_eq!(sample_button(button), hover);
         SendMessageW(button, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
-        assert_eq!(sample_button(button), original, "leave did not restore the normal fill");
+        assert_eq!(
+            sample_button(button),
+            original,
+            "leave did not restore the normal fill"
+        );
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, false);
         let disabled = sample_button(button);
         SendMessageW(button, WM_MOUSEMOVE, WPARAM(0), LPARAM((12 << 16) | 12));
-        assert_eq!(sample_button(button), disabled, "disabled button reacted to hover");
+        assert_eq!(
+            sample_button(button),
+            disabled,
+            "disabled button reacted to hover"
+        );
         SetWindowLongPtrW(root, GWLP_USERDATA, 0);
         DestroyWindow(root).unwrap();
         drop(shell);
@@ -170,8 +190,14 @@ unsafe fn sample_button(button: HWND) -> u32 {
     let reference = GetDC(None);
     let mut rect = RECT::default();
     GetClientRect(button, &mut rect).unwrap();
-    let frame = super::super::buffered::PaintBuffer::new(reference, rect.right, rect.bottom).unwrap();
-    SendMessageW(button, WM_PRINTCLIENT, WPARAM(frame.dc().0 as usize), LPARAM(0));
+    let frame =
+        super::super::buffered::PaintBuffer::new(reference, rect.right, rect.bottom).unwrap();
+    SendMessageW(
+        button,
+        WM_PRINTCLIENT,
+        WPARAM(frame.dc().0 as usize),
+        LPARAM(0),
+    );
     let color = GetPixel(frame.dc(), 6, rect.bottom / 2).0;
     ReleaseDC(None, reference);
     assert_ne!(color, CLR_INVALID, "could not sample button pixels");
@@ -220,6 +246,7 @@ fn fixture(phase: Phase) -> View {
             tone: if phase == Phase::Failed { Tone::Failure } else if recording { Tone::Recording } else { Tone::Neutral },
         },
         ask: None, saved_path: None,
+        job_busy: false,
     }
 }
 

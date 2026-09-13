@@ -12,8 +12,6 @@ use ::windows::Win32::UI::Shell::{
 
 use crate::recorder::SavePrompt;
 
-/// A dismissed dialog and a broken one both answer `None`, because neither is a reason to
-/// lose the take.
 pub(crate) fn ask_destination(owner: HWND, prompt: &SavePrompt) -> Option<PathBuf> {
     let label = HSTRING::from(prompt.filter_label);
     let pattern = HSTRING::from(format!("*.{}", prompt.extension));
@@ -22,9 +20,12 @@ pub(crate) fn ask_destination(owner: HWND, prompt: &SavePrompt) -> Option<PathBu
     unsafe {
         let dialog: IFileSaveDialog =
             CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        // Reusing the previous name must still require confirmation before
-        // replacing an existing recording.
-        dialog.SetOptions(dialog.GetOptions().ok()? | FOS_OVERWRITEPROMPT).ok()?;
+        dialog
+            .SetOptions(options_with_overwrite(
+                dialog.GetOptions().ok()?,
+                prompt.warn_if_exists,
+            ))
+            .ok()?;
         dialog
             .SetFileTypes(&[COMDLG_FILTERSPEC {
                 pszName: PCWSTR(label.as_ptr()),
@@ -44,6 +45,17 @@ pub(crate) fn ask_destination(owner: HWND, prompt: &SavePrompt) -> Option<PathBu
         let path = chosen.to_string().ok().map(PathBuf::from);
         CoTaskMemFree(Some(chosen.0 as *const c_void));
         path
+    }
+}
+
+fn options_with_overwrite(
+    options: ::windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS,
+    warn: bool,
+) -> ::windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS {
+    if warn {
+        options | FOS_OVERWRITEPROMPT
+    } else {
+        ::windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS(options.0 & !FOS_OVERWRITEPROMPT.0)
     }
 }
 

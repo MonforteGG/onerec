@@ -7,7 +7,7 @@ use crate::RunError;
 use std::cell::Cell;
 use std::ffi::c_void;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{
@@ -32,6 +32,8 @@ pub(crate) const ID_REFRESH: u16 = 108;
 pub(crate) const ID_PAUSE: u16 = 110;
 pub(crate) const ID_SETTINGS: u16 = 111;
 pub(crate) const ID_STOP: u16 = 113;
+pub(crate) const ID_TRANSCRIBE: u16 = 114;
+pub(crate) const ID_NOTES: u16 = 115;
 const MICROPHONE_Y: i32 = 176;
 
 pub(crate) struct Controls {
@@ -49,6 +51,8 @@ pub(crate) struct Controls {
     settings: HWND,
     folder: HWND,
     refresh: HWND,
+    transcribe: HWND,
+    notes: HWND,
     elapsed: HWND,
     heading: HWND,
     status: HWND,
@@ -75,6 +79,7 @@ struct Painted {
     percent: Option<u32>,
     saved_file: bool,
     missing_devices: bool,
+    job_busy: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -118,7 +123,22 @@ impl Controls {
         control_tooltip(root, instance, settings, w!("Settings (Alt+G)"))?;
         control_tooltip(root, instance, discard, w!("Discard recording (Alt+D)"))?;
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
+        control_tooltip(root, instance, folder, w!("Open folder (Alt+F)"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
+        let transcribe = button(root, instance, ID_TRANSCRIBE, w!("Transcri&be"))?;
+        control_tooltip(
+            root,
+            instance,
+            transcribe,
+            w!("Transcribe with your API key (Alt+B)"),
+        )?;
+        let notes = button(root, instance, ID_NOTES, w!("&Notes"))?;
+        control_tooltip(
+            root,
+            instance,
+            notes,
+            w!("Write notes from the recording (Alt+N)"),
+        )?;
         let mut controls = Self {
             microphones,
             outputs,
@@ -134,6 +154,8 @@ impl Controls {
             settings,
             folder,
             refresh,
+            transcribe,
+            notes,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
             heading: static_text(root, instance, w!("Ready"), 0)?,
             status: static_text(
@@ -164,6 +186,8 @@ impl Controls {
         for control in [
             folder,
             refresh,
+            transcribe,
+            notes,
             controls.progress,
             controls.progress_label,
         ] {
@@ -178,7 +202,7 @@ impl Controls {
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 19] {
+    fn all(&self) -> [HWND; 21] {
         [
             self.microphones,
             self.outputs,
@@ -194,6 +218,8 @@ impl Controls {
             self.settings,
             self.folder,
             self.refresh,
+            self.transcribe,
+            self.notes,
             self.elapsed,
             self.heading,
             self.status,
@@ -258,7 +284,6 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
         };
-        // Keep transport and audio meters in place throughout the recording.
         place(self.heading, 20, 12, 392, 20);
         place(self.elapsed, 20, 36, 392, 44);
         place(self.settings, 428, 12, 32, 32);
@@ -273,9 +298,9 @@ impl Controls {
         place_combo(self.quality, 178, 282, 282, 220);
         place(self.progress_label, 20, 282, 440, 20);
         place(self.progress, 20, 306, 440, 10);
-        let text_width = if self.painted.saved_file
-            || self.painted.missing_devices
-        {
+        let text_width = if self.painted.saved_file {
+            192
+        } else if self.painted.missing_devices {
             288
         } else {
             440
@@ -292,7 +317,9 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        place(self.folder, 320, 326, 140, 32);
+        place(self.transcribe, 218, 326, 110, 32);
+        place(self.notes, 334, 326, 80, 32);
+        place(self.folder, 420, 326, 40, 32);
         place(self.refresh, 320, 326, 140, 32);
         for list in [self.microphones, self.outputs, self.quality] {
             unsafe {
@@ -425,7 +452,6 @@ impl Controls {
         if self.list_dropped && view.phase == Phase::Idle {
             return;
         }
-        // Preserve an open picker's hovered row without freezing status updates.
         if !self.list_dropped {
             if let Some(lists) = &view.endpoints {
                 refill(self.microphones, &lists.microphones);
@@ -470,7 +496,6 @@ impl Controls {
         enable(self.pause, live);
         enable(self.save, view.transport.save_enabled);
         enable(self.discard, view.transport.discard_enabled);
-        // A disabled action must not keep keyboard focus after a transition.
         if phase_changed
             && self.command_buttons().contains(&previous_focus)
             && unsafe { !IsWindowEnabled(previous_focus).as_bool() }
@@ -531,11 +556,17 @@ impl Controls {
         if self.painted.status.as_ref() != Some(&status)
             || saved_file != self.painted.saved_file
             || missing != self.painted.missing_devices
+            || view.job_busy != self.painted.job_busy
         {
             self.painted.saved_file = saved_file;
             self.painted.missing_devices = missing;
+            self.painted.job_busy = view.job_busy;
             visible(self.folder, saved_file);
+            visible(self.transcribe, saved_file);
+            visible(self.notes, saved_file);
             visible(self.refresh, missing && !saved_file);
+            enable(self.transcribe, saved_file && !view.job_busy);
+            enable(self.notes, saved_file && !view.job_busy);
             set_text(self.status, &status.text);
             self.painted.status = Some(status);
             self.layout(root);
@@ -693,7 +724,7 @@ impl Controls {
         self.theme.background
     }
 
-    pub(crate) fn command_buttons(&self) -> [HWND; 8] {
+    pub(crate) fn command_buttons(&self) -> [HWND; 10] {
         [
             self.toggle,
             self.stop,
@@ -701,8 +732,10 @@ impl Controls {
             self.pause,
             self.discard,
             self.settings,
+            self.notes,
             self.folder,
             self.refresh,
+            self.transcribe,
         ]
     }
 
@@ -710,7 +743,6 @@ impl Controls {
         self.command_buttons().contains(&hwnd)
     }
 
-    // Track only state transitions; moving within a button needs no new frame.
     pub(crate) fn set_button_hover(&self, hwnd: HWND, hovered: bool) -> bool {
         let previous = self.hovered_button.get();
         let next = if hovered {
@@ -751,7 +783,8 @@ impl Controls {
         let primary = hwnd == self.toggle || hwnd == self.save || hwnd == self.stop;
         let destructive = hwnd == self.discard;
         let settings = hwnd == self.settings;
-        let icon_only = settings || destructive;
+        let folder = hwnd == self.folder;
+        let icon_only = settings || destructive || folder;
         let mut rect = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rect);
@@ -793,7 +826,6 @@ impl Controls {
         } else {
             self.theme.ink
         };
-        // Native captions, including access keys, remain the accessible names.
         let mut caption = [0u16; 128];
         let count = unsafe { GetWindowTextW(hwnd, &mut caption) } as usize;
         let mut text: Vec<u16> = String::from_utf16_lossy(&caption[..count])
@@ -851,7 +883,15 @@ impl Controls {
             };
             let offset = if pressed && !disabled { self.s(1) } else { 0 };
             let left = (rect.right - width) / 2 + offset;
-            if let Some(icon) = icon {
+            if folder {
+                draw_folder_glyph(
+                    hdc,
+                    left,
+                    (rect.bottom - icon_size) / 2 + offset,
+                    icon_size,
+                    ink,
+                );
+            } else if let Some(icon) = icon {
                 SelectObject(hdc, HGDIOBJ(self.fonts.icons.0));
                 let transform = MAT2 {
                     eM11: FIXED { value: 1, fract: 0 },
@@ -914,6 +954,24 @@ impl Controls {
     }
 }
 
+fn draw_folder_glyph(hdc: HDC, left: i32, top: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let pen = CreatePen(PS_SOLID, 1.max(size / 16), color);
+        let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+        let tab_h = (size / 5).max(2);
+        let tab_w = size / 2;
+        let body_top = top + tab_h;
+        let _ = Rectangle(hdc, left, top + size / 10, left + tab_w, body_top + 1);
+        let _ = Rectangle(hdc, left, body_top, left + size, top + size);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ButtonIcon {
     Record,
@@ -943,7 +1001,6 @@ impl ButtonIcon {
 fn name_device_controls(microphones: HWND, outputs: HWND) {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, PROPID_ACC_NAME};
-    // Explicit accessible names replace the removed visual labels.
     unsafe {
         if let Ok(names) =
             CoCreateInstance::<_, IAccPropServices>(&CAccPropServices, None, CLSCTX_INPROC_SERVER)
