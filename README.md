@@ -25,7 +25,7 @@ A small, portable recorder for **Windows 10+**, built with Rust and a native Win
 
 `Alt+Shift+R` starts and stops recording, even in the background. Change it in Settings. Save your recording before closing; unsaved takes are not recovered on the next launch.
 
-On launch, onerec looks for a newer GitHub Release. If one is available, **Update** replaces `onerec.exe` in that same folder and restarts.
+On launch, onerec looks for a newer GitHub Release. If one is available, **Update** downloads the zip, replaces `onerec.exe` in that same folder, and restarts.
 
 Preferences are stored in `onerec.ini` beside the executable.
 

@@ -49,6 +49,7 @@ impl std::fmt::Display for Version {
 pub(crate) struct Release {
     pub version: Version,
     pub download_url: String,
+    pub zip: bool,
 }
 
 pub(crate) fn check() -> Result<Option<Release>, String> {
@@ -60,20 +61,30 @@ pub(crate) fn parse_latest_release(body: &str) -> Option<Release> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let version = Version::parse(value.get("tag_name")?.as_str()?)?;
     let assets = value.get("assets")?.as_array()?;
-    let download_url = assets.iter().find_map(|asset| {
+    let (download_url, zip) = asset_download(assets, "onerec.zip", true)
+        .or_else(|| asset_download(assets, "onerec.exe", false))?;
+    Some(Release {
+        version,
+        download_url,
+        zip,
+    })
+}
+
+fn asset_download(
+    assets: &[serde_json::Value],
+    file_name: &str,
+    zip: bool,
+) -> Option<(String, bool)> {
+    assets.iter().find_map(|asset| {
         let name = asset.get("name")?.as_str()?;
-        name.eq_ignore_ascii_case("onerec.exe")
+        name.eq_ignore_ascii_case(file_name)
             .then(|| {
                 asset
                     .get("browser_download_url")?
                     .as_str()
-                    .map(str::to_owned)
+                    .map(|url| (url.to_owned(), zip))
             })
             .flatten()
-    })?;
-    Some(Release {
-        version,
-        download_url,
     })
 }
 
@@ -84,15 +95,24 @@ pub(crate) fn install(release: &Release) -> Result<(), String> {
 
 pub(crate) fn install_into(current: &Path, release: &Release) -> Result<(), String> {
     let downloaded = with_suffix(current, "new");
-    if let Err(error) = download_to(&release.download_url, &downloaded) {
+    let archive = with_suffix(current, "zip");
+    let result = (|| {
+        if release.zip {
+            download_to(&release.download_url, &archive)?;
+            extract_onerec_exe(&archive, &downloaded)?;
+        } else {
+            download_to(&release.download_url, &downloaded)?;
+        }
+        if !looks_like_windows_exe(&downloaded) {
+            return Err("The download was not a Windows executable.".into());
+        }
+        replace_exe(current, &downloaded)
+    })();
+    let _ = fs::remove_file(&archive);
+    if result.is_err() {
         let _ = fs::remove_file(&downloaded);
-        return Err(error);
     }
-    if !looks_like_windows_exe(&downloaded) {
-        let _ = fs::remove_file(&downloaded);
-        return Err("The download was not a Windows executable.".into());
-    }
-    replace_exe(current, &downloaded)
+    result
 }
 
 pub(crate) fn relaunch() -> Result<(), String> {
@@ -112,7 +132,7 @@ pub(crate) fn remove_stale_files() {
 }
 
 pub(crate) fn remove_stale(current: &Path) {
-    for suffix in ["old", "new"] {
+    for suffix in ["old", "new", "zip"] {
         let _ = fs::remove_file(with_suffix(current, suffix));
     }
 }
@@ -152,6 +172,33 @@ fn looks_like_windows_exe(path: &Path) -> bool {
         .and_then(|mut file| file.read_exact(&mut magic))
         .ok()
         .is_some_and(|_| magic == PE_MAGIC)
+}
+
+fn extract_onerec_exe(archive: &Path, dest: &Path) -> Result<(), String> {
+    let file = File::open(archive).map_err(|error| error.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
+    let index = (0..zip.len())
+        .find(|&i| {
+            zip.by_index(i)
+                .ok()
+                .is_some_and(|entry| !entry.is_dir() && zip_file_name(entry.name()) == "onerec.exe")
+        })
+        .ok_or_else(|| "The zip did not contain onerec.exe.".to_string())?;
+    let mut entry = zip.by_index(index).map_err(|error| error.to_string())?;
+    if entry.size() > MAX_DOWNLOAD_BYTES {
+        return Err("The download was larger than expected.".into());
+    }
+    let mut out = File::create(dest).map_err(|error| error.to_string())?;
+    io::copy(&mut entry, &mut out).map_err(|error| error.to_string())?;
+    out.flush().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn zip_file_name(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
 }
 
 fn get_text(url: &str, timeout: Duration) -> Result<String, String> {
@@ -247,18 +294,59 @@ mod tests {
 
     #[test]
     fn parse_latest_release_reads_the_onerec_asset() {
-        let body = r#"{
+        let zip_body = r#"{
             "tag_name": "v9.8.7",
             "assets": [
                 {"name": "LICENSE", "browser_download_url": "https://example/LICENSE"},
+                {"name": "onerec.exe", "browser_download_url": "https://example/onerec.exe"},
+                {"name": "onerec.zip", "browser_download_url": "https://example/onerec.zip"}
+            ]
+        }"#;
+        let release = parse_latest_release(zip_body).unwrap();
+        assert_eq!(release.version.to_string(), "9.8.7");
+        assert_eq!(release.download_url, "https://example/onerec.zip");
+        assert!(release.zip);
+        let exe_only = r#"{
+            "tag_name": "v9.8.7",
+            "assets": [
                 {"name": "onerec.exe", "browser_download_url": "https://example/onerec.exe"}
             ]
         }"#;
-        let release = parse_latest_release(body).unwrap();
-        assert_eq!(release.version.to_string(), "9.8.7");
-        assert_eq!(release.download_url, "https://example/onerec.exe");
+        let fallback = parse_latest_release(exe_only).unwrap();
+        assert_eq!(fallback.download_url, "https://example/onerec.exe");
+        assert!(!fallback.zip);
         assert!(parse_latest_release(r#"{"tag_name":"v1.0.0","assets":[]}"#).is_none());
         assert!(parse_latest_release("not json").is_none());
+    }
+
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_onerec_exe_ignores_other_files_and_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("onerec.zip");
+        let dest = dir.path().join("onerec.exe.new");
+        write_zip(
+            &archive,
+            &[
+                ("LICENSE", b"mit"),
+                ("folder/onerec.exe", b"MZ-from-folder"),
+            ],
+        );
+        extract_onerec_exe(&archive, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"MZ-from-folder");
+        write_zip(&archive, &[("NOTICE", b"lgpl")]);
+        assert!(extract_onerec_exe(&archive, &dest).is_err());
     }
 
     #[test]

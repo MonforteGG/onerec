@@ -2368,7 +2368,8 @@ mod tests {
     fn newer_release() -> crate::update::Release {
         crate::update::Release {
             version: crate::update::Version::parse("9.9.9").unwrap(),
-            download_url: "https://example.invalid/onerec.exe".into(),
+            download_url: "https://example.invalid/onerec.zip".into(),
+            zip: true,
         }
     }
 

@@ -46,14 +46,14 @@ jobs:
           $notes = @"
           Download ``onerec.zip``, Extract All, and run ``onerec.exe`` from that folder. Windows names the folder ``onerec``; leave the exe there so ``onerec.ini`` stays beside it. v1 is Windows 10 and later only.
 
-          This patch replaces $prev for new downloads. If onerec is already installed, open it and use Update, or replace only ``onerec.exe`` in the same folder.
+          This patch replaces $prev for new downloads. If onerec is already installed, open it and use Update.
 
           The app is that one executable. LAME, the icon, and the Lucide font are inside it. The first run creates ``onerec.ini`` beside the exe. The API key, if you set one, goes to Windows Credential Manager.
 
-          The zip also has ``LICENSE`` and ``NOTICE``. Include those if you redistribute the app. ``onerec.exe`` is attached for in-app updates.
+          The zip also has ``LICENSE`` and ``NOTICE``. Include those if you redistribute the app.
 
           If Windows reports that ``VCRUNTIME140.dll`` is missing, install the Visual C++ 2015-2022 x64 redistributable from https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
           "@
-          $ghArgs = @("release", "create", $tag, $zip, $exe, "--title", $tag, "--notes", $notes, "--generate-notes")
+          $ghArgs = @("release", "create", $tag, $zip, "--title", $tag, "--notes", $notes, "--generate-notes")
           if ($prev) { $ghArgs += @("--notes-start-tag", $prev) }
           gh @ghArgs
