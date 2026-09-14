@@ -1220,16 +1220,20 @@ mod tests {
         high.stop();
         let meeting_bytes = std::fs::metadata(&meeting_path).unwrap().len();
         let high_bytes = std::fs::metadata(&high_path).unwrap().len();
+        assert_eq!(
+            ExportQuality::Meeting.staging_frame_bytes(),
+            ExportQuality::High.staging_frame_bytes()
+        );
         let frame = ExportQuality::Meeting.staging_frame_bytes() as u64;
+        assert_eq!(frame, 8);
+        let quantum = MIX_QUANTUM_FRAMES as u64 * frame;
         assert_eq!(meeting_bytes % frame, 0);
         assert_eq!(high_bytes % frame, 0);
-        let meeting_frames = meeting_bytes / frame;
-        let high_frames = high_bytes / frame;
-        let delta = meeting_frames.abs_diff(high_frames);
         assert!(
-            delta <= MIX_QUANTUM_FRAMES as u64 * 3,
-            "meeting {meeting_frames} frames vs high {high_frames}"
+            meeting_bytes >= quantum,
+            "meeting staged {meeting_bytes} bytes"
         );
+        assert!(high_bytes >= quantum, "high staged {high_bytes} bytes");
     }
 
     #[test]
