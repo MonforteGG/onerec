@@ -28,8 +28,9 @@ const LABEL_NOTES_MODEL: i32 = 229;
 const NEST: i32 = 230;
 const NOTES_PROMPT: i32 = 231;
 const NOTES_HINT: i32 = 232;
+const LABEL_VERSION: i32 = 233;
 const PROMPT_LIMIT: usize = 32767;
-const RECORDING_IDS: [i32; 3] = [LABEL_SHORTCUT, SHORTCUT, HINT];
+const RECORDING_IDS: [i32; 4] = [LABEL_SHORTCUT, SHORTCUT, HINT, LABEL_VERSION];
 const API_IDS: [i32; 10] = [
     LABEL_KEY,
     API_KEY,
@@ -173,6 +174,11 @@ unsafe extern "system" fn dialog_proc(
                 }),
                 LPARAM(0),
             );
+            let _ = SetDlgItemTextW(
+                hwnd,
+                LABEL_VERSION,
+                &HSTRING::from(format!("onerec {}", env!("CARGO_PKG_VERSION"))),
+            );
             show_tab(hwnd);
             1
         }
@@ -220,7 +226,7 @@ unsafe extern "system" fn dialog_proc(
                 state.theme.red
             } else if id == NOTES_HINT && state.notes_error.get() {
                 state.theme.red
-            } else if id == HINT || id == API_HINT || id == NOTES_HINT {
+            } else if id == HINT || id == API_HINT || id == NOTES_HINT || id == LABEL_VERSION {
                 state.theme.muted
             } else {
                 state.theme.ink
@@ -244,7 +250,13 @@ fn commit(hwnd: HWND, state: &State) -> bool {
     if super::shell::register_shortcut(state.owner, shortcut).is_err() {
         state.error.set(true);
         select_tab(hwnd, 0);
-        let _ = unsafe { SetDlgItemTextW(hwnd, HINT, w!("This shortcut is unavailable. Try another combination or clear it.")) };
+        let _ = unsafe {
+            SetDlgItemTextW(
+                hwnd,
+                HINT,
+                w!("This shortcut is unavailable. Try another combination or clear it."),
+            )
+        };
         focus(hwnd, SHORTCUT);
         return false;
     }
@@ -384,6 +396,7 @@ fn template() -> Vec<u32> {
             [20, 52, 280, 14],
         ),
         (HINT, "STATIC", SHORTCUT_HINT, 0, [20, 74, 280, 40]),
+        (LABEL_VERSION, "STATIC", "", 0, [20, 122, 280, 12]),
         (LABEL_KEY, "STATIC", "API &key", 0, [20, 36, 280, 12]),
         (
             API_KEY,
@@ -668,11 +681,20 @@ mod tests {
                 SendDlgItemMessageW(dialog, NEST, BM_GETCHECK, WPARAM(0), LPARAM(0)).0,
                 0
             );
-            assert_eq!(dlg_text(dialog, LABEL_TRANSCRIBE).unwrap(), "Transcribe model");
+            assert_eq!(
+                dlg_text(dialog, LABEL_TRANSCRIBE).unwrap(),
+                "Transcribe model"
+            );
             assert_eq!(dlg_text(dialog, LABEL_NOTES_MODEL).unwrap(), "Notes model");
+            assert_eq!(
+                dlg_text(dialog, LABEL_VERSION).unwrap(),
+                format!("onerec {}", env!("CARGO_PKG_VERSION"))
+            );
             let url = dlg_text(dialog, API_URL).unwrap();
             assert!(!url.contains("groq"));
-            assert!(!dlg_text(dialog, API_MODEL).unwrap().contains("whisper-large"));
+            assert!(!dlg_text(dialog, API_MODEL)
+                .unwrap()
+                .contains("whisper-large"));
         });
     }
 

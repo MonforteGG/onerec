@@ -17,6 +17,7 @@ use crate::save_path::{save_plan, SavePlan};
 use crate::session::{SaveError, Session};
 use crate::sidecar::{self, Job, JobKind, StartError};
 use crate::staging::StagingArea;
+use crate::update::{self, Release};
 use crate::vault::{self, SecretStore};
 
 pub(crate) use self::level::Level;
@@ -50,6 +51,8 @@ pub(crate) enum Intent {
     SetSettings(SettingsValues),
     ConfirmNestedSave,
     Sidecar(JobKind),
+    RequestUpdate,
+    InstallUpdate,
     Closing,
     DiscardAndClose,
     HotkeyUnavailable,
@@ -71,6 +74,7 @@ pub(crate) struct View {
     pub ask: Option<Ask>,
     pub saved_path: Option<PathBuf>,
     pub job_busy: bool,
+    pub update: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +156,8 @@ pub(crate) enum Ask {
     Close,
     Settings(SettingsValues),
     OverwriteNested { path: PathBuf },
+    ConfirmUpdate { version: String },
+    Relaunch,
 }
 
 impl std::fmt::Debug for Ask {
@@ -168,6 +174,10 @@ impl std::fmt::Debug for Ask {
                 .debug_struct("OverwriteNested")
                 .field("path", path)
                 .finish(),
+            Self::ConfirmUpdate { version } => {
+                f.debug_tuple("ConfirmUpdate").field(version).finish()
+            }
+            Self::Relaunch => f.debug_tuple("Relaunch").finish(),
         }
     }
 }
@@ -263,6 +273,11 @@ pub(crate) struct Recorder {
     sidecar_job: Option<(JobKind, JoinHandle<Result<PathBuf, String>>)>,
     pub(crate) sidecar: fn(&Job) -> Result<PathBuf, String>,
     save_plan: Option<SavePlan>,
+    update_check: Option<JoinHandle<Result<Option<Release>, String>>>,
+    update_install: Option<JoinHandle<Result<(), String>>>,
+    available_update: Option<Release>,
+    pub(crate) check_update: fn() -> Result<Option<Release>, String>,
+    pub(crate) install_update: fn(&Release) -> Result<(), String>,
 }
 
 impl Recorder {
@@ -271,7 +286,10 @@ impl Recorder {
         let path = prefs_path();
         let vault: Box<dyn SecretStore> = Box::new(vault::CredentialManager);
         let prefs = load_stored_prefs(&path, &*vault);
-        Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path), vault)
+        let mut recorder =
+            Self::with_prefs(Box::new(wasapi::Wasapi), staging, prefs, Some(path), vault);
+        recorder.start_update_check();
+        recorder
     }
 
     #[cfg(test)]
@@ -344,6 +362,11 @@ impl Recorder {
             sidecar_job: None,
             sidecar: sidecar::run,
             save_plan: None,
+            update_check: None,
+            update_install: None,
+            available_update: None,
+            check_update: update::check,
+            install_update: update::install,
         };
         recorder.ensure_monitors();
         recorder
@@ -399,6 +422,8 @@ impl Recorder {
             }
             Intent::ConfirmNestedSave => self.begin_encode(),
             Intent::Sidecar(kind) => self.request_sidecar(kind),
+            Intent::RequestUpdate => self.request_update(),
+            Intent::InstallUpdate => self.begin_update(),
             Intent::Closing => self.consider_closing(),
             Intent::DiscardAndClose => self.abandon_and_close(),
             Intent::HotkeyUnavailable => self.notice = Some(warn(HOTKEY_UNAVAILABLE)),
@@ -408,6 +433,10 @@ impl Recorder {
     }
 
     fn toggle(&mut self) {
+        if self.update_install.is_some() {
+            self.notice = Some(warn("Wait for the update to finish."));
+            return;
+        }
         if matches!(self.session, Session::Idle) {
             self.begin();
         } else if matches!(self.session, Session::Recording(_) | Session::Paused(_)) {
@@ -595,6 +624,86 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn start_update_check(&mut self) {
+        if self.update_check.is_some() || self.available_update.is_some() {
+            return;
+        }
+        let check = self.check_update;
+        self.update_check = Some(std::thread::spawn(move || check()));
+    }
+
+    fn request_update(&mut self) {
+        self.poll_update();
+        if self.update_install.is_some() {
+            return;
+        }
+        let Some(release) = &self.available_update else {
+            return;
+        };
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
+            self.notice = Some(warn("Save or discard this take before updating."));
+            return;
+        }
+        self.pending_ask = Some(Ask::ConfirmUpdate {
+            version: release.version.to_string(),
+        });
+    }
+
+    fn begin_update(&mut self) {
+        self.poll_update();
+        if self.update_install.is_some() {
+            return;
+        }
+        if !matches!(self.session, Session::Idle | Session::Failed(_)) {
+            self.notice = Some(warn("Save or discard this take before updating."));
+            return;
+        }
+        let Some(release) = self.available_update.clone() else {
+            return;
+        };
+        self.notice = Some(neutral(format!("Downloading onerec {}…", release.version)));
+        let install = self.install_update;
+        self.update_install = Some(std::thread::spawn(move || install(&release)));
+    }
+
+    fn poll_update(&mut self) {
+        if let Some(job) = self.update_install.take() {
+            if !job.is_finished() {
+                self.update_install = Some(job);
+                return;
+            }
+            match job.join() {
+                Ok(Ok(())) => {
+                    self.available_update = None;
+                    self.notice = Some(neutral("Updated. Restarting…"));
+                    self.pending_ask = Some(Ask::Relaunch);
+                }
+                Ok(Err(detail)) => self.notice = Some(warn(detail)),
+                Err(_) => self.notice = Some(warn("The update stopped unexpectedly.")),
+            }
+            return;
+        }
+        let Some(job) = self.update_check.take() else {
+            return;
+        };
+        if !job.is_finished() {
+            self.update_check = Some(job);
+            return;
+        }
+        match job.join() {
+            Ok(Ok(Some(release))) => {
+                self.available_update = Some(release.clone());
+                if self.notice.is_none()
+                    && matches!(self.session, Session::Idle | Session::Failed(_))
+                {
+                    self.notice =
+                        Some(neutral(format!("onerec {} is available.", release.version)));
+                }
+            }
+            Ok(Ok(None) | Err(_)) | Err(_) => {}
+        }
+    }
+
     pub(crate) fn shortcut(&self) -> Shortcut {
         self.prefs.shortcut
     }
@@ -737,6 +846,7 @@ impl Recorder {
             self.system_vu.advance(dt);
         }
         self.poll_sidecar();
+        self.poll_update();
         self.drive_save();
     }
 
@@ -841,7 +951,11 @@ impl Recorder {
             },
             ask: self.pending_ask.take(),
             saved_path: self.saved_path.clone(),
-            job_busy: self.sidecar_job.is_some(),
+            job_busy: self.sidecar_job.is_some() || self.update_install.is_some(),
+            update: self
+                .available_update
+                .as_ref()
+                .map(|release| release.version.to_string()),
         }
     }
 
@@ -849,7 +963,9 @@ impl Recorder {
         match &self.session {
             Session::Idle => Transport {
                 toggle_label: "Start recording",
-                toggle_enabled: self.microphone.is_some() && self.output.is_some(),
+                toggle_enabled: self.microphone.is_some()
+                    && self.output.is_some()
+                    && self.update_install.is_none(),
                 save_enabled: false,
                 discard_enabled: false,
             },
@@ -867,7 +983,7 @@ impl Recorder {
             },
             Session::Failed(_) => Transport {
                 toggle_label: "Start recording",
-                toggle_enabled: true,
+                toggle_enabled: self.update_install.is_none(),
                 save_enabled: false,
                 discard_enabled: false,
             },
@@ -2247,5 +2363,125 @@ mod tests {
         assert_eq!(saved.saved_path.as_deref(), Some(nested.as_path()));
         assert_eq!(recorder.prefs.folder.as_deref(), Some(dest_dir.path()));
         assert_ne!(std::fs::read(&nested).unwrap(), b"old");
+    }
+
+    fn newer_release() -> crate::update::Release {
+        crate::update::Release {
+            version: crate::update::Version::parse("9.9.9").unwrap(),
+            download_url: "https://example.invalid/onerec.exe".into(),
+        }
+    }
+
+    fn wait_offer(recorder: &mut Recorder) -> View {
+        let mut view = recorder.apply(Intent::Tick);
+        for _ in 0..100 {
+            if view.update.is_some() {
+                return view;
+            }
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        panic!("update was not offered: {}", view.status.text)
+    }
+
+    #[test]
+    fn a_newer_release_is_offered_on_the_idle_status_line() {
+        let mut recorder = recorder_with_prefs(Prefs::default(), None);
+        recorder.check_update = || Ok(Some(newer_release()));
+        recorder.start_update_check();
+        let view = wait_offer(&mut recorder);
+        assert_eq!(view.update.as_deref(), Some("9.9.9"));
+        assert_eq!(view.status.text, "onerec 9.9.9 is available.");
+        assert!(!view.job_busy);
+    }
+
+    #[test]
+    fn a_current_release_is_ignored_silently() {
+        let mut recorder = recorder_with_prefs(Prefs::default(), None);
+        recorder.check_update = || Ok(None);
+        recorder.start_update_check();
+        let mut view = recorder.apply(Intent::Tick);
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        assert_eq!(view.update, None);
+        assert_eq!(view.status.text, "");
+    }
+
+    #[test]
+    fn update_asks_to_confirm_when_idle_and_refuses_during_a_take() {
+        let mut recorder = recorder_with_prefs(Prefs::default(), None);
+        recorder.check_update = || Ok(Some(newer_release()));
+        recorder.start_update_check();
+        wait_offer(&mut recorder);
+        let asked = recorder.apply(Intent::RequestUpdate);
+        match asked.ask {
+            Some(Ask::ConfirmUpdate { version }) => assert_eq!(version, "9.9.9"),
+            other => panic!("expected confirm, got {other:?}"),
+        }
+        recorder.apply(Intent::Toggle);
+        wait_mix();
+        let refused = recorder.apply(Intent::RequestUpdate);
+        assert_eq!(refused.phase, Phase::Recording);
+        assert!(refused.ask.is_none());
+        assert_eq!(refused.update.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn a_successful_update_relaunches_and_a_failed_one_can_be_retried() {
+        let mut recorder = recorder_with_prefs(Prefs::default(), None);
+        recorder.check_update = || Ok(Some(newer_release()));
+        recorder.install_update = |_| Err("the onerec folder is not writable".into());
+        recorder.start_update_check();
+        wait_offer(&mut recorder);
+        let started = recorder.apply(Intent::InstallUpdate);
+        assert!(started.job_busy);
+        assert!(started.status.text.contains("Downloading"));
+        let mut view = started;
+        for _ in 0..100 {
+            if !view.job_busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        assert!(!view.job_busy);
+        assert!(view.status.text.contains("not writable"));
+        assert_eq!(view.update.as_deref(), Some("9.9.9"));
+        assert!(view.ask.is_none());
+
+        recorder.install_update = |_| Ok(());
+        let started = recorder.apply(Intent::InstallUpdate);
+        assert!(started.job_busy);
+        let mut view = started;
+        for _ in 0..100 {
+            if matches!(view.ask, Some(Ask::Relaunch)) || view.update.is_none() && !view.job_busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            view = recorder.apply(Intent::Tick);
+        }
+        assert!(matches!(view.ask, Some(Ask::Relaunch)));
+        assert_eq!(view.update, None);
+        assert_eq!(view.status.text, "Updated. Restarting…");
+    }
+
+    #[test]
+    fn recording_is_blocked_while_an_update_downloads() {
+        let mut recorder = recorder_with_prefs(Prefs::default(), None);
+        recorder.check_update = || Ok(Some(newer_release()));
+        recorder.install_update = |_| {
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        };
+        recorder.start_update_check();
+        wait_offer(&mut recorder);
+        let started = recorder.apply(Intent::InstallUpdate);
+        assert!(started.job_busy);
+        assert!(!started.transport.toggle_enabled);
+        let refused = recorder.apply(Intent::Toggle);
+        assert_eq!(refused.phase, Phase::Idle);
+        assert!(refused.status.text.contains("Wait for the update"));
     }
 }

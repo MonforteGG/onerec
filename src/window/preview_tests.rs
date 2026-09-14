@@ -247,6 +247,7 @@ fn fixture(phase: Phase) -> View {
         },
         ask: None, saved_path: None,
         job_busy: false,
+        update: None,
     }
 }
 

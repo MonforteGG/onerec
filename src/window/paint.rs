@@ -36,6 +36,7 @@ pub(crate) const ID_SETTINGS: u16 = 111;
 pub(crate) const ID_STOP: u16 = 113;
 pub(crate) const ID_TRANSCRIBE: u16 = 114;
 pub(crate) const ID_NOTES: u16 = 115;
+pub(crate) const ID_UPDATE: u16 = 116;
 const MICROPHONE_Y: i32 = 176;
 
 pub(crate) struct Controls {
@@ -53,6 +54,7 @@ pub(crate) struct Controls {
     settings: HWND,
     folder: HWND,
     refresh: HWND,
+    update: HWND,
     transcribe: HWND,
     notes: HWND,
     elapsed: HWND,
@@ -82,6 +84,7 @@ struct Painted {
     saved_file: bool,
     missing_devices: bool,
     job_busy: bool,
+    update: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -127,6 +130,13 @@ impl Controls {
         let folder = button(root, instance, ID_FOLDER, w!("Open &folder"))?;
         control_tooltip(root, instance, folder, w!("Open folder (Alt+F)"))?;
         let refresh = button(root, instance, ID_REFRESH, w!("Re&fresh devices"))?;
+        let update = button(root, instance, ID_UPDATE, w!("&Update"))?;
+        control_tooltip(
+            root,
+            instance,
+            update,
+            w!("Download the new version and restart (Alt+U)"),
+        )?;
         let transcribe = button(root, instance, ID_TRANSCRIBE, w!("Transcri&be"))?;
         control_tooltip(
             root,
@@ -156,6 +166,7 @@ impl Controls {
             settings,
             folder,
             refresh,
+            update,
             transcribe,
             notes,
             elapsed: static_text(root, instance, w!("00:00"), 0)?,
@@ -188,6 +199,7 @@ impl Controls {
         for control in [
             folder,
             refresh,
+            update,
             transcribe,
             notes,
             controls.progress,
@@ -204,7 +216,7 @@ impl Controls {
         Ok(controls)
     }
 
-    fn all(&self) -> [HWND; 21] {
+    fn all(&self) -> [HWND; 22] {
         [
             self.microphones,
             self.outputs,
@@ -220,6 +232,7 @@ impl Controls {
             self.settings,
             self.folder,
             self.refresh,
+            self.update,
             self.transcribe,
             self.notes,
             self.elapsed,
@@ -304,7 +317,7 @@ impl Controls {
             let painted = self.painted.borrow();
             if painted.saved_file {
                 192
-            } else if painted.missing_devices {
+            } else if painted.missing_devices || painted.update {
                 288
             } else {
                 440
@@ -326,6 +339,7 @@ impl Controls {
         place(self.notes, 334, 326, 80, 32);
         place(self.folder, 420, 326, 40, 32);
         place(self.refresh, 320, 326, 140, 32);
+        place(self.update, 320, 326, 140, 32);
         for list in [self.microphones, self.outputs, self.quality] {
             unsafe {
                 SendMessageW(
@@ -582,12 +596,17 @@ impl Controls {
             }
             _ => status.text,
         };
+        let can_update = view.update.is_some()
+            && matches!(view.phase, Phase::Idle | Phase::Failed)
+            && !saved_file
+            && !missing;
         let status_changed = {
             let painted = self.painted.borrow();
             painted.status.as_ref() != Some(&status)
                 || saved_file != painted.saved_file
                 || missing != painted.missing_devices
                 || view.job_busy != painted.job_busy
+                || can_update != painted.update
         };
         if status_changed {
             {
@@ -595,14 +614,17 @@ impl Controls {
                 painted.saved_file = saved_file;
                 painted.missing_devices = missing;
                 painted.job_busy = view.job_busy;
+                painted.update = can_update;
                 painted.status = Some(status.clone());
             }
             visible(self.folder, saved_file);
             visible(self.transcribe, saved_file);
             visible(self.notes, saved_file);
             visible(self.refresh, missing && !saved_file);
+            visible(self.update, can_update);
             enable(self.transcribe, saved_file && !view.job_busy);
             enable(self.notes, saved_file && !view.job_busy);
+            enable(self.update, can_update && !view.job_busy);
             set_text(self.status, &status.text);
             self.layout(root);
         }
@@ -777,7 +799,7 @@ impl Controls {
         self.theme.background
     }
 
-    pub(crate) fn command_buttons(&self) -> [HWND; 10] {
+    pub(crate) fn command_buttons(&self) -> [HWND; 11] {
         [
             self.toggle,
             self.stop,
@@ -788,6 +810,7 @@ impl Controls {
             self.notes,
             self.folder,
             self.refresh,
+            self.update,
             self.transcribe,
         ]
     }

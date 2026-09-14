@@ -132,6 +132,7 @@ mod tests {
             },
             ask: None,
             job_busy: false,
+            update: None,
         }
     }
 
@@ -469,6 +470,37 @@ mod tests {
         view.status.text = "Connect a microphone to record.".into();
         controls.show(ui.root, &view);
         assert_eq!(caption(controls.status), view.status.text);
+    }
+
+    #[test]
+    fn update_sits_where_refresh_does_until_a_saved_file_takes_the_row() {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let ui = harness();
+        let controls = Controls::create(ui.root, instance).unwrap();
+        let mut view = idle_view(Some(0));
+        view.update = Some("9.9.9".into());
+        view.status.text = "onerec 9.9.9 is available.".into();
+        controls.show(ui.root, &view);
+        assert!(unsafe { IsWindowVisible(controls.update).as_bool() });
+        assert!(unsafe { IsWindowEnabled(controls.update).as_bool() });
+        assert!(!unsafe { IsWindowVisible(controls.refresh).as_bool() });
+        assert_eq!(caption(controls.update), "&Update");
+        let status = window_rect_in_parent(ui.root, controls.status);
+        let update = window_rect_in_parent(ui.root, controls.update);
+        assert_eq!(status.right - status.left, scale(288, controls.units));
+        assert_eq!(update.left, scale(320, controls.units));
+        assert_eq!(update.right - update.left, scale(140, controls.units));
+        view.saved_path = Some(r"C:\Meetings\take.mp3".into());
+        view.status.text = "Saved: take.mp3".into();
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.update).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.transcribe).as_bool() });
+        view.saved_path = None;
+        view.microphone.selected = None;
+        view.status.text = "Connect a microphone to record.".into();
+        controls.show(ui.root, &view);
+        assert!(!unsafe { IsWindowVisible(controls.update).as_bool() });
+        assert!(unsafe { IsWindowVisible(controls.refresh).as_bool() });
     }
 
     #[test]

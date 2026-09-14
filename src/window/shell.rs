@@ -24,22 +24,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, ShowWindow, TranslateMessage, BM_SETSTATE, BN_CLICKED, CBN_CLOSEUP,
     CBN_DROPDOWN, CBN_SELCHANGE, CBN_SELENDOK, CB_GETCURSEL, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     GWLP_USERDATA, GWLP_WNDPROC, HCURSOR, HICON, IDC_ARROW, IDC_WAIT, IDYES, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MB_ICONWARNING, MB_YESNO, MSG, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
-    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND,
-    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTEXT, WM_SHOWWINDOW, WM_TIMER,
-    WM_UPDATEUISTATE, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    LR_DEFAULTCOLOR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXICON,
+    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DEVICECHANGE,
+    WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT,
+    WM_SETFOCUS, WM_SETTEXT, WM_SHOWWINDOW, WM_TIMER, WM_UPDATEUISTATE, WNDCLASSEXW, WNDPROC,
+    WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::paint::{
     Controls, CLIENT_HEIGHT, CLIENT_WIDTH, ID_DISCARD, ID_FOLDER, ID_MICROPHONE, ID_NOTES,
     ID_OUTPUT, ID_PAUSE, ID_QUALITY, ID_REFRESH, ID_SAVE, ID_SETTINGS, ID_STOP, ID_TOGGLE,
-    ID_TRANSCRIBE,
+    ID_TRANSCRIBE, ID_UPDATE,
 };
 use super::save_dialog;
 use crate::recorder::{Ask, Intent, Phase, Recorder};
 use crate::sidecar::JobKind;
+use crate::update;
 use crate::RunError;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetClientRect, IsIconic, SetWindowPos, MB_DEFBUTTON2, SWP_NOACTIVATE,
@@ -56,6 +58,7 @@ const STYLE: WINDOW_STYLE = WINDOW_STYLE(
 );
 
 pub(crate) fn run(recorder: Recorder) -> Result<(), RunError> {
+    update::remove_stale_files();
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }
         .map_err(|error| RunError::new(format!("reading the module handle failed: {error}")))?
         .into();
@@ -218,6 +221,30 @@ fn dispatch(root: HWND, intent: Intent) {
                 dispatch(root, Intent::ConfirmNestedSave);
             } else {
                 dispatch(root, Intent::CancelSave);
+            }
+        }
+        Some(Ask::ConfirmUpdate { version }) => {
+            let question = HSTRING::from(format!(
+                "Download onerec {version} and restart now?\nYou have {}.",
+                env!("CARGO_PKG_VERSION")
+            ));
+            if modal(root, || unsafe {
+                MessageBoxW(root, &question, TITLE, MB_YESNO | MB_ICONINFORMATION)
+            }) == IDYES
+            {
+                dispatch(root, Intent::InstallUpdate);
+            }
+        }
+        Some(Ask::Relaunch) => {
+            if let Err(error) = update::relaunch() {
+                let detail = HSTRING::from(error);
+                unsafe {
+                    MessageBoxW(root, &detail, TITLE, MB_OK | MB_ICONWARNING);
+                }
+            } else {
+                unsafe {
+                    let _ = DestroyWindow(root);
+                }
             }
         }
     }
@@ -719,6 +746,7 @@ fn command(wparam: WPARAM, lparam: LPARAM, list_dropped: bool) -> Option<Intent>
         (BN_CLICKED, ID_REFRESH) => Some(Intent::RefreshEndpoints),
         (BN_CLICKED, ID_TRANSCRIBE) => Some(Intent::Sidecar(JobKind::Transcript)),
         (BN_CLICKED, ID_NOTES) => Some(Intent::Sidecar(JobKind::Notes)),
+        (BN_CLICKED, ID_UPDATE) => Some(Intent::RequestUpdate),
         _ => None,
     }
 }
