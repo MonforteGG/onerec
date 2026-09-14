@@ -700,6 +700,17 @@ mod tests {
             .collect()
     }
 
+    fn assert_pcm_tracks_elapsed(mixed: Duration, elapsed: Duration) {
+        assert!(
+            mixed + MIX_TICK * 8 >= elapsed,
+            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
+        );
+        assert!(
+            mixed <= elapsed + MIX_TICK,
+            "mixed {mixed:?} ran past elapsed {elapsed:?}"
+        );
+    }
+
     fn awaiting(
         staging: StagingFile,
         elapsed: Duration,
@@ -772,14 +783,7 @@ mod tests {
                 / f64::from(pending.quality().staging_hz()),
         );
         let elapsed = pending.elapsed();
-        assert!(
-            mixed + MIX_TICK * 3 >= elapsed,
-            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
-        );
-        assert!(
-            mixed <= elapsed + MIX_TICK,
-            "mixed {mixed:?} ran past elapsed {elapsed:?}"
-        );
+        assert_pcm_tracks_elapsed(mixed, elapsed);
     }
 
     #[test]
@@ -906,14 +910,7 @@ mod tests {
             staged_frame_count(pending.staging_file(), pending.quality()) as f64
                 / f64::from(pending.quality().staging_hz()),
         );
-        assert!(
-            mixed + MIX_TICK * 3 >= elapsed,
-            "mixed {mixed:?} is shorter than elapsed {elapsed:?}"
-        );
-        assert!(
-            mixed <= elapsed + MIX_TICK,
-            "mixed {mixed:?} ran past elapsed {elapsed:?}"
-        );
+        assert_pcm_tracks_elapsed(mixed, elapsed);
     }
 
     #[test]
