@@ -17,7 +17,7 @@ A small, portable recorder for **Windows 10+**, built with Rust and a native Win
 
 ## Get started
 
-[Download onerec.exe](https://github.com/MonforteGG/onerec/releases), place it in a writable folder, and run it.
+[Download onerec.zip](https://github.com/MonforteGG/onerec/releases), Extract All into a writable folder, and run `onerec.exe` from there. That folder is the app: `onerec.ini` and later updates stay beside the exe.
 
 1. Select your microphone, the output device playing your meeting, and MP3 quality.
 2. Click **Record**. Use **Pause** and **Resume** as needed.
@@ -25,7 +25,7 @@ A small, portable recorder for **Windows 10+**, built with Rust and a native Win
 
 `Alt+Shift+R` starts and stops recording, even in the background. Change it in Settings. Save your recording before closing; unsaved takes are not recovered on the next launch.
 
-On launch, onerec looks for a newer GitHub Release. If one is available, **Update** downloads `onerec.exe` into the same folder and restarts.
+On launch, onerec looks for a newer GitHub Release. If one is available, **Update** replaces `onerec.exe` in that same folder and restarts.
 
 Preferences are stored in `onerec.ini` beside the executable.
 
