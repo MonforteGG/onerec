@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne "v$ver") {
+            throw "tag $tag does not match package version $ver"
+          }
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $exe = "target/release/onerec.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $prev = gh release list --json tagName --jq ".[0].tagName"
+          $notes = @"
+          Download ``onerec.exe``, copy it to a folder you can write to, and double-click it. v1 is Windows 10 and later only.
+
+          This patch replaces $prev for new downloads. Keep using $prev if you already have it and do not need this update.
+
+          The app is that one executable. LAME, the icon, and the Lucide font are inside it. The first run creates ``onerec.ini`` beside the exe. The API key, if you set one, goes to Windows Credential Manager.
+
+          If you redistribute the app, also ship ``LICENSE`` and ``NOTICE``.
+
+          If Windows reports that ``VCRUNTIME140.dll`` is missing, install the Visual C++ 2015-2022 x64 redistributable from https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
+          "@
+          $ghArgs = @("release", "create", $tag, $exe, "LICENSE", "NOTICE", "--title", $tag, "--notes", $notes, "--generate-notes")
+          if ($prev) { $ghArgs += @("--notes-start-tag", $prev) }
+          gh @ghArgs
