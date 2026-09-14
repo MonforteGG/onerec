@@ -4,25 +4,24 @@ use std::slice;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ::windows::core::{Error as WindowsError, HSTRING};
-use ::windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use ::windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-use ::windows::Win32::Media::Audio::{
+use windows::core::{Error as WindowsError, HSTRING};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, EDataFlow, IAudioCaptureClient, IAudioClient, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE,
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
 };
-use ::windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
-use ::windows::Win32::Media::Multimedia::{
-    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT,
-};
-use ::windows::Win32::System::Com::{
+use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
+use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
+use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
 
+use crate::audio::resample::LinearResampler;
 use crate::audio::stream::Tap;
 use crate::audio::{AudioError, Branded, CaptureStream, Endpoint, Endpoints};
 use crate::capture::CaptureError;
@@ -81,7 +80,7 @@ impl Role {
 fn open(endpoint: String, role: Role) -> Result<CaptureStream, AudioError> {
     let (opened, opened_rx) = mpsc::sync_channel::<Result<(), AudioError>>(1);
     let stream = CaptureStream::spawn(role.thread_name(), move |tap| {
-        let client = match Client::open(&endpoint, role) {
+        let mut client = match Client::open(&endpoint, role) {
             Ok(client) => {
                 let _ = opened.send(Ok(()));
                 client
@@ -106,6 +105,7 @@ struct Client {
     audio: IAudioClient,
     capture: IAudioCaptureClient,
     format: StereoDecoder,
+    resampler: LinearResampler,
     _com: Com,
 }
 
@@ -121,23 +121,25 @@ impl Client {
         let (audio, format) = activate_shared_or_mix(&device, role.stream_flags())?;
         let capture: IAudioCaptureClient = unsafe { audio.GetService() }
             .map_err(|error| failure("requesting the capture service", error))?;
+        let rate = format.rate;
 
         Ok(Self {
             audio,
             capture,
             format,
+            resampler: LinearResampler::new(rate),
             _com: com,
         })
     }
 
-    fn pump(&self, tap: &Tap) -> Result<(), CaptureError> {
+    fn pump(&mut self, tap: &Tap) -> Result<(), CaptureError> {
         unsafe { self.audio.Start() }.map_err(|error| lost("starting capture", error))?;
         let outcome = self.drain_until_stop(tap);
         let _ = unsafe { self.audio.Stop() };
         outcome
     }
 
-    fn drain_until_stop(&self, tap: &Tap) -> Result<(), CaptureError> {
+    fn drain_until_stop(&mut self, tap: &Tap) -> Result<(), CaptureError> {
         while !tap.wait_for_stop(POLL) {
             loop {
                 let packet = unsafe { self.capture.GetNextPacketSize() }
@@ -150,7 +152,7 @@ impl Client {
         Ok(())
     }
 
-    fn take_packet(&self, tap: &Tap) -> Result<bool, CaptureError> {
+    fn take_packet(&mut self, tap: &Tap) -> Result<bool, CaptureError> {
         let mut data = ptr::null_mut();
         let mut frames = 0u32;
         let mut flags = 0u32;
@@ -164,15 +166,18 @@ impl Client {
             let _ = unsafe { self.capture.ReleaseBuffer(frames) };
             return Ok(false);
         }
-        if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-            tap.push_silence(frames as usize);
+        let native = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+            vec![[0.0, 0.0]; frames as usize]
         } else {
             let bytes =
                 unsafe { slice::from_raw_parts(data, frames as usize * self.format.frame_bytes) };
-            tap.push(&self.format.front_pair(bytes));
-        }
+            self.format.front_pair(bytes)
+        };
         unsafe { self.capture.ReleaseBuffer(frames) }
             .map_err(|error| lost("releasing a capture packet", error))?;
+        let mut mix = Vec::new();
+        self.resampler.push(&native, &mut mix);
+        tap.push(&mix);
         Ok(true)
     }
 }
@@ -264,6 +269,7 @@ struct StereoDecoder {
     sample: Sample,
     channels: usize,
     frame_bytes: usize,
+    rate: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -279,6 +285,7 @@ impl StereoDecoder {
         sample: Sample::Float32,
         channels: 2,
         frame_bytes: 8,
+        rate: SAMPLE_RATE,
     };
 
     fn of(wave: *const WAVEFORMATEX) -> Result<Self, AudioError> {
@@ -287,10 +294,8 @@ impl StereoDecoder {
         let channels = header.nChannels as usize;
         let frame_bytes = header.nBlockAlign as usize;
         let tag = header.wFormatTag as u32;
-        if rate != SAMPLE_RATE {
-            return Err(AudioError::new(format!(
-                "the device runs at {rate} Hz and this build has no resampler"
-            )));
+        if rate == 0 {
+            return Err(AudioError::new("the device reported a 0 Hz mix format"));
         }
         if channels == 0 || frame_bytes == 0 || !frame_bytes.is_multiple_of(channels) {
             return Err(AudioError::new(format!(
@@ -315,6 +320,7 @@ impl StereoDecoder {
             sample,
             channels,
             frame_bytes,
+            rate,
         })
     }
 

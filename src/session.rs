@@ -581,12 +581,7 @@ fn mix_loop(
         let mic = take_quantum(&mut mic_buf);
         let sys = take_quantum(&mut sys_buf);
         let block = mix(&mic, &sys);
-        fold_mix(
-            &block,
-            quality.staging_factor(),
-            quality.staging_channels(),
-            &mut staged,
-        );
+        fold_mix(&block, &mut staged);
         file.write_all(&staged).map_err(io_fail)?;
         quanta = quanta.saturating_add(1);
 
@@ -655,7 +650,7 @@ mod tests {
     use super::*;
     use crate::capture::{NoPacketSource, PcmSource};
     use crate::staging::StagingArea;
-    use crate::timeline::MIX_SAMPLE_RATE;
+    use crate::timeline::{MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE};
 
     fn mic_id() -> MicrophoneId {
         MicrophoneId::parse("mic".into()).unwrap()
@@ -1198,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn meeting_staging_is_much_smaller_than_high() {
+    fn meeting_and_high_stage_the_same_pcm_layout() {
         let area = StagingArea::open().unwrap();
         let meeting_file = area.next_take().unwrap();
         let high_file = area.next_take().unwrap();
@@ -1225,9 +1220,15 @@ mod tests {
         high.stop();
         let meeting_bytes = std::fs::metadata(&meeting_path).unwrap().len();
         let high_bytes = std::fs::metadata(&high_path).unwrap().len();
+        let frame = ExportQuality::Meeting.staging_frame_bytes() as u64;
+        assert_eq!(meeting_bytes % frame, 0);
+        assert_eq!(high_bytes % frame, 0);
+        let meeting_frames = meeting_bytes / frame;
+        let high_frames = high_bytes / frame;
+        let delta = meeting_frames.abs_diff(high_frames);
         assert!(
-            meeting_bytes * 8 < high_bytes,
-            "meeting {meeting_bytes} B was not far smaller than high {high_bytes} B"
+            delta <= MIX_QUANTUM_FRAMES as u64 * 3,
+            "meeting {meeting_frames} frames vs high {high_frames}"
         );
     }
 

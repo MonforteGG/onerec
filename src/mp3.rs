@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use mp3lame_encoder::{Bitrate, Builder, Encoder, FlushNoGap, InterleavedPcm, Mode, Quality};
 
-use crate::timeline::{MIX_QUANTUM_FRAMES, MIX_SAMPLE_RATE};
+use crate::timeline::MIX_SAMPLE_RATE;
 
 const SAMPLE_BYTES: usize = 4;
 const FLUSH_CAPACITY: usize = 7200;
@@ -71,8 +71,8 @@ impl ExportQuality {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Meeting => "Meeting (8 kbps, ~4 MB/h)",
-            Self::Voice => "Voice (24 kbps, ~11 MB/h)",
+            Self::Meeting => "Meeting (32 kbps, ~14 MB/h)",
+            Self::Voice => "Voice (64 kbps, ~28 MB/h)",
             Self::Compact => "Compact (128 kbps, ~56 MB/h)",
             Self::Standard => "Standard (192 kbps, ~84 MB/h)",
             Self::High => "High (320 kbps, ~141 MB/h)",
@@ -82,12 +82,12 @@ impl ExportQuality {
     fn profile(self) -> Profile {
         match self {
             Self::Meeting => Profile {
-                bitrate: Bitrate::Kbps8,
-                mode: Mode::Mono,
+                bitrate: Bitrate::Kbps32,
+                mode: Mode::JointStereo,
             },
             Self::Voice => Profile {
-                bitrate: Bitrate::Kbps24,
-                mode: Mode::Mono,
+                bitrate: Bitrate::Kbps64,
+                mode: Mode::JointStereo,
             },
             Self::Compact => Profile {
                 bitrate: Bitrate::Kbps128,
@@ -104,33 +104,20 @@ impl ExportQuality {
         }
     }
 
-    /// Sample rate of the PCM take. Matches the MP3, so Meeting cannot be
-    /// re-exported as High later.
     pub const fn staging_hz(self) -> u32 {
-        match self {
-            Self::Meeting => 8_000,
-            Self::Voice => 16_000,
-            Self::Compact | Self::Standard | Self::High => 48_000,
-        }
+        MIX_SAMPLE_RATE
     }
 
     pub const fn staging_channels(self) -> u8 {
-        match self {
-            Self::Meeting | Self::Voice => 1,
-            Self::Compact | Self::Standard | Self::High => 2,
-        }
+        2
     }
 
     pub const fn staging_frame_bytes(self) -> usize {
         SAMPLE_BYTES * self.staging_channels() as usize
     }
 
-    pub const fn staging_factor(self) -> usize {
-        MIX_SAMPLE_RATE as usize / self.staging_hz() as usize
-    }
-
     const fn chunk_frames(self) -> usize {
-        self.staging_hz() as usize / 10
+        MIX_SAMPLE_RATE as usize / 10
     }
 }
 
@@ -138,9 +125,7 @@ const _: () = {
     let mut i = 0;
     while i < ExportQuality::ALL.len() {
         let quality = ExportQuality::ALL[i];
-        assert!(MIX_SAMPLE_RATE % quality.staging_hz() == 0);
-        assert!(MIX_QUANTUM_FRAMES % quality.staging_factor() == 0);
-        assert!(quality.staging_hz() % 10 == 0);
+        assert!(quality.staging_hz() == MIX_SAMPLE_RATE);
         i += 1;
     }
 };
@@ -311,16 +296,15 @@ fn fill(src: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 
 fn lame(quality: ExportQuality) -> io::Result<Encoder> {
     let profile = quality.profile();
-    let hz = quality.staging_hz();
     let mut builder = Builder::new().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "could not allocate the MP3 encoder")
     })?;
+    builder.set_num_channels(2).map_err(encode_fail)?;
     builder
-        .set_num_channels(quality.staging_channels())
+        .set_sample_rate(MIX_SAMPLE_RATE)
         .map_err(encode_fail)?;
-    builder.set_sample_rate(hz).map_err(encode_fail)?;
     builder
-        .set_output_sample_rate(NonZeroU32::new(hz))
+        .set_output_sample_rate(NonZeroU32::new(MIX_SAMPLE_RATE))
         .map_err(encode_fail)?;
     builder.set_brate(profile.bitrate).map_err(encode_fail)?;
     builder.set_quality(Quality::Best).map_err(encode_fail)?;
@@ -554,15 +538,12 @@ mod tests {
     }
 
     #[test]
-    fn meeting_stages_8khz_mono() {
-        assert_eq!(ExportQuality::Meeting.staging_hz(), 8_000);
-        assert_eq!(ExportQuality::Meeting.staging_channels(), 1);
-        assert_eq!(ExportQuality::Meeting.staging_factor(), 6);
-        assert_eq!(ExportQuality::Voice.staging_hz(), 16_000);
-        assert_eq!(ExportQuality::Voice.staging_channels(), 1);
-        assert_eq!(ExportQuality::High.staging_hz(), 48_000);
-        assert_eq!(ExportQuality::High.staging_channels(), 2);
-        assert_eq!(ExportQuality::High.staging_factor(), 1);
+    fn meeting_stages_48khz_stereo() {
+        for quality in ExportQuality::ALL {
+            assert_eq!(quality.staging_hz(), MIX_SAMPLE_RATE);
+            assert_eq!(quality.staging_channels(), 2);
+            assert_eq!(quality.staging_frame_bytes(), 8);
+        }
     }
 
     #[test]
@@ -638,32 +619,71 @@ mod tests {
         }
     }
 
+    fn mpeg_duration_secs(frames: &[MpegLayer3Frame]) -> f64 {
+        frames
+            .iter()
+            .map(|frame| {
+                let samples_per_frame = if frame.sample_rate >= 32_000 {
+                    1152.0
+                } else {
+                    576.0
+                };
+                samples_per_frame / f64::from(frame.sample_rate)
+            })
+            .sum()
+    }
+
     #[test]
-    fn meeting_headers_are_8_kbps_8_khz_mono() {
+    fn meeting_headers_are_32_kbps_48_khz_stereo() {
         let dir = tempfile::tempdir().unwrap();
         let meeting = encode_seconds(dir.path(), "meeting", 1, ExportQuality::Meeting);
         let compact = encode_seconds(dir.path(), "compact", 1, ExportQuality::Compact);
-        let frames = parse_layer3_cbr(&meeting).unwrap();
+        let frames = parse_mpeg1_layer3_cbr(&meeting).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
-            assert_cbr_header(frame, 8, 8_000, 1);
+            assert_cbr_header(frame, 32, MIX_SAMPLE_RATE, 2);
         }
         assert!(
-            meeting.len() < compact.len() / 8,
-            "meeting {} B was not far smaller than compact {} B",
+            meeting.len() < compact.len() / 3,
+            "meeting {} B was not smaller than compact {} B",
             meeting.len(),
             compact.len()
         );
     }
 
     #[test]
-    fn voice_headers_are_24_kbps_16_khz_mono() {
+    fn voice_headers_are_64_kbps_48_khz_stereo() {
         let dir = tempfile::tempdir().unwrap();
         let mp3 = encode_seconds(dir.path(), "voice", 1, ExportQuality::Voice);
-        let frames = parse_layer3_cbr(&mp3).unwrap();
+        let frames = parse_mpeg1_layer3_cbr(&mp3).unwrap();
         assert!(!frames.is_empty());
         for frame in &frames {
-            assert_cbr_header(frame, 24, 16_000, 1);
+            assert_cbr_header(frame, 64, MIX_SAMPLE_RATE, 2);
+        }
+    }
+
+    #[test]
+    fn every_quality_plays_one_pcm_second_at_mix_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        for quality in ExportQuality::ALL {
+            let mp3 = encode_seconds(dir.path(), quality.short_name(), 1, quality);
+            let frames = parse_layer3_cbr(&mp3).unwrap();
+            assert!(!frames.is_empty(), "{}", quality.short_name());
+            for frame in &frames {
+                assert_eq!(
+                    frame.sample_rate,
+                    MIX_SAMPLE_RATE,
+                    "{} header was {} Hz",
+                    quality.short_name(),
+                    frame.sample_rate
+                );
+            }
+            let duration = mpeg_duration_secs(&frames);
+            assert!(
+                (duration - 1.0).abs() < 0.05,
+                "{} lasted {duration} s",
+                quality.short_name()
+            );
         }
     }
 
