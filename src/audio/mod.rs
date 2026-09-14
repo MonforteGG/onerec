@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod resample;
 mod stream;
 
 #[cfg(windows)]
