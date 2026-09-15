@@ -48,7 +48,8 @@ const SHORTCUT_HINT: &str =
     "Press a key combination. Works even in the background.\nClear to disable the shortcut.";
 const API_HELP: &str =
     "Works with Groq, OpenAI, and other OpenAI-compatible APIs.\nThe key is stored in Windows Credential Manager, not in onerec.ini.";
-const NOTES_HELP: &str = "Leave blank to use the built-in default.";
+const NOTES_HELP: &str =
+    "The notes model uses this prompt. The built-in text is shown until you change it.";
 const PROMPT_TOO_LONG: &str = "This prompt is too long.";
 
 #[derive(Debug)]
@@ -161,7 +162,10 @@ unsafe extern "system" fn dialog_proc(
             let _ = SetDlgItemTextW(
                 hwnd,
                 NOTES_PROMPT,
-                &HSTRING::from(state.initial.notes_prompt.as_str()),
+                &HSTRING::from(
+                    sidecar::resolved_notes_prompt(Some(state.initial.notes_prompt.as_str()))
+                        .as_str(),
+                ),
             );
             SendDlgItemMessageW(
                 hwnd,
@@ -287,7 +291,7 @@ fn commit(hwnd: HWND, state: &State) -> bool {
             focus(hwnd, NOTES_PROMPT);
             return false;
         }
-        Ok(text) => text,
+        Ok(text) => sidecar::custom_notes_prompt(&text).unwrap_or_default(),
     };
     let nest = unsafe { SendDlgItemMessageW(hwnd, NEST, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
         == BST_CHECKED.0 as isize;
@@ -676,7 +680,15 @@ mod tests {
             assert_eq!(dlg_text(dialog, API_MODEL).unwrap(), "");
             assert_eq!(dlg_text(dialog, API_NOTES_MODEL).unwrap(), "");
             assert_eq!(dlg_text(dialog, API_KEY).unwrap(), "");
-            assert_eq!(dlg_text(dialog, NOTES_PROMPT).unwrap(), "");
+            let notes_prompt = dlg_text(dialog, NOTES_PROMPT)
+                .unwrap()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            assert_eq!(notes_prompt, sidecar::resolved_notes_prompt(None));
+            assert!(notes_prompt.contains("## Summary"));
+            assert!(notes_prompt.contains("## Decisions"));
+            assert!(notes_prompt.contains("## Action items"));
+            assert!(notes_prompt.contains("## Open questions"));
             assert_eq!(
                 SendDlgItemMessageW(dialog, NEST, BM_GETCHECK, WPARAM(0), LPARAM(0)).0,
                 0

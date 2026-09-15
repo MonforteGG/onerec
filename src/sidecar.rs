@@ -232,10 +232,15 @@ pub(crate) fn validate_fields(
 }
 
 pub(crate) fn resolved_notes_prompt(stored: Option<&str>) -> String {
-    match stored {
-        Some(text) if !text.trim().is_empty() => text.to_owned(),
-        _ => NOTES_SYSTEM_PROMPT.to_owned(),
+    match custom_notes_prompt(stored.unwrap_or("")) {
+        Some(text) => text,
+        None => NOTES_SYSTEM_PROMPT.to_owned(),
     }
+}
+
+pub(crate) fn custom_notes_prompt(displayed: &str) -> Option<String> {
+    let normalized = displayed.replace("\r\n", "\n").replace('\r', "\n");
+    optional_text(&normalized).filter(|text| text != NOTES_SYSTEM_PROMPT)
 }
 
 pub(crate) fn path(audio: &Path, kind: SidecarKind) -> PathBuf {
@@ -589,6 +594,21 @@ mod tests {
         prefs.notes_prompt = Some("   ".into());
         let blank = prepare_job(&vault, &prefs, JobKind::Notes, Path::new("take.mp3")).unwrap();
         assert_eq!(blank.notes_prompt, resolved_notes_prompt(None));
+    }
+
+    #[test]
+    fn custom_notes_prompt_treats_the_built_in_text_as_unset() {
+        assert_eq!(custom_notes_prompt(""), None);
+        assert_eq!(custom_notes_prompt("   "), None);
+        assert_eq!(custom_notes_prompt(NOTES_SYSTEM_PROMPT), None);
+        assert_eq!(
+            custom_notes_prompt(&NOTES_SYSTEM_PROMPT.replace('\n', "\r\n")),
+            None
+        );
+        assert_eq!(
+            custom_notes_prompt("Use bullets only."),
+            Some("Use bullets only.".into())
+        );
     }
 
     #[test]

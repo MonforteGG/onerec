@@ -216,7 +216,7 @@ impl SettingsValues {
             transcribe_model: prefs.transcribe_model.clone().unwrap_or_default(),
             notes_model: prefs.notes_model.clone().unwrap_or_default(),
             nest: prefs.nest,
-            notes_prompt: prefs.notes_prompt.clone().unwrap_or_default(),
+            notes_prompt: sidecar::resolved_notes_prompt(prefs.notes_prompt.as_deref()),
         }
     }
 }
@@ -410,7 +410,7 @@ impl Recorder {
                 self.prefs.transcribe_model = optional_text(&next.transcribe_model);
                 self.prefs.notes_model = optional_text(&next.notes_model);
                 self.prefs.nest = next.nest;
-                self.prefs.notes_prompt = optional_text(&next.notes_prompt);
+                self.prefs.notes_prompt = sidecar::custom_notes_prompt(&next.notes_prompt);
                 if self
                     .notice
                     .as_ref()
@@ -2244,7 +2244,70 @@ mod tests {
         assert!(!text.contains("transcribe_model="));
         assert!(!text.contains("notes_model="));
         assert!(!text.contains("chat_model="));
+        assert!(!text.contains("notes_prompt="));
         assert!(text.lines().any(|line| line == "nest=0"));
+    }
+
+    #[test]
+    fn settings_form_shows_the_built_in_notes_prompt_by_default() {
+        let vault = crate::vault::MemoryVault::default();
+        let values = SettingsValues::from_prefs_and_vault(&Prefs::default(), &vault);
+        assert_eq!(values.notes_prompt, sidecar::resolved_notes_prompt(None));
+        assert!(values.notes_prompt.contains("## Summary"));
+        let custom_prefs = Prefs {
+            notes_prompt: Some("Use bullets only.".into()),
+            ..Prefs::default()
+        };
+        let custom = SettingsValues::from_prefs_and_vault(&custom_prefs, &vault);
+        assert_eq!(custom.notes_prompt, "Use bullets only.");
+    }
+
+    #[test]
+    fn built_in_notes_prompt_is_not_written_to_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        for prompt in [
+            sidecar::resolved_notes_prompt(None),
+            sidecar::resolved_notes_prompt(None).replace('\n', "\r\n"),
+        ] {
+            recorder.apply(Intent::SetSettings(SettingsValues {
+                shortcut: Shortcut::default(),
+                api_key: String::new(),
+                transcribe_url: String::new(),
+                transcribe_model: String::new(),
+                notes_model: String::new(),
+                nest: false,
+                notes_prompt: prompt,
+            }));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("notes_prompt="));
+            assert_eq!(Prefs::read(&path).notes_prompt, None);
+        }
+    }
+
+    #[test]
+    fn custom_notes_prompt_is_written_to_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onerec.ini");
+        let mut recorder = recorder_with_prefs(Prefs::default(), Some(path.clone()));
+        recorder.apply(Intent::SetSettings(SettingsValues {
+            shortcut: Shortcut::default(),
+            api_key: String::new(),
+            transcribe_url: String::new(),
+            transcribe_model: String::new(),
+            notes_model: String::new(),
+            nest: false,
+            notes_prompt: "Use bullets only.".into(),
+        }));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text
+            .lines()
+            .any(|line| line == "notes_prompt=Use bullets only."));
+        assert_eq!(
+            Prefs::read(&path).notes_prompt.as_deref(),
+            Some("Use bullets only.")
+        );
     }
 
     #[test]
